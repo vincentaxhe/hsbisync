@@ -1,0 +1,37 @@
+name:                hsbisync
+version:             0.1.0.0
+github:              "user/hsbisync"
+license:             MIT
+author:              "Vincent"
+maintainer:          "vincent@example.com"
+copyright:           "2026 Vincent"
+
+description:         A bidirectional file sync tool written in Haskell
+
+dependencies:
+- aeson
+- async
+- base >= 4.7 && < 5
+- bytestring
+- containers
+- cryptonite
+- directory
+- filepath
+- memory
+- process
+- text
+- time
+- unix
+
+library:
+  source-dirs: .
+
+executables:
+  hsbisync:
+    main:                Main.hs
+    source-dirs:         .
+    ghc-options:
+    - -Wall
+    - -O2
+    dependencies:
+    - hsbisync
