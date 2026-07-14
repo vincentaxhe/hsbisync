@@ -64,6 +64,31 @@ parseArgsFrom args =
         _ ->
             die "Usage: hsbisync <root1> <root2>\n  root = /local/path  or  [user@]host:/remote/path"
 
+-- | 验证 profile 名是否合法：不能为空，不能含路径分隔符
+validateProfile :: String -> IO ()
+validateProfile name
+    | null name                 = die "Profile name cannot be empty"
+    | '/' `elem` name           = die "Profile name cannot contain '/'"
+    | '\\' `elem` name          = die "Profile name cannot contain '\\'"
+    | name == "." || name == ".." = die "Profile name cannot be '.' or '..'"
+    | otherwise                 = return ()
+
+-- | 从字符串列表解析 profile + 两个 Root 并验证可达性
+--   [profile, r1, r2] → (profile, root1, root2)
+parseSyncThree :: [String] -> IO (String, Root, Root)
+parseSyncThree [profile, r1, r2] = do
+    validateProfile profile
+    let root1 = parseRoot r1
+        root2 = parseRoot r2
+    ok1 <- checkRoot root1
+    ok2 <- checkRoot root2
+    case (ok1, ok2) of
+        (True,  True)  -> return (profile, root1, root2)
+        (False, True)  -> die $ rootLabel root1 ++ ": not accessible"
+        (True,  False) -> die $ rootLabel root2 ++ ": not accessible"
+        _              -> die $ rootLabel root1 ++ " and " ++ rootLabel root2 ++ ": not accessible"
+parseSyncThree _ = die "Usage: hsbisync sync <profile> <root1> <root2>"
+
 -- | 打印错误并退出
 die :: String -> IO a
 die msg = do

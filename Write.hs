@@ -1,18 +1,19 @@
 module Write where
 
 import Data.Bits ((.&.))
-import System.Directory (createDirectoryIfMissing, renameFile)
-import System.FilePath ((</>), takeDirectory, takeFileName)
+import System.Directory (createDirectoryIfMissing, doesFileExist, removeFile, renameFile)
+import System.FilePath (takeDirectory)
 import System.IO
-    ( Handle, hFlush
+    ( Handle, hClose, hFlush
     , hPutStrLn, hSetBinaryMode
-    , hGetLine, hIsEOF
+    , hGetLine, openTempFile
     )
 import System.Posix.Files
     ( getFileStatus, fileMode, modificationTime
     , setFileMode, setFileTimes
     )
 
+import Crypto.Hash (hash, SHA512, Digest)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BL
 
@@ -137,19 +138,78 @@ syncFileAttrsLocal srcPath dstPath = do
     setFileTimes dstPath mt mt
 
 -- ============================================================================
--- 文件写入
+-- 文件写入（统一入口：原子写入 + 属性 + 哈希）
 -- ============================================================================
 
--- | 本地写入文件，确保完整落盘后同步属性
+-- | 计算内存中 ByteString 的 SHA512 哈希（hex 字符串），无需读磁盘
+hashBytes :: BS.ByteString -> String
+hashBytes = show . (hash :: BS.ByteString -> Digest SHA512)
+
+-- | 计算本地文件 SHA512 哈希（hex 字符串）
+hashFile :: FilePath -> IO String
+hashFile fp = do
+    content <- BS.readFile fp
+    return $ hashBytes content
+
+-- | 原子写入文件：系统分配随机临时文件名，写入成功后原子 rename 到目标路径。
 --
---   先写到临时文件，再原子 rename
-writeFileLocal :: FilePath -> BS.ByteString -> IO ()
-writeFileLocal path content = do
-    let dir     = takeDirectory path
-        tmpPath = dir </> "." ++ takeFileName path ++ ".tmp"
+--   使用 'openTempFile' 确保临时文件名唯一，多进程并发写同一目标文件也不会冲突。
+--   保证并发读者永远看到完整文件——要么旧文件，要么新文件，不会看到写入一半的内容。
+--   即使在写入过程中程序崩溃，也只会留下孤儿临时文件，不会破坏目标文件。
+writeFileAtomic :: FilePath -> BS.ByteString -> IO ()
+writeFileAtomic path content = do
+    let dir = takeDirectory path
     createDirectoryIfMissing True dir
-    BS.writeFile tmpPath content
+    (tmpPath, h) <- openTempFile dir ".tmp"
+    BS.hPut h content
+    hClose h
     renameFile tmpPath path
+
+-- | 原子写入 + 校验：先写临时文件 → 设属性 → 算哈希比对 → 通过才 rename。
+--
+--   这是 rsync 的核心安全保证：
+--   * 校验在 rename 之前——哈希不匹配则删除临时文件，目标文件完全不受影响
+--   * 校验通过才原子替换——新文件从出现的第一刻起内容和属性就完全正确
+--   * 不会出现"写完了才发现不对但原文件已经没了"的情况
+--
+--   返回 @Right ()@ 表示写入和校验均成功，@Left err@ 表示校验失败（原文件未动）。
+writeFileVerified
+    :: FilePath       -- ^ 目标路径
+    -> BS.ByteString  -- ^ 文件内容
+    -> Int            -- ^ 目标权限 mode
+    -> Integer        -- ^ 目标 mtime（epoch 秒）
+    -> String         -- ^ 期望的 SHA512 哈希（hex）
+    -> IO (Either String ())
+writeFileVerified path content mode_ mtime_ expectedHash = do
+    let dir = takeDirectory path
+    createDirectoryIfMissing True dir
+    (tmpPath, h) <- openTempFile dir ".tmp"
+    BS.hPut h content
+    hClose h
+    -- 属性在 rename 前设好，保证新文件立即可用
+    setFileMode tmpPath (fromIntegral mode_)
+    setFileTimes tmpPath (fromIntegral mtime_) (fromIntegral mtime_)
+    -- 核⼼：校验在 rename 之前，不通过则丢弃临时文件
+    let actualHash = hashBytes content
+    if actualHash /= expectedHash
+        then do
+            removeFile tmpPath
+            return $ Left "verification failed before commit; target untouched"
+        else do
+            renameFile tmpPath path
+            return $ Right ()
+
+-- | 安全删除文件：不存在则静默跳过，不抛异常
+removeFileSafe :: FilePath -> IO ()
+removeFileSafe fp = do
+    exists <- doesFileExist fp
+    if exists then removeFile fp else return ()
+
+-- | 本地写入文件，确保完整落盘后同步属性（保留旧名，兼容已有调用）
+--
+--   已由 'writeFileAtomic' 替代，保留此别名避免大规模改动。
+writeFileLocal :: FilePath -> BS.ByteString -> IO ()
+writeFileLocal = writeFileAtomic
 
 -- | 通过 helper 协议在两个 helper 之间复制文件
 --

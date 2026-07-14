@@ -4,8 +4,8 @@ import Control.Exception (catch, IOException)
 import Control.Monad (unless)
 import Data.Bits ((.&.))
 import Data.Char (toUpper)
-import System.Directory (createDirectoryIfMissing, removeFile, renameFile)
-import System.FilePath ((</>), takeDirectory, takeFileName)
+import System.Directory (createDirectoryIfMissing, removeFile)
+import System.FilePath ((</>), takeDirectory)
 import System.IO
     ( BufferMode(..), hFlush, hLookAhead
     , hSetBinaryMode, hSetBuffering, hSetEncoding, utf8, stdin, stdout
@@ -24,6 +24,7 @@ import State
     ( diffState, appendAdded, appendDeleted
     , currentState, lastState, stateJSON
     )
+import Write (writeFileVerified)
 
 -- ============================================================================
 -- 入口
@@ -152,23 +153,42 @@ cmdSend root filename = do
     BS.hPut stdout content
     hFlush stdout
 
+-- | RECV 命令（扩展协议）：接收文件并在 rename 之前校验。
+--
+--   协议格式：RECV <size>,<filename> <mode> <mtime> <expectedHash>
+--   其中 filename 是 size 之后到倒数第 3 个空格之前的所有内容（可含空格），
+--   mode、mtime、expectedHash 是最后 3 个以空格分隔的字段。
+--
+--   流程：
+--   1. 解析参数，回复 "OK" 表示准备接收
+--   2. 读取 <size> 字节二进制数据
+--   3. 写临时文件 + 设 mode/mtime + 算哈希比对
+--   4. 通过 → rename + 回复 "OK"；不通过 → 删临时文件 + 回复 "ERROR ..."
 cmdRecv :: FilePath -> String -> IO ()
 cmdRecv root params =
     case break (== ',') params of
-        (sizeStr, ',' : filename) ->
-            case reads sizeStr of
-                [(sz, "")] -> do
-                    let fullPath = root </> filename
-                        dstDir   = takeDirectory fullPath
-                        tmpPath  = dstDir </> "." ++ takeFileName filename ++ ".tmp"
-                    createDirectoryIfMissing True dstDir
-                    putStrLn "OK"
-                    hFlush stdout
-                    hSetBinaryMode stdin True
-                    content <- BS.hGet stdin sz
-                    BS.writeFile tmpPath content
-                    renameFile tmpPath fullPath
-                _ -> putStrLn "ERROR Invalid RECV size"
+        (sizeStr, ',' : rest) ->
+            let revWords = reverse (words rest)
+            in case revWords of
+                (hashStr : mtimeStr : modeStr : revFilename) ->
+                    case (reads sizeStr, reads modeStr, reads mtimeStr) of
+                        ([(sz, "")], [(md, "")], [(mt, "")]) -> do
+                            let filename = unwords (reverse revFilename)
+                                fullPath = root </> filename
+                                dstDir   = takeDirectory fullPath
+                            createDirectoryIfMissing True dstDir
+                            putStrLn "OK"
+                            hFlush stdout
+                            hSetBinaryMode stdin True
+                            content <- BS.hGet stdin sz
+                            hSetBinaryMode stdin False
+                            result <- writeFileVerified fullPath content md mt hashStr
+                            case result of
+                                Right () -> putStrLn "OK"
+                                Left err -> putStrLn ("ERROR " ++ err)
+                            hFlush stdout
+                        _ -> putStrLn "ERROR Invalid RECV params"
+                _ -> putStrLn "ERROR Invalid RECV params"
         _ -> putStrLn "ERROR Invalid RECV params"
 
 -- ============================================================================
