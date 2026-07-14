@@ -23,7 +23,7 @@ import qualified Data.ByteString as BS
 import Crypto.Hash (hash, SHA512, Digest)
 
 import State
-    ( FileState(..), FileChange(..), DiffState(..), parseStateJSON
+    ( FileState(..), FileChange(..), parseStateJSON
     , currentState, lastState, appendAdded, appendDeleted, posixSecs
     )
 import Sync (sync, SyncAction(..), resolveConflicts)
@@ -143,11 +143,11 @@ execute self other pairs = do
     let receives   = [ (filename fs, mode fs, posixSecs (mtime fs))
                      | (Added     fs _ _, Just Receive)       <- pairs ]
         removes    = [ (filename fs, d1, d2)
-                     | (Deleted   fs d1 d2, Just Remove)      <- pairs ]
+                     | (Del   fs d1 d2, Just Remove)      <- pairs ]
         recordAdds = [ filename fs
-                     | (Unchanged fs _ _, Just RecordAdd)     <- pairs ]
+                     | (Noop fs _ _, Just RecordAdd)     <- pairs ]
         recordDels = [ filename fs
-                     | (Deleted   fs _ _, Just RecordDelete)  <- pairs ]
+                     | (Del   fs _ _, Just RecordDelete)  <- pairs ]
     unless (null removes) $ do
         putStrLn "\nDeleting..."
         forM_ removes $ \(relPath, _, _) -> do
@@ -310,11 +310,11 @@ setRemoteStat hh relPath mt md =
 showSummary :: [(FileChange, Maybe SyncAction)] -> [(FileChange, Maybe SyncAction)] -> IO ()
 showSummary pairs1 pairs2 = do
     let add1 = [ (f, d1, d2) | (Added    fs d1 d2, Just Receive) <- pairs1, let f = filename fs ]
-        del1 = [ (f, d1, d2) | (Deleted  fs d1 d2, Just Remove)  <- pairs1, let f = filename fs ]
+        del1 = [ (f, d1, d2) | (Del  fs d1 d2, Just Remove)  <- pairs1, let f = filename fs ]
         add2 = [ (f, d1, d2) | (Added    fs d1 d2, Just Receive) <- pairs2, let f = filename fs ]
-        del2 = [ (f, d1, d2) | (Deleted  fs d1 d2, Just Remove)  <- pairs2, let f = filename fs ]
-        recAdds = [ f | (Unchanged fs _ _, Just RecordAdd)    <- pairs1, let f = filename fs ]
-        recDels = [ f | (Deleted   fs _ _, Just RecordDelete) <- pairs1, let f = filename fs ]
+        del2 = [ (f, d1, d2) | (Del  fs d1 d2, Just Remove)  <- pairs2, let f = filename fs ]
+        recAdds = [ f | (Noop fs _ _, Just RecordAdd)    <- pairs1, let f = filename fs ]
+        recDels = [ f | (Del   fs _ _, Just RecordDelete) <- pairs1, let f = filename fs ]
         conf = [ (f, d1, d2) | (Conflict fs d1 d2, Just Unsolvable) <- pairs1 ++ pairs2, let f = filename fs ]
 
     when (not (null del1)) $ do

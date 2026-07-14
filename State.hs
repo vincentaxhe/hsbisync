@@ -49,19 +49,26 @@ data DiffEntry = DiffEntry
     , deFile  :: !FilePath
     } deriving (Show, Eq, Generic, FromJSON, ToJSON)
 -- | 单侧文件状态变化
-data DiffState = None | New | Update | Delete
+-- | 单侧文件差异（5 种）
+--
+--   * 'None'  — 该侧从未有过此文件
+--   * 'Unchanged'    — 文件存在且未变
+--   * 'New'     — 新增
+--   * 'Updated'  — 修改
+--   * 'Deleted'  — 删除
+data DiffState = None | Unchanged | New | Updated | Deleted
     deriving (Show, Eq)
 
 -- | 文件变更决策，携带双方各自的 DiffState
 --
 --   * 'Added'     — 本方应接收。root1Diff/root2Diff 说明两侧变化
---   * 'Deleted'   — 本方应删除
+--   * 'Del'   — 本方应删除
 --   * 'Conflict'  — 双方冲突
---   * 'Unchanged' — 无变化
+--   * 'Noop' — 无变化
 data FileChange
-    = Unchanged FileState DiffState DiffState
+    = Noop FileState DiffState DiffState
     | Added     FileState DiffState DiffState
-    | Deleted   FileState DiffState DiffState
+    | Del   FileState DiffState DiffState
     | Conflict  FileState DiffState DiffState
     deriving (Show, Eq)
 
@@ -334,11 +341,11 @@ diffOneSide prev cur =
             case lookupPrev (filename fs) of
                 Nothing     -> (New,    fs)
                 Just prevFs -> if sameFile fs prevFs
-                    then (None,   fs)
-                    else (Update, fs)
+                    then (Unchanged, fs)
+                    else (Updated,   fs)
             ) cur
 
-        delDiffs = [ (Delete, fs)
+        delDiffs = [ (Deleted, fs)
                    | fs <- prev
                    , filename fs `notElem` curNames
                    ]

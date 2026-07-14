@@ -137,7 +137,7 @@ cmdState = do
     cur  <- currentState cwd
 
     let diffs = diffOneSide prev cur
-        changed = [ (ds, fs) | (ds, fs) <- diffs, ds /= None ]
+        changed = [ (ds, fs) | (ds, fs) <- diffs, ds /= Unchanged ]
 
     putStrLn $ "Last merged state: " ++ show (length prev) ++ " files"
     putStrLn $ "Current directory:  " ++ show (length cur)  ++ " files"
