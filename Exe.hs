@@ -13,7 +13,8 @@ import System.Environment (getExecutablePath)
 import System.FilePath ((</>), takeDirectory)
 import System.IO
     ( hClose, hFlush, hGetLine, hSetBinaryMode
-    , hSetEncoding, utf8, stdout
+    , hSetEncoding, utf8, stdout, stdin
+    , hSetEcho, hSetBuffering, BufferMode(..)
     )
 import System.Posix.Files (setFileTimes, setFileMode)
 import System.Posix.Types (EpochTime)
@@ -62,17 +63,22 @@ runSync root1 root2 = do
     else do
         putStr "\nProceed? [y/N] "
         hFlush stdout
-        answer <- getLine
-        unless (map toLower answer `elem` ["y", "yes"]) $ do
-            putStrLn "Aborted."
-            return ()
-        -- 执行
-        bracket (maybe (return Nothing) (\h -> Just <$> spawnHelper h path1) mHost1) (maybe (return ()) (\hh -> destroyHelper hh)) $ \mHh1 ->
-          bracket (maybe (return Nothing) (\h -> Just <$> spawnHelper h path2) mHost2) (maybe (return ()) (\hh -> destroyHelper hh)) $ \mHh2 -> do
-            let side1 = case mHh1 of Just hh -> Rmt hh; Nothing -> Lcl path1
-                side2 = case mHh2 of Just hh -> Rmt hh; Nothing -> Lcl path2
-            execute side1 side2 pairs1'
-            execute side2 side1 pairs2'
+        hSetBuffering stdin NoBuffering
+        hSetEcho stdin False
+        answer <- getChar
+        hSetEcho stdin True
+        let yes = toLower answer == 'y'
+        putStrLn [answer]
+        if not yes
+            then putStrLn "Aborted."
+            else do
+                -- 执行
+                bracket (maybe (return Nothing) (\h -> Just <$> spawnHelper h path1) mHost1) (maybe (return ()) (\hh -> destroyHelper hh)) $ \mHh1 ->
+                  bracket (maybe (return Nothing) (\h -> Just <$> spawnHelper h path2) mHost2) (maybe (return ()) (\hh -> destroyHelper hh)) $ \mHh2 -> do
+                    let side1 = case mHh1 of Just hh -> Rmt hh; Nothing -> Lcl path1
+                        side2 = case mHh2 of Just hh -> Rmt hh; Nothing -> Lcl path2
+                    execute side1 side2 pairs1'
+                    execute side2 side1 pairs2'
 
     putStrLn "\nSync complete."
 
