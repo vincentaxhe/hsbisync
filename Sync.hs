@@ -1,6 +1,7 @@
 module Sync where
 
 import Data.List (nub, find)
+import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import State (FileState(..), FileChange(..), DiffState(..), sameFile)
 
 -- | 同步操作
@@ -186,7 +187,7 @@ classifyOne lm1 lm2 cm1 cm2 name =
         -- 兜底
         _ -> (nop, nop)
 
-  where dummy = FileState 0 (error "dummy") 0 name
+  where dummy = FileState 0 (posixSecondsToUTCTime 0) 0 name
 
 lookupFS :: [FileState] -> FilePath -> Maybe FileState
 lookupFS fs name = find (\f -> filename f == name) fs
