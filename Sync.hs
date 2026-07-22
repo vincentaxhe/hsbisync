@@ -49,13 +49,17 @@ resolveConflicts pairs1 pairs2 =
     let conflicts1 = [(fc, fs) | (fc@(Conflict fs _ _), _) <- pairs1]
         conflicts2 = [(fc, fs) | (fc@(Conflict fs _ _), _) <- pairs2]
 
-        -- New/Updated + sameFile → RecordAdd
+        -- New/Updated/Unchanged + sameFile → RecordAdd
+        --   * New+New / Updated+Updated / New+Updated → 双方内容相同则 ADD
+        --   * Unchanged+New / New+Unchanged → 一侧未变一侧新增，
+        --     内容相同则在新侧记 ADD（消解为已同步）
         resolvedAdd = [ (name, fs1)
                       | ((Conflict fs1 d1 _), fs1') <- conflicts1, let name = filename fs1
-                      , d1 `elem` [New, Updated]
-                      , (Conflict fs2 d2 _, _) <- conflicts2
-                      , filename fs2 == name, d2 `elem` [New, Updated]
-                      , sameFile fs1' fs2
+                      , d1 `elem` [New, Updated, Unchanged]
+                      , (Conflict fs2 d2 _, fs2') <- conflicts2
+                      , filename fs2 == name, d2 `elem` [New, Updated, Unchanged]
+                      , not (d1 == Unchanged && d2 == Unchanged)
+                      , sameFile fs1' fs2'
                       ]
 
         -- Deleted+Deleted → RecordDelete
@@ -70,8 +74,8 @@ resolveConflicts pairs1 pairs2 =
         keepInPairs2 _                    = True
 
         convert ((Conflict fs d1 d2), _)
-            | filename fs `elem` resolvedDel                                      = (Del fs d1 d2, Just RecordDelete)
-            | filename fs `elem` map fst resolvedAdd, d1 `elem` [New, Updated]     = (Noop fs d1 d2, Just RecordAdd)
+            | filename fs `elem` resolvedDel                                = (Del fs d1 d2, Just RecordDelete)
+            | filename fs `elem` map fst resolvedAdd                        = (Noop fs d1 d2, Just RecordAdd)
         convert other = other
 
     in (resolvedAdd, map convert pairs1, filter keepInPairs2 pairs2)
