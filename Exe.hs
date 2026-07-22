@@ -4,6 +4,7 @@ import Control.Concurrent.Async (concurrently)
 import Control.Exception (bracket, catch, IOException)
 import Control.Monad (forM_, unless, when)
 import Data.Char (toLower)
+import Data.List (nub)
 import Data.Maybe (fromMaybe, isJust)
 import System.Environment (getExecutablePath)
 import System.FilePath ((</>))
@@ -299,7 +300,7 @@ showSummary pairs1 pairs2 = do
         del2 = [ (f, d1, d2) | (Del  fs d1 d2, Just Remove)  <- pairs2, let f = filename fs ]
         recAdds = [ f | (Noop fs _ _, Just RecordAdd)    <- pairs1, let f = filename fs ]
         recDels = [ f | (Del   fs _ _, Just RecordDelete) <- pairs1, let f = filename fs ]
-        conf = [ (f, d1, d2) | (Conflict fs d1 d2, Just Unsolvable) <- pairs1 ++ pairs2, let f = filename fs ]
+        conf = nub [ (f, d1, d2) | (Conflict fs d1 d2, Just Unsolvable) <- pairs1 ++ pairs2, let f = filename fs ]
 
     when (not (null del1)) $ do
         putStrLn "\nroot1 will delete:"
