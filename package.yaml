@@ -9,7 +9,7 @@ copyright:           "2026 Vincent"
 description:         A bidirectional file sync tool written in Haskell
 
 dependencies:
-- aeson
+- json
 - async
 - base >= 4.7 && < 5
 - bytestring

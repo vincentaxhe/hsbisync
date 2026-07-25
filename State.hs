@@ -1,14 +1,12 @@
-{-# LANGUAGE DeriveGeneric, DeriveAnyClass #-}
 module State where
 
 import Control.Exception (catch, IOException)
 import Control.Monad (when)
-import Data.Aeson (FromJSON, ToJSON)
 import Data.Bits ((.&.))
 import Data.Maybe (fromMaybe)
 import Data.Time (UTCTime)
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime, utcTimeToPOSIXSeconds)
-import GHC.Generics (Generic)
+
 import System.Directory
     ( createDirectoryIfMissing, doesDirectoryExist, doesFileExist
     , listDirectory, removeFile, renameFile
@@ -17,10 +15,10 @@ import System.FilePath (takeFileName, (</>), takeDirectory)
 import System.Posix.Files
     ( getFileStatus, fileSize, fileMode, modificationTime
     )
+import Text.JSON
 
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.ByteString as BS
-import qualified Data.Aeson as Aeson
 import qualified Data.Text.Encoding as T
 import qualified Data.Text as T (pack, unpack)
 
@@ -32,14 +30,14 @@ import qualified Data.Text as T (pack, unpack)
 --
 --   本地和远程都归一化到此类型：
 --   * 本地：@EpochTime → UTCTime@（通过 'posixSecondsToUTCTime'）
---   * 远程：JSON 中的 ISO 8601 字符串 → 'UTCTime'（通过 aeson）
+--   * 远程：JSON 中的 epoch 秒整数 → 'UTCTime'（通过 json）
 --   两者产生等价的 'Eq' 实例，'Sync.sync' 可直接比较。
 data FileState = FileState
     { size     :: !Integer
     , mtime    :: !UTCTime
     , mode     :: !Int
     , filename :: !FilePath
-    } deriving (Show, Eq, Generic, FromJSON, ToJSON)
+    } deriving (Show, Eq)
 
 -- | diff 条目
 data DiffEntry = DiffEntry
@@ -47,7 +45,7 @@ data DiffEntry = DiffEntry
     , deSize  :: !Integer
     , deMtime :: !Integer
     , deFile  :: !FilePath
-    } deriving (Show, Eq, Generic, FromJSON, ToJSON)
+    } deriving (Show, Eq)
 -- | 单侧文件状态变化
 -- | 单侧文件差异（5 种）
 --
@@ -351,16 +349,56 @@ diffOneSide prev cur =
                    ]
     in curDiffs ++ delDiffs
 
+-- ============================================================================
+-- JSON 编解码（json 包，纯 Haskell，无 C++ 依赖）
+-- ============================================================================
+
+-- | FileState 的 JSON 实例
+instance JSON FileState where
+    showJSON (FileState sz mt md fn) =
+        makeObj [ ("size",     showJSON sz)
+                , ("mtime",    showJSON (posixSecs mt))
+                , ("mode",     showJSON md)
+                , ("filename", showJSON fn)
+                ]
+
+    readJSON (JSObject obj) = do
+        sz <- valFromObj "size" obj
+        mt <- valFromObj "mtime" obj
+        md <- valFromObj "mode" obj
+        fn <- valFromObj "filename" obj
+        return $ FileState sz (posixSecondsToUTCTime (realToFrac (mt :: Integer))) md fn
+    readJSON _ = Error "FileState: expected object"
+
+-- | DiffEntry 的 JSON 实例
+instance JSON DiffEntry where
+    showJSON (DiffEntry st sz mt fn) =
+        makeObj [ ("deState", showJSON st)
+                , ("deSize",  showJSON sz)
+                , ("deMtime", showJSON mt)
+                , ("deFile",  showJSON fn)
+                ]
+
+    readJSON (JSObject obj) = do
+        st <- valFromObj "deState" obj
+        sz <- valFromObj "deSize" obj
+        mt <- valFromObj "deMtime" obj
+        fn <- valFromObj "deFile" obj
+        return $ DiffEntry st sz mt fn
+    readJSON _ = Error "DiffEntry: expected object"
+
 -- | 将 FileState 列表编码为 JSON（供 GETSTATE/GETLAST 使用）
 stateJSON :: [FileState] -> BL.ByteString
-stateJSON = Aeson.encode
+stateJSON = BL.fromStrict . T.encodeUtf8 . T.pack . encode
 
--- | 从 JSON 解析 FileState 列表（客户端使用）
+-- | 从 JSON 解析 FileState 列表
 parseStateJSON :: BL.ByteString -> [FileState]
-parseStateJSON bs = case Aeson.decode bs of
-    Just fs -> fs
-    Nothing -> error $ "parseStateJSON: invalid JSON: " ++ show (BL.take 200 bs)
+parseStateJSON bs = case decode (T.unpack (T.decodeUtf8 (BL.toStrict bs))) of
+    Ok fs   -> fs
+    Error e -> error $ "parseStateJSON: invalid JSON: " ++ e
 
 -- | 将 diff 列表编码为 JSON
 diffJSON :: [DiffEntry] -> BL.ByteString
-diffJSON = Aeson.encode
+diffJSON = BL.fromStrict . T.encodeUtf8 . T.pack . encode
+
+
