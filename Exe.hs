@@ -323,7 +323,7 @@ showSummary pairs1 pairs2 = do
         forM_ recAdds $ \f ->
             putStrLn $ "  - " ++ f
     when (not (null recDels)) $ do
-        putStrLn "\nAlready deleted on both sides (will record):"
+        putStrLn "\nAlready deleted on both sides (will record as deleted):"
         forM_ recDels $ \f ->
             putStrLn $ "  - " ++ f
     when (not (null conf)) $ do
