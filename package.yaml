@@ -17,6 +17,7 @@ dependencies:
 - cryptonite
 - directory
 - filepath
+- gitignore-ospath
 - memory
 - process
 - text

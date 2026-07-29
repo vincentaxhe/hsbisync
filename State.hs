@@ -12,15 +12,23 @@ import System.Directory
     , listDirectory, removeFile, renameFile
     )
 import System.FilePath (takeFileName, (</>), takeDirectory)
+import System.OsPath (encodeFS)
 import System.Posix.Files
     ( getFileStatus, fileSize, fileMode, modificationTime
     )
 import Text.JSON
 
+import Ignore (Ignore, parse, ignores)
+
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.ByteString as BS
 import qualified Data.Text.Encoding as T
+import qualified Data.Text.IO as TIO
 import qualified Data.Text as T (pack, unpack)
+
+-- | 空的 gitignore 规则集
+emptyIgnore :: Ignore
+emptyIgnore = parse (T.pack "")
 
 -- ============================================================================
 -- Data types
@@ -74,27 +82,59 @@ data FileChange
 -- 获取当前文件状态（扫描 root 目录）
 -- ============================================================================
 
+-- | 从 @.bisync/<profile>/ignore@ 读取忽略规则
+readProfileIgnore :: FilePath -> Maybe String -> IO Ignore
+readProfileIgnore root mTag = do
+    let ignoreFile = root </> ".bisync" </> fromMaybe "" mTag </> "ignore"
+    exists <- doesFileExist ignoreFile
+    if exists
+        then parse <$> TIO.readFile ignoreFile
+        else return emptyIgnore
+
 -- | 扫描目录，返回所有非隐藏文件的相对路径（深度优先）
 --
 --   隐藏文件/目录（以 @.@ 开头）会被跳过，隐藏目录不进入。
-scanFiles :: FilePath -> IO [FilePath]
-scanFiles root = scanRel root root
+--   同时读取 @.bisync/<profile>/ignore@ 文件，按规则过滤条目。
+scanFiles :: FilePath -> Maybe String -> IO [FilePath]
+scanFiles root mTag = do
+    ign <- readProfileIgnore root mTag
+    scanRel' root root ign
 
 -- | 扫描 root 目录，返回所有非隐藏文件的 FileState 列表（相对路径）
 --
 --   等同于 @scanFiles + statRel@
-currentState :: FilePath -> IO [FileState]
-currentState root = do
-    files <- scanRel root root
+currentState :: FilePath -> Maybe String -> IO [FileState]
+currentState root mTag = do
+    ign <- readProfileIgnore root mTag
+    files <- scanRel' root root ign
     mapM (statRel root) files
 
--- | 内部递归扫描
+-- | 内部递归扫描（兼容旧接口，不使用任何忽略规则）
 scanRel :: FilePath -> FilePath -> IO [FilePath]
-scanRel root dir = do
+scanRel root dir = scanRel' root dir emptyIgnore
+
+-- | 递归扫描，使用给定的 gitignore 规则过滤所有条目
+scanRel' :: FilePath -> FilePath -> Ignore -> IO [FilePath]
+scanRel' root dir ignoreRules = do
     entries <- listDirectory dir
     let visible = filter (not . isHidden . takeFileName) entries
-    (dirs, files) <- partitionM doesDirectoryExist [dir </> e | e <- visible]
-    subFiles <- concat <$> mapM (scanRel root) dirs
+
+    -- 判断每个条目是否为目录
+    let fullPaths  = [dir </> e | e <- visible]
+    isDirFlags <- mapM doesDirectoryExist fullPaths
+
+    -- 将路径转为相对于 root 的形式，供 gitignore 匹配
+    let relPaths = map (makeRelative root) fullPaths
+    osPaths  <- mapM encodeFS relPaths
+    let ignored  = zipWith (ignores ignoreRules) osPaths isDirFlags
+        kept     = [ (fp, isDir)
+                   | (fp, isDir, ign) <- zip3 fullPaths isDirFlags ignored
+                   , not ign ]
+
+    let dirs  = [d | (d, True ) <- kept]
+        files = [f | (f, False) <- kept]
+
+    subFiles <- concat <$> mapM (\d -> scanRel' root d ignoreRules) dirs
     let relFiles = map (makeRelative root) files
     return (subFiles ++ relFiles)
 
@@ -278,7 +318,7 @@ makeRelative root path =
 diffState :: FilePath -> Maybe String -> IO BL.ByteString
 diffState root mTag = do
     prev <- lastState root mTag
-    cur  <- currentState root
+    cur  <- currentState root mTag
 
     let diffs = diffOneSide prev cur
     return $ diffJSON [mkDiffEntry ds fs | (ds, fs) <- diffs]

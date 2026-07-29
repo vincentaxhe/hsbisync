@@ -2,7 +2,7 @@ module Main where
 
 import Control.Monad (forM_, unless)
 import System.Directory
-    ( doesDirectoryExist, doesFileExist
+    ( createDirectoryIfMissing, doesDirectoryExist, doesFileExist
     , getCurrentDirectory, listDirectory
     )
 import System.Environment (getArgs)
@@ -30,13 +30,13 @@ main :: IO ()
 main = do
     args <- getArgs
     case args of
-        "--helper" : rest -> helperMain rest
-        ["--help"]        -> showHelp
-        ["log", profile]  -> cmdLog profile
+        "--helper" : rest  -> helperMain rest
+        ["--help"]         -> showHelp
+        ["log", profile]   -> cmdLog profile
         ["state", profile] -> cmdState profile
-        ["profile"]        -> cmdProfile
-        "sync" : rest     -> syncCmd rest
-        _                 -> showHelp
+        "profile" : rest   -> cmdProfile rest
+        "sync" : rest      -> syncCmd rest
+        _                  -> showHelp
 
 showHelp :: IO ()
 showHelp = putStrLn $ unlines
@@ -44,11 +44,14 @@ showHelp = putStrLn $ unlines
     , ""
     , "Usage:"
     , "  hsbisync sync <profile> [<root1> <root2>]"
-    , "    With 3 args: sync two directories using <profile>"
     , "    With 1 arg:  read peer from .bisync/<profile>/repo and sync"
+    , "    With 3 args: sync two directories using <profile>"
     , "  hsbisync log <profile>             Show pending changes"
     , "  hsbisync state <profile>           Preview changes (read-only)"
-    , "  hsbisync profile                   List profiles and their peers"
+    , "  hsbisync profile                   List all profiles"
+    , "  hsbisync profile <name>            Show profile details"
+    , "  hsbisync profile <name> <addr> [--repo <a>] [--ignore <r>] ..."
+    , "                                      Configure profile at multiple paths"
     , "  hsbisync --help                    Show this help"
     , ""
     , "Root formats:"
@@ -88,14 +91,35 @@ dropPrefix prefix s
 -- ============================================================================
 
 -- | hsbisync sync <profile> [<root1> <root2>]
---   一个参数：读 .bisync/<profile>/repo 获取对端地址（须手动创建）
---   三个参数：profile + 双端直接同步（不写 repo，repo 须手动维护）
+--   一个参数：读 .bisync/<profile>/repo 获取对端地址
+--   三个参数：profile + 双端直接同步
 syncCmd :: [String] -> IO ()
 syncCmd [profile] = syncFromRepo profile
 syncCmd args@[_, _, _] = do
     (profile, root1, root2) <- parseSyncThree args
     runSync profile root1 root2
 syncCmd _ = die "Usage: hsbisync sync <profile> [<root1> <root2>]"
+
+-- ============================================================================
+-- 参数解析工具
+-- ============================================================================
+
+-- | 解析 --key value 风格的标志，返回 [(flag, value)] 和剩余参数
+parseFlags :: [String] -> ([(String, String)], [String])
+parseFlags [] = ([], [])
+parseFlags (a:b:xs)
+    | a == "--repo" || a == "--ignore" =
+        let (more, rest) = parseFlags xs in ((a, b) : more, rest)
+parseFlags (x:xs) =
+    let (flags, rest) = parseFlags xs in (flags, x : rest)
+
+-- | 将 \\n 转义序列转换为实际换行符
+unescapeNewlines :: String -> String
+unescapeNewlines = go
+  where
+    go [] = []
+    go ('\\':'n':xs) = '\n' : go xs
+    go (x:xs)        = x   : go xs
 
 -- ============================================================================
 -- sync (profile only) — 读 .bisync/<profile>/repo，与记录的对端同步
@@ -155,7 +179,7 @@ cmdState :: String -> IO ()
 cmdState profile = do
     cwd <- getCurrentDirectory
     prev <- readLastState cwd (Just profile)
-    cur  <- currentState cwd
+    cur  <- currentState cwd (Just profile)
 
     let diffs = diffOneSide prev cur
         changed = [ (ds, fs) | (ds, fs) <- diffs, ds /= Unchanged ]
@@ -171,16 +195,39 @@ cmdState profile = do
                 putStrLn $ "  " ++ pad 8 (show ds) ++ "  " ++ filename fs
 
 -- ============================================================================
--- profile 子命令：列出 .bisync/ 下所有 profile 及其对端地址
+-- profile 子命令
 -- ============================================================================
 
-cmdProfile :: IO ()
-cmdProfile = do
+-- | hsbisync profile                                — 列出所有 profile
+--   hsbisync profile <name>                         — 显示指定 profile
+--   hsbisync profile <name> <addr> [flags] [<addr> [flags] ...]
+--     flags: --repo <addr>  --ignore <rules>         — 在多个路径下配置 profile
+cmdProfile :: [String] -> IO ()
+cmdProfile [] = cmdProfileList
+cmdProfile [name] = cmdProfileShow name
+cmdProfile (name : rest) =
+    case parseBlocks rest of
+        []  -> die "Usage: hsbisync profile <name> <addr> [--repo <addr>] [--ignore <rules>] ..."
+        blks -> forM_ blks $ \(path, mRepo, mIgnore) ->
+            cmdProfileConfig name path mRepo mIgnore
+
+-- | 将参数列表解析为多个地址块 [(path, mRepo, mIgnore)]
+parseBlocks :: [String] -> [(FilePath, Maybe String, Maybe String)]
+parseBlocks [] = []
+parseBlocks (p : xs)
+    | p == "--repo" || p == "--ignore" = []  -- 孤立标志，忽略
+    | otherwise =
+        let (flags, rest) = parseFlags xs
+        in (p, lookup "--repo" flags, lookup "--ignore" flags) : parseBlocks rest
+
+-- | 列出 .bisync/ 下所有 profile
+cmdProfileList :: IO ()
+cmdProfileList = do
     cwd <- getCurrentDirectory
     let bisyncDir = cwd </> ".bisync"
     exists <- doesDirectoryExist bisyncDir
     if not exists
-        then putStrLn "No .bisync directory found. Run 'hsbisync sync <profile> ...' first."
+        then putStrLn "No .bisync directory found."
         else do
             entries <- listDirectory bisyncDir
             let profiles = filter (not . isHidden) entries
@@ -188,21 +235,62 @@ cmdProfile = do
                 then putStrLn "No profiles found."
                 else do
                     putStrLn "Profiles:"
-                    forM_ profiles $ \name -> do
-                        let isDir = doesDirectoryExist (bisyncDir </> name)
-                            -- quick check: if it's a directory, it's a profile
-                        isProfile <- isDir
-                        if not isProfile
-                            then return ()
-                            else do
-                                let repoFile = bisyncDir </> name </> "repo"
-                                hasRepo <- doesFileExist repoFile
-                                if hasRepo
-                                    then do
-                                        peer <- filter (not . (`elem` "\n\r")) <$> readFile repoFile
-                                        putStrLn $ "  " ++ name ++ "  →  " ++ peer
-                                    else
-                                        putStrLn $ "  " ++ name ++ "  (no peer recorded)"
+                    forM_ profiles $ \name ->
+                        showProfile bisyncDir name
+
+-- | 显示单个 profile 详情（从 CWD）
+cmdProfileShow :: String -> IO ()
+cmdProfileShow name = do
+    cwd <- getCurrentDirectory
+    let bisyncDir = cwd </> ".bisync"
+    exists <- doesDirectoryExist (bisyncDir </> name)
+    if not exists
+        then putStrLn $ "Profile '" ++ name ++ "' not found."
+        else showProfile bisyncDir name
+
+-- | 在指定路径下创建/更新 profile 配置文件
+cmdProfileConfig :: String -> FilePath -> Maybe String -> Maybe String -> IO ()
+cmdProfileConfig name path mRepo mIgnore = do
+    let profDir = path </> ".bisync" </> name
+    createDirectoryIfMissing True profDir
+    putStrLn $ "[" ++ path ++ "]"
+    case mRepo of
+        Just addr -> do
+            writeFile (profDir </> "repo") addr
+            putStrLn $ "  repo: " ++ addr
+        Nothing -> return ()
+    case mIgnore of
+        Just rules -> do
+            writeFile (profDir </> "ignore") (unescapeNewlines rules)
+            putStrLn "  ignore: written"
+        Nothing -> return ()
+
+-- | 显示单个 profile 的 repo 和 ignore 内容
+showProfile :: FilePath -> String -> IO ()
+showProfile bisyncDir name = do
+    let repoFile   = bisyncDir </> name </> "repo"
+        ignoreFile = bisyncDir </> name </> "ignore"
+    hasRepo   <- doesFileExist repoFile
+    hasIgnore <- doesFileExist ignoreFile
+
+    peerText <- if hasRepo
+        then do
+            peer <- filter (not . (`elem` "\n\r")) <$> readFile repoFile
+            return $ "repo: " ++ peer
+        else return "repo: -"
+
+    ignoreLines <- if hasIgnore
+        then lines <$> readFile ignoreFile
+        else return []
+
+    putStrLn $ "  " ++ name
+    putStrLn $ "    " ++ peerText
+    if null ignoreLines
+        then putStrLn "    ignore: -"
+        else do
+            putStrLn "    ignore:"
+            forM_ ignoreLines $ \l ->
+                putStrLn $ "      " ++ l
 
 -- | 文件名是否以 '.' 开头
 isHidden :: FilePath -> Bool

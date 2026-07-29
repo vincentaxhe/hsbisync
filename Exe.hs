@@ -95,7 +95,7 @@ readSide :: Maybe String -> Maybe String -> FilePath -> IO (String, ([FileState]
 readSide mTag mHost path =
     case mHost of
         Nothing -> do
-            st <- (,) <$> lastState path mTag <*> currentState path
+            st <- (,) <$> lastState path mTag <*> currentState path mTag
             return ("local", st)
         Just host -> do
             hh <- spawnHelper host path (fromMaybe "" mTag)

@@ -93,8 +93,8 @@ cmdGetDiff root mTag = do
 
 -- | GETSTATE — 返回当前文件状态列表（JSON）
 cmdGetState :: FilePath -> Maybe String -> IO ()
-cmdGetState root _mTag = do
-    st <- currentState root
+cmdGetState root mTag = do
+    st <- currentState root mTag
     putStrLn "OK"
     BL.hPutStr stdout (BL.snoc (stateJSON st) 10)
     hFlush stdout
