@@ -15,6 +15,7 @@ import System.Posix.Files
 
 import Crypto.Hash (hash, SHA512, Digest)
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Char8 as B8
 import qualified Data.ByteString.Lazy as BL
 
 -- ============================================================================
@@ -102,7 +103,7 @@ readJSON hh cmd = do
     case resp of
         RErr msg -> return $ Left msg
         ROk _    -> do
-            line <- BS.hGetLine (hhOut hh)
+            line <- B8.hGetLine (hhOut hh)
             return $ Right (BL.fromStrict line)
 
 -- ============================================================================
@@ -210,6 +211,48 @@ removeFileSafe fp = do
 --   已由 'writeFileAtomic' 替代，保留此别名避免大规模改动。
 writeFileLocal :: FilePath -> BS.ByteString -> IO ()
 writeFileLocal = writeFileAtomic
+
+-- ============================================================================
+-- 远程写入 profile 配置文件（repo / ignore）
+-- ============================================================================
+
+-- | 通过 helper 协议向远端写入 repo 文件
+--
+--   协议：PUTREPO <size> → OK → 发送内容 → OK/ERROR
+putRepoRemote :: HelperHandle -> BS.ByteString -> IO (Either String ())
+putRepoRemote hh content = do
+    let cmd = "PUTREPO " ++ show (BS.length content)
+    sendCommand hh cmd
+    resp <- readResponse hh
+    case resp of
+        RErr msg -> return $ Left ("PUTREPO: " ++ msg)
+        ROk _ -> do
+            hSetBinaryMode (hhIn hh) True
+            hPutFully (hhIn hh) content
+            hFlush (hhIn hh)
+            resp2 <- readResponse hh
+            case resp2 of
+                ROk _    -> return $ Right ()
+                RErr msg -> return $ Left ("PUTREPO write: " ++ msg)
+
+-- | 通过 helper 协议向远端写入 ignore 文件
+--
+--   协议：PUTIGNORE <size> → OK → 发送内容 → OK/ERROR
+putIgnoreRemote :: HelperHandle -> BS.ByteString -> IO (Either String ())
+putIgnoreRemote hh content = do
+    let cmd = "PUTIGNORE " ++ show (BS.length content)
+    sendCommand hh cmd
+    resp <- readResponse hh
+    case resp of
+        RErr msg -> return $ Left ("PUTIGNORE: " ++ msg)
+        ROk _ -> do
+            hSetBinaryMode (hhIn hh) True
+            hPutFully (hhIn hh) content
+            hFlush (hhIn hh)
+            resp2 <- readResponse hh
+            case resp2 of
+                ROk _    -> return $ Right ()
+                RErr msg -> return $ Left ("PUTIGNORE write: " ++ msg)
 
 -- | 通过 helper 协议在两个 helper 之间复制文件
 --

@@ -1,6 +1,8 @@
 module Main where
 
+import Control.Exception (bracket, try, displayException, SomeException)
 import Control.Monad (forM_, unless)
+import Data.Maybe (isNothing)
 import System.Directory
     ( createDirectoryIfMissing, doesDirectoryExist, doesFileExist
     , getCurrentDirectory, listDirectory
@@ -11,11 +13,12 @@ import System.FilePath ((</>))
 
 import qualified Data.ByteString as BS
 import qualified Data.Text.Encoding as T
-import qualified Data.Text as T (unpack)
+import qualified Data.Text as T (unpack, pack)
 
 import Arg (Root(..), parseRoot, parseSyncThree)
-import Exe (runSync)
+import Exe (runSync, spawnHelper, destroyHelper)
 import Helper (runHelper)
+import Write (HelperHandle(..), putRepoRemote, putIgnoreRemote)
 import State
     ( FileState(..), DiffState(..)
     , readLastState, currentState, diffOneSide
@@ -103,15 +106,6 @@ syncCmd _ = die "Usage: hsbisync sync <profile> [<root1> <root2>]"
 -- ============================================================================
 -- 参数解析工具
 -- ============================================================================
-
--- | 解析 --key value 风格的标志，返回 [(flag, value)] 和剩余参数
-parseFlags :: [String] -> ([(String, String)], [String])
-parseFlags [] = ([], [])
-parseFlags (a:b:xs)
-    | a == "--repo" || a == "--ignore" =
-        let (more, rest) = parseFlags xs in ((a, b) : more, rest)
-parseFlags (x:xs) =
-    let (flags, rest) = parseFlags xs in (flags, x : rest)
 
 -- | 将 \\n 转义序列转换为实际换行符
 unescapeNewlines :: String -> String
@@ -212,6 +206,7 @@ cmdProfile (name : rest) =
             cmdProfileConfig name path mRepo mIgnore
 
 -- | 将参数列表解析为多个地址块 [(path, mRepo, mIgnore)]
+--   flags 只属于紧邻的前一个地址，遇到下一个地址停止消费
 parseBlocks :: [String] -> [(FilePath, Maybe String, Maybe String)]
 parseBlocks [] = []
 parseBlocks (p : xs)
@@ -219,6 +214,14 @@ parseBlocks (p : xs)
     | otherwise =
         let (flags, rest) = parseFlags xs
         in (p, lookup "--repo" flags, lookup "--ignore" flags) : parseBlocks rest
+
+-- | 只消费前导的 --key value 对，遇到非 flag 参数立即停止
+parseFlags :: [String] -> ([(String, String)], [String])
+parseFlags [] = ([], [])
+parseFlags (a:b:xs)
+    | a == "--repo" || a == "--ignore" =
+        let (more, rest) = parseFlags xs in ((a, b) : more, rest)
+parseFlags rest = ([], rest)
 
 -- | 列出 .bisync/ 下所有 profile
 cmdProfileList :: IO ()
@@ -249,20 +252,67 @@ cmdProfileShow name = do
         else showProfile bisyncDir name
 
 -- | 在指定路径下创建/更新 profile 配置文件
+--
+--   path 可以是本地路径或 user@host:/path 格式的远程路径。
+--   远程路径通过 helper 协议写入，写入失败会报错。
 cmdProfileConfig :: String -> FilePath -> Maybe String -> Maybe String -> IO ()
-cmdProfileConfig name path mRepo mIgnore = do
+cmdProfileConfig name path mRepo mIgnore
+    | isNothing mRepo && isNothing mIgnore = do
+        putStrLn $ "[" ++ path ++ "]"
+        putStrLn "  WARNING: no --repo or --ignore specified, nothing to write"
+    | otherwise = do
+    case parseRoot path of
+        Local localPath ->
+            writeProfileLocal name localPath mRepo mIgnore
+        Remote host remotePath -> do
+            putStrLn $ "[" ++ host ++ ":" ++ remotePath ++ "]"
+            result <- (try :: IO () -> IO (Either SomeException ())) $
+                bracket (spawnHelper host remotePath name)
+                        destroyHelper
+                        $ \hh -> writeProfileRemote hh mRepo mIgnore
+            case result of
+                Left e  -> putStrLn $ "  ERROR: " ++ displayException e
+                Right () -> return ()
+
+-- | 本地写入 profile 配置
+--
+--   要求 path 必须是已存在的目录，只在其下创建 .bisync/<name>/
+writeProfileLocal :: String -> FilePath -> Maybe String -> Maybe String -> IO ()
+writeProfileLocal name path mRepo mIgnore = do
+    exists <- doesDirectoryExist path
+    unless exists $
+        die $ "Path does not exist: " ++ path
     let profDir = path </> ".bisync" </> name
     createDirectoryIfMissing True profDir
     putStrLn $ "[" ++ path ++ "]"
     case mRepo of
         Just addr -> do
             writeFile (profDir </> "repo") addr
-            putStrLn $ "  repo: " ++ addr
+            putStrLn $ "  repo: " ++ addr ++ "  [OK]"
         Nothing -> return ()
     case mIgnore of
         Just rules -> do
             writeFile (profDir </> "ignore") (unescapeNewlines rules)
-            putStrLn "  ignore: written"
+            putStrLn $ "  ignore: " ++ rules ++ "  [OK]"
+        Nothing -> return ()
+
+-- | 通过 helper 协议远程写入 profile 配置
+writeProfileRemote :: HelperHandle -> Maybe String -> Maybe String -> IO ()
+writeProfileRemote hh mRepo mIgnore = do
+    case mRepo of
+        Just addr -> do
+            result <- putRepoRemote hh (T.encodeUtf8 (T.pack addr))
+            case result of
+                Left err -> die $ "Failed to write remote repo: " ++ err
+                Right () -> putStrLn $ "  repo: " ++ addr ++ "  [OK]"
+        Nothing -> return ()
+    case mIgnore of
+        Just rules -> do
+            let content = unescapeNewlines rules
+            result <- putIgnoreRemote hh (T.encodeUtf8 (T.pack content))
+            case result of
+                Left err -> die $ "Failed to write remote ignore: " ++ err
+                Right () -> putStrLn $ "  ignore: " ++ rules ++ "  [OK]"
         Nothing -> return ()
 
 -- | 显示单个 profile 的 repo 和 ignore 内容
