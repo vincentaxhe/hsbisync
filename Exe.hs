@@ -6,6 +6,7 @@ import Control.Monad (forM_, unless, when)
 import Data.Char (toLower)
 import Data.List (nub)
 import Data.Maybe (fromMaybe, isJust)
+import System.Directory (doesFileExist)
 import System.Environment (getExecutablePath)
 import System.FilePath ((</>))
 import System.IO
@@ -18,16 +19,16 @@ import System.Process (createProcess, proc, StdStream(..), CreateProcess(..))
 import qualified Data.ByteString as BS
 
 import State
-    ( FileState(..), FileChange(..), parseStateJSON
+    ( FileState(..), FileChange(..), parseStateJSON, statRel
     , currentState, lastState, appendAdded, appendDeleted, posixSecs
     )
 import Sync (sync, SyncAction(..), resolveConflicts)
 import Write
     ( HelperHandle(..), Response(..), sendCommand, readResponse, readJSON
     , hGetExactly, hPutFully, expectOK
-    , writeFileVerified, hashBytes, removeFileSafe
+    , writeFileVerified, hashBytes, removeFileSafe, getIgnoreRemote
     )
-import Arg (Root(..))
+import Arg (Root(..), rootLabel)
 
 -- ============================================================================
 -- 统一入口
@@ -43,14 +44,28 @@ runSync profile root1 root2 = do
         (mHost2, path2) = case root2 of Local p -> (Nothing, p); Remote h p -> (Just h, p)
         mTag = Just profile
 
-    -- 并行读取状态
-    putStrLn "\nReading states ..."
+    -- 阶段 0：明确两端地址
+    putStrLn $ "\n  root1 = " ++ rootLabel root1
+    putStrLn $ "  root2 = " ++ rootLabel root2
+    putStrLn $ "  profile: " ++ profile
+
+    -- 阶段 1：无条件先同步当前 profile 的 ignore 文件（较新一端覆盖较旧一端）。
+    -- 两端 ignore 必须先一致，之后各自扫描文件集合才不会出现偏差。
+    -- 此阶段之后 ignore 文件不再参与文件同步。
+    putStrLn "\n[1/3] Syncing ignore rules ..."
+    syncIgnoreFiles profile mHost1 path1 mHost2 path2
+
+    -- 阶段 2：并行读取两端状态（各自按已统一的 ignore 过滤）
+    putStrLn "\n[2/3] Reading states ..."
     ((label1, (last1, cur1)), (label2, (last2, cur2))) <-
         concurrently (readSide mTag mHost1 path1) (readSide mTag mHost2 path2)
 
     putStrLn $ "  root1 (" ++ label1 ++ "): " ++ show (length cur1) ++ " files (last: " ++ show (length last1) ++ ")"
     putStrLn $ "  root2 (" ++ label2 ++ "): " ++ show (length cur2) ++ " files (last: " ++ show (length last2) ++ ")"
 
+    -- 阶段 3：计算差异并实际同步文件。此阶段只处理两端扫描出的普通文件，
+    -- ignore 文件已在上面的阶段 1 处理，不会进入这里的记录/删除/传输。
+    putStrLn "\n[3/3] Syncing files ..."
     -- 计算 + 消解形式冲突
     let (pairs1, pairs2) = sync (last1, last2) (cur1, cur2)
         (_, pairs1', pairs2') = resolveConflicts pairs1 pairs2
@@ -80,6 +95,94 @@ runSync profile root1 root2 = do
                     execute mTag side2 side1 pairs2'
 
     putStrLn "\nSync complete."
+
+-- ============================================================================
+-- Ignore 规则预同步（同步开始前对齐两端 .bisync/<profile>/ignore）
+-- ============================================================================
+
+-- | 若该端为远程，则为其派生一个 helper 执行动作；本地端直接执行。
+withSide :: Maybe String -> FilePath -> String -> (Side -> IO a) -> IO a
+withSide Nothing path _ k = k (Lcl path)
+withSide (Just host) path profile k =
+    bracket (spawnHelper host path profile) destroyHelper (k . Rmt)
+
+-- | profile 的 ignore 文件相对路径（相对同步根目录）
+ignoreRel :: String -> FilePath
+ignoreRel profile = ".bisync" </> profile </> "ignore"
+
+-- | 读取本地 ignore 文件元信息 @(mtime, mode, sha512)@，不存在返回 Nothing
+localIgnoreMeta :: FilePath -> String -> IO (Maybe (Integer, Int, String))
+localIgnoreMeta root profile = do
+    let rel  = ignoreRel profile
+        full = root </> rel
+    e <- doesFileExist full
+    if not e
+        then return Nothing
+        else do
+            fs <- statRel root rel
+            content <- BS.readFile full
+            return $ Just (posixSecs (mtime fs), mode fs, hashBytes content)
+
+-- | 读取任一端 ignore 文件元信息
+sideIgnoreMeta :: Side -> String -> IO (Maybe (Integer, Int, String))
+sideIgnoreMeta (Lcl root) profile = localIgnoreMeta root profile
+sideIgnoreMeta (Rmt hh)   _        = getIgnoreRemote hh
+
+-- | 对齐两端 ignore 文件（在扫描状态之前调用）
+syncIgnoreFiles
+    :: String            -- ^ profile
+    -> Maybe String      -- ^ root1 host（Nothing=本地）
+    -> FilePath         -- ^ root1 路径
+    -> Maybe String      -- ^ root2 host
+    -> FilePath         -- ^ root2 路径
+    -> IO ()
+syncIgnoreFiles profile mHost1 path1 mHost2 path2 =
+    withSide mHost1 path1 profile $ \side1 ->
+      withSide mHost2 path2 profile $ \side2 ->
+        syncIgnore profile side1 side2
+
+-- | 两端 ignore 的合并决策：
+--   * 都无 → 无事
+--   * 仅一端有 → 复制到另一端
+--   * 都有且内容相同 → 跳过
+--   * 都有但内容不同 → 较新（mtime 大）的一端覆盖另一端；
+--     mtime 相同则告警并采用 root1
+syncIgnore :: String -> Side -> Side -> IO ()
+syncIgnore profile sideA sideB = do
+    mA <- sideIgnoreMeta sideA profile
+    mB <- sideIgnoreMeta sideB profile
+    case (mA, mB) of
+        (Nothing, Nothing) ->
+            putStrLn "  (no ignore file on root1 or root2)"
+        (Just a, Nothing) ->
+            copyIgnore profile sideA sideB "root2" a
+        (Nothing, Just b) ->
+            copyIgnore profile sideB sideA "root1" b
+        (Just a, Just b)
+            | hashOf a == hashOf b ->
+                putStrLn "  (ignore already identical on root1 and root2)"
+            | otherwise ->
+                case compare (mtOf a) (mtOf b) of
+                    GT -> copyIgnore profile sideA sideB "root2" a
+                    LT -> copyIgnore profile sideB sideA "root1" b
+                    EQ -> do
+                        putStrLn "  WARNING: ignore files differ but mtime is equal; using root1"
+                        copyIgnore profile sideA sideB "root2" a
+  where
+    mtOf   (m, _, _) = m
+    hashOf (_, _, h) = h
+
+-- | 把 src 端的 ignore 文件同步到 dst 端（经 transferContent 保留 mtime/mode）。
+--   只提示哪个 root 被更新了，不区分"较旧/缺失"、不指明来源。
+copyIgnore
+    :: String -> Side -> Side -> String
+    -> (Integer, Int, String)  -- ^ 源端 (mtime, mode, hash)
+    -> IO ()
+copyIgnore profile src dst dstName (mt, srcMode, _) = do
+    result <- transferContent src dst (ignoreRel profile) srcMode mt
+    case result of
+        Left err -> putStrLn $ "  ERROR: failed to sync ignore file: " ++ err
+        Right () -> putStrLn $ "  " ++ dstName ++ " ignore updated"
 
 -- ============================================================================
 -- 执行端类型
@@ -233,6 +336,8 @@ transferContent (Rmt hhSrc) (Lcl dstRoot) relPath srcMode srcMtime = do
     sz <- readSendSize hhSrc
     hSetBinaryMode (hhOut hhSrc) True
     content <- hGetExactly (hhOut hhSrc) sz
+    hSetBinaryMode (hhOut hhSrc) False             -- 恢复文本模式，供后续行协议读取
+    hSetEncoding (hhOut hhSrc) utf8                -- 显式重设 utf8（C locale 下二进制开关不恢复编码）
     writeFileVerified d content srcMode srcMtime expectedHash
 
 transferContent (Lcl srcRoot) (Rmt hhDst) relPath srcMode srcMtime = do
@@ -247,6 +352,8 @@ transferContent (Rmt hhSrc) (Rmt hhDst) relPath srcMode srcMtime = do
     sz <- readSendSize hhSrc
     hSetBinaryMode (hhOut hhSrc) True
     content <- hGetExactly (hhOut hhSrc) sz
+    hSetBinaryMode (hhOut hhSrc) False             -- 恢复文本模式
+    hSetEncoding (hhOut hhSrc) utf8                -- 显式重设 utf8
     recvVerified hhDst sz relPath srcMode srcMtime expectedHash content
 
 -- | 向远端 helper 发送 RECV 命令（扩展协议：带 mode/mtime/expectedHash），
@@ -263,6 +370,8 @@ recvVerified hh sz relPath mode_ mtime_ expectedHash content = do
             hSetBinaryMode (hhIn hh) True
             hPutFully (hhIn hh) content
             hFlush (hhIn hh)
+            hSetBinaryMode (hhIn hh) False       -- 恢复文本模式：后续命令可能含非 ASCII 文件名
+            hSetEncoding (hhIn hh) utf8          -- 显式重设 utf8（C locale 下不恢复编码）
             resp2 <- readResponse hh            -- 第二步：校验 + rename 结果
             case resp2 of
                 ROk _    -> return $ Right ()

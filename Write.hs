@@ -213,46 +213,27 @@ writeFileLocal :: FilePath -> BS.ByteString -> IO ()
 writeFileLocal = writeFileAtomic
 
 -- ============================================================================
--- 远程写入 profile 配置文件（repo / ignore）
+-- GETIGNORE — 通过 helper 协议读取远端 ignore 元信息
 -- ============================================================================
 
--- | 通过 helper 协议向远端写入 repo 文件
+-- | 通过 helper 协议读取远端 ignore 文件元信息（用于跨端比较）
 --
---   协议：PUTREPO <size> → OK → 发送内容 → OK/ERROR
-putRepoRemote :: HelperHandle -> BS.ByteString -> IO (Either String ())
-putRepoRemote hh content = do
-    let cmd = "PUTREPO " ++ show (BS.length content)
-    sendCommand hh cmd
-    resp <- readResponse hh
-    case resp of
-        RErr msg -> return $ Left ("PUTREPO: " ++ msg)
-        ROk _ -> do
-            hSetBinaryMode (hhIn hh) True
-            hPutFully (hhIn hh) content
-            hFlush (hhIn hh)
-            resp2 <- readResponse hh
-            case resp2 of
-                ROk _    -> return $ Right ()
-                RErr msg -> return $ Left ("PUTREPO write: " ++ msg)
-
--- | 通过 helper 协议向远端写入 ignore 文件
---
---   协议：PUTIGNORE <size> → OK → 发送内容 → OK/ERROR
-putIgnoreRemote :: HelperHandle -> BS.ByteString -> IO (Either String ())
-putIgnoreRemote hh content = do
-    let cmd = "PUTIGNORE " ++ show (BS.length content)
-    sendCommand hh cmd
-    resp <- readResponse hh
-    case resp of
-        RErr msg -> return $ Left ("PUTIGNORE: " ++ msg)
-        ROk _ -> do
-            hSetBinaryMode (hhIn hh) True
-            hPutFully (hhIn hh) content
-            hFlush (hhIn hh)
-            resp2 <- readResponse hh
-            case resp2 of
-                ROk _    -> return $ Right ()
-                RErr msg -> return $ Left ("PUTIGNORE write: " ++ msg)
+--   协议：GETIGNORE
+--   文件存在：OK <mtime> <mode> <sha512hex>
+--   文件不存在：OK -
+--   返回 @(mtime, mode, sha512hex)@；文件不存在返回 @Nothing@
+getIgnoreRemote :: HelperHandle -> IO (Maybe (Integer, Int, String))
+getIgnoreRemote hh = do
+    res <- expectOK hh "GETIGNORE"
+    case res of
+        Left err -> error $ "GETIGNORE failed: " ++ err
+        Right "-" -> return Nothing
+        Right msg -> case words msg of
+            [mtStr, modeStr, hashStr] ->
+                case (reads mtStr, reads modeStr) of
+                    ([(mt, "")], [(md, "")]) -> return $ Just (mt, md, hashStr)
+                    _ -> error $ "GETIGNORE: invalid response: " ++ msg
+            _ -> error $ "GETIGNORE: invalid response: " ++ msg
 
 -- | 通过 helper 协议在两个 helper 之间复制文件
 --

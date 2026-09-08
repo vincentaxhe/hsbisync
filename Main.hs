@@ -1,10 +1,8 @@
 module Main where
 
-import Control.Exception (bracket, try, displayException, SomeException)
 import Control.Monad (forM_, unless)
-import Data.Maybe (isNothing)
 import System.Directory
-    ( createDirectoryIfMissing, doesDirectoryExist, doesFileExist
+    ( canonicalizePath, createDirectoryIfMissing, doesDirectoryExist, doesFileExist
     , getCurrentDirectory, listDirectory
     )
 import System.Environment (getArgs)
@@ -13,12 +11,11 @@ import System.FilePath ((</>))
 
 import qualified Data.ByteString as BS
 import qualified Data.Text.Encoding as T
-import qualified Data.Text as T (unpack, pack)
+import qualified Data.Text as T (unpack)
 
-import Arg (Root(..), parseRoot, parseSyncThree)
-import Exe (runSync, spawnHelper, destroyHelper)
+import Arg (Root(..), parseRoot, parseSyncThree, ensureRoot)
+import Exe (runSync)
 import Helper (runHelper)
-import Write (HelperHandle(..), putRepoRemote, putIgnoreRemote)
 import State
     ( FileState(..), DiffState(..)
     , readLastState, currentState, diffOneSide
@@ -48,13 +45,11 @@ showHelp = putStrLn $ unlines
     , "Usage:"
     , "  hsbisync sync <profile> [<root1> <root2>]"
     , "    With 1 arg:  read peer from .bisync/<profile>/repo and sync"
-    , "    With 3 args: sync two directories using <profile>"
+    , "    With 3 args: sync two roots and record the peer into repo file(s)"
     , "  hsbisync log <profile>             Show pending changes"
     , "  hsbisync state <profile>           Preview changes (read-only)"
     , "  hsbisync profile                   List all profiles"
     , "  hsbisync profile <name>            Show profile details"
-    , "  hsbisync profile <name> <addr> [--repo <a>] [--ignore <r>] ..."
-    , "                                      Configure profile at multiple paths"
     , "  hsbisync --help                    Show this help"
     , ""
     , "Root formats:"
@@ -100,20 +95,49 @@ syncCmd :: [String] -> IO ()
 syncCmd [profile] = syncFromRepo profile
 syncCmd args@[_, _, _] = do
     (profile, root1, root2) <- parseSyncThree args
+    persistRepo profile root1 root2   -- 记录对端地址，供以后 hsbisync sync <profile>
     runSync profile root1 root2
 syncCmd _ = die "Usage: hsbisync sync <profile> [<root1> <root2>]"
 
 -- ============================================================================
--- 参数解析工具
+-- repo 持久化：显式双端 sync 时把对端地址写入本地仓库的 repo 文件
 -- ============================================================================
 
--- | 将 \\n 转义序列转换为实际换行符
-unescapeNewlines :: String -> String
-unescapeNewlines = go
+-- | 显式双端同步时，把对端地址记录到本地仓库的 .bisync/<profile>/repo，
+--   这样之后在仓库内直接 hsbisync sync <profile> 即可。
+--   * 两端都是本地 → 两端互写对方的绝对路径
+--   * 一端本地一端远程 → 只在本地端写远程地址（host:path）；
+--     远程端不写——反向的 ssh 地址难以确定
+persistRepo :: String -> Root -> Root -> IO ()
+persistRepo profile r1 r2 =
+    case (r1, r2) of
+        (Local p1, Local p2) -> do
+            a1 <- canonicalizePath p1
+            a2 <- canonicalizePath p2
+            writeRepo profile p1 a2
+            writeRepo profile p2 a1
+        (Local p1, Remote _ _) -> writeRepo profile p1 (remoteAddr r2)
+        (Remote _ _, Local p2) -> writeRepo profile p2 (remoteAddr r1)
+        (Remote _ _, Remote _ _) -> return ()
   where
-    go [] = []
-    go ('\\':'n':xs) = '\n' : go xs
-    go (x:xs)        = x   : go xs
+    -- 仅在 r1/r2 为 Remote 时调用
+    remoteAddr (Remote h p) = h ++ ":" ++ p
+    remoteAddr (Local _)    = ""
+
+-- | 把对端地址写入某个本地仓库（内容相同则跳过，不产生输出）
+writeRepo :: String -> FilePath -> String -> IO ()
+writeRepo profile localPath addr = do
+    let profDir = localPath </> ".bisync" </> profile
+        repoFp  = profDir </> "repo"
+    same <- doesFileExist repoFp >>= \e ->
+              if not e then return False
+              else (== addr) <$> filter (not . (`elem` "\n\r")) <$> readFile repoFp
+    if same
+        then return ()
+        else do
+            createDirectoryIfMissing True profDir
+            writeFile repoFp (addr ++ "\n")
+            putStrLn $ "  " ++ localPath ++ ": repo = " ++ addr ++ "  [OK]"
 
 -- ============================================================================
 -- sync (profile only) — 读 .bisync/<profile>/repo，与记录的对端同步
@@ -132,6 +156,8 @@ syncFromRepo profile = do
     peer <- filter (not . (`elem` "\n\r")) <$> readFile repoFile
     let root1 = Local cwd
         root2 = parseRoot peer
+    ensureRoot root1
+    ensureRoot root2
     runSync profile root1 root2
 
 -- ============================================================================
@@ -189,39 +215,19 @@ cmdState profile = do
                 putStrLn $ "  " ++ pad 8 (show ds) ++ "  " ++ filename fs
 
 -- ============================================================================
--- profile 子命令
+-- profile 子命令（只读：列出 / 显示某个 profile 的 repo 与 ignore）
 -- ============================================================================
 
--- | hsbisync profile                                — 列出所有 profile
---   hsbisync profile <name>                         — 显示指定 profile
---   hsbisync profile <name> <addr> [flags] [<addr> [flags] ...]
---     flags: --repo <addr>  --ignore <rules>         — 在多个路径下配置 profile
+-- | hsbisync profile            — 列出所有 profile
+--   hsbisync profile <name>     — 显示指定 profile
+--
+--   注：repo/ignore 不再由 profile 命令直接写入。
+--   repo 改为在 hsbisync sync <profile> <root1> <root2> 时自动记录；
+--   ignore 则靠每次 sync 前的 ignore 预同步在两端对齐。
 cmdProfile :: [String] -> IO ()
-cmdProfile [] = cmdProfileList
+cmdProfile []     = cmdProfileList
 cmdProfile [name] = cmdProfileShow name
-cmdProfile (name : rest) =
-    case parseBlocks rest of
-        []  -> die "Usage: hsbisync profile <name> <addr> [--repo <addr>] [--ignore <rules>] ..."
-        blks -> forM_ blks $ \(path, mRepo, mIgnore) ->
-            cmdProfileConfig name path mRepo mIgnore
-
--- | 将参数列表解析为多个地址块 [(path, mRepo, mIgnore)]
---   flags 只属于紧邻的前一个地址，遇到下一个地址停止消费
-parseBlocks :: [String] -> [(FilePath, Maybe String, Maybe String)]
-parseBlocks [] = []
-parseBlocks (p : xs)
-    | p == "--repo" || p == "--ignore" = []  -- 孤立标志，忽略
-    | otherwise =
-        let (flags, rest) = parseFlags xs
-        in (p, lookup "--repo" flags, lookup "--ignore" flags) : parseBlocks rest
-
--- | 只消费前导的 --key value 对，遇到非 flag 参数立即停止
-parseFlags :: [String] -> ([(String, String)], [String])
-parseFlags [] = ([], [])
-parseFlags (a:b:xs)
-    | a == "--repo" || a == "--ignore" =
-        let (more, rest) = parseFlags xs in ((a, b) : more, rest)
-parseFlags rest = ([], rest)
+cmdProfile _      = die "Usage: hsbisync profile [<name>]"
 
 -- | 列出 .bisync/ 下所有 profile
 cmdProfileList :: IO ()
@@ -250,70 +256,6 @@ cmdProfileShow name = do
     if not exists
         then putStrLn $ "Profile '" ++ name ++ "' not found."
         else showProfile bisyncDir name
-
--- | 在指定路径下创建/更新 profile 配置文件
---
---   path 可以是本地路径或 user@host:/path 格式的远程路径。
---   远程路径通过 helper 协议写入，写入失败会报错。
-cmdProfileConfig :: String -> FilePath -> Maybe String -> Maybe String -> IO ()
-cmdProfileConfig name path mRepo mIgnore
-    | isNothing mRepo && isNothing mIgnore = do
-        putStrLn $ "[" ++ path ++ "]"
-        putStrLn "  WARNING: no --repo or --ignore specified, nothing to write"
-    | otherwise = do
-    case parseRoot path of
-        Local localPath ->
-            writeProfileLocal name localPath mRepo mIgnore
-        Remote host remotePath -> do
-            putStrLn $ "[" ++ host ++ ":" ++ remotePath ++ "]"
-            result <- (try :: IO () -> IO (Either SomeException ())) $
-                bracket (spawnHelper host remotePath name)
-                        destroyHelper
-                        $ \hh -> writeProfileRemote hh mRepo mIgnore
-            case result of
-                Left e  -> putStrLn $ "  ERROR: " ++ displayException e
-                Right () -> return ()
-
--- | 本地写入 profile 配置
---
---   要求 path 必须是已存在的目录，只在其下创建 .bisync/<name>/
-writeProfileLocal :: String -> FilePath -> Maybe String -> Maybe String -> IO ()
-writeProfileLocal name path mRepo mIgnore = do
-    exists <- doesDirectoryExist path
-    unless exists $
-        die $ "Path does not exist: " ++ path
-    let profDir = path </> ".bisync" </> name
-    createDirectoryIfMissing True profDir
-    putStrLn $ "[" ++ path ++ "]"
-    case mRepo of
-        Just addr -> do
-            writeFile (profDir </> "repo") addr
-            putStrLn $ "  repo: " ++ addr ++ "  [OK]"
-        Nothing -> return ()
-    case mIgnore of
-        Just rules -> do
-            writeFile (profDir </> "ignore") (unescapeNewlines rules)
-            putStrLn $ "  ignore: " ++ rules ++ "  [OK]"
-        Nothing -> return ()
-
--- | 通过 helper 协议远程写入 profile 配置
-writeProfileRemote :: HelperHandle -> Maybe String -> Maybe String -> IO ()
-writeProfileRemote hh mRepo mIgnore = do
-    case mRepo of
-        Just addr -> do
-            result <- putRepoRemote hh (T.encodeUtf8 (T.pack addr))
-            case result of
-                Left err -> die $ "Failed to write remote repo: " ++ err
-                Right () -> putStrLn $ "  repo: " ++ addr ++ "  [OK]"
-        Nothing -> return ()
-    case mIgnore of
-        Just rules -> do
-            let content = unescapeNewlines rules
-            result <- putIgnoreRemote hh (T.encodeUtf8 (T.pack content))
-            case result of
-                Left err -> die $ "Failed to write remote ignore: " ++ err
-                Right () -> putStrLn $ "  ignore: " ++ rules ++ "  [OK]"
-        Nothing -> return ()
 
 -- | 显示单个 profile 的 repo 和 ignore 内容
 showProfile :: FilePath -> String -> IO ()

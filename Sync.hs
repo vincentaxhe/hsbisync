@@ -53,10 +53,15 @@ resolveConflicts pairs1 pairs2 =
         --   * New+New / Updated+Updated / New+Updated → 双方内容相同则 ADD
         --   * Unchanged+New / New+Unchanged → 一侧未变一侧新增，
         --     内容相同则在新侧记 ADD（消解为已同步）
+        --
+        -- 注意：每个 Conflict 都携带 (root1状态, root2状态) 两个字段。
+        -- d1 从 conflicts1（root1 侧）取第一个字段 = root1 的状态；
+        -- d2 必须从 conflicts2（root2 侧）取第二个字段 = root2 的状态，
+        -- 不能也取第一个字段，否则 Unchanged+New 会被误判成两边都 Unchanged。
         resolvedAdd = [ (name, fs1)
                       | ((Conflict fs1 d1 _), fs1') <- conflicts1, let name = filename fs1
                       , d1 `elem` [New, Updated, Unchanged]
-                      , (Conflict fs2 d2 _, fs2') <- conflicts2
+                      , (Conflict fs2 _ d2, fs2') <- conflicts2
                       , filename fs2 == name, d2 `elem` [New, Updated, Unchanged]
                       , not (d1 == Unchanged && d2 == Unchanged)
                       , sameFile fs1' fs2'

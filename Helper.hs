@@ -5,7 +5,7 @@ import Control.Monad (unless)
 import Data.Bits ((.&.))
 import Data.Char (toUpper)
 import Data.Maybe (fromMaybe)
-import System.Directory (createDirectoryIfMissing, doesDirectoryExist, removeFile)
+import System.Directory (createDirectoryIfMissing, doesFileExist, removeFile)
 import System.FilePath ((</>), takeDirectory)
 import System.IO
     ( BufferMode(..), hFlush, hLookAhead
@@ -71,8 +71,7 @@ commandLoop root mTag = go
                 "GETSTAT" -> cmdGetStat  root params'
                 "SETSTAT" -> cmdSetStat  root params'
                 "RECV"    -> cmdRecv     root params'
-                "PUTREPO"  -> cmdPutRepo  root mTag params'
-                "PUTIGNORE"-> cmdPutIgnore root mTag params'
+                "GETIGNORE"-> cmdGetIgnore root mTag
                 _         -> putStrLn ("ERROR Unknown command: " ++ cmd)
             hFlush stdout
             go
@@ -155,6 +154,8 @@ cmdSend root filename = do
     hSetBinaryMode stdout True
     BS.hPut stdout content
     hFlush stdout
+    hSetBinaryMode stdout False                  -- 恢复文本模式，供后续行响应输出
+    hSetEncoding stdout utf8                     -- C locale 下二进制开关不会恢复编码，显式重设
 
 -- | RECV 命令（扩展协议）：接收文件并在 rename 之前校验。
 --
@@ -185,6 +186,7 @@ cmdRecv root params =
                             hSetBinaryMode stdin True
                             content <- BS.hGet stdin sz
                             hSetBinaryMode stdin False
+                            hSetEncoding stdin utf8   -- 重新显式设置 utf8：C locale 下二进制开关不会恢复编码
                             result <- writeFileVerified fullPath content md mt hashStr
                             case result of
                                 Right () -> putStrLn "OK"
@@ -218,60 +220,24 @@ cmdSetStat root params = do
         _ -> putStrLn "ERROR Invalid SETSTAT params"
 
 -- ============================================================================
--- PUTREPO / PUTIGNORE — 远程写入 profile 配置文件
+-- GETIGNORE — 读取 .bisync/<profile>/ignore 元信息（供 ignore 预同步比较）
 -- ============================================================================
 
--- | PUTREPO 命令：写入 .bisync/<profile>/repo 文件
+-- | GETIGNORE 命令：读取 .bisync/<profile>/ignore 的元信息（供跨端比较）
 --
---   协议：PUTREPO <size>
---   1. 解析 size 参数，回复 "OK" 表示准备接收
---   2. 从 stdin 读取 <size> 字节
---   3. 写入 repo 文件（root 必须已存在，否则报错）
---   4. 成功回复 "OK"，失败回复 "ERROR ..."
-cmdPutRepo :: FilePath -> Maybe String -> String -> IO ()
-cmdPutRepo root mTag params =
-    case reads params of
-        [(sz, "")] -> do
-            rootExists <- doesDirectoryExist root
-            if not rootExists
-                then putStrLn ("ERROR root not found: " ++ root)
-                else do
-                    let profDir  = root </> ".bisync" </> fromMaybe "" mTag
-                        repoFile = profDir </> "repo"
-                    createDirectoryIfMissing True profDir
-                    putStrLn "OK"
-                    hFlush stdout
-                    hSetBinaryMode stdin True
-                    content <- BS.hGet stdin sz
-                    hSetBinaryMode stdin False
-                    catch (BS.writeFile repoFile content >> putStrLn "OK") writeErrorHandler
-                    hFlush stdout
-        _ -> putStrLn "ERROR Invalid PUTREPO params"
-
--- | PUTIGNORE 命令：写入 .bisync/<profile>/ignore 文件
---
---   协议：PUTIGNORE <size>
---   流程同 PUTREPO
-cmdPutIgnore :: FilePath -> Maybe String -> String -> IO ()
-cmdPutIgnore root mTag params =
-    case reads params of
-        [(sz, "")] -> do
-            rootExists <- doesDirectoryExist root
-            if not rootExists
-                then putStrLn ("ERROR root not found: " ++ root)
-                else do
-                    let profDir    = root </> ".bisync" </> fromMaybe "" mTag
-                        ignoreFile = profDir </> "ignore"
-                    createDirectoryIfMissing True profDir
-                    putStrLn "OK"
-                    hFlush stdout
-                    hSetBinaryMode stdin True
-                    content <- BS.hGet stdin sz
-                    hSetBinaryMode stdin False
-                    catch (BS.writeFile ignoreFile content >> putStrLn "OK") writeErrorHandler
-                    hFlush stdout
-        _ -> putStrLn "ERROR Invalid PUTIGNORE params"
-
--- | catch 用的 handler，把 IOException 转成 ERROR 响应
-writeErrorHandler :: IOException -> IO ()
-writeErrorHandler e = putStrLn ("ERROR " ++ show e)
+--   协议：GETIGNORE
+--   文件存在：OK <mtime> <mode> <sha512hex>
+--   文件不存在：OK -
+cmdGetIgnore :: FilePath -> Maybe String -> IO ()
+cmdGetIgnore root mTag = do
+    let ignoreFile = root </> ".bisync" </> fromMaybe "" mTag </> "ignore"
+    exists <- doesFileExist ignoreFile
+    if not exists
+        then putStrLn "OK -"
+        else do
+            fs <- getFileStatus ignoreFile
+            content <- BS.readFile ignoreFile
+            let mt     = modificationTime fs
+                mode   = fileMode fs .&. 0o7777
+                digest = hash content :: Digest SHA512
+            putStrLn $ "OK " ++ show mt ++ " " ++ show mode ++ " " ++ show digest

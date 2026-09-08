@@ -24,9 +24,9 @@ dependencies:
 - time
 - unix
 
-library:
-  source-dirs: .
-
+# 纯命令行工具：不建 library。
+# 若把 source-dirs: . 设为 library，hpack 会把 Main.hs 也纳入库模块，
+# 导致库编译时多一次 "Linking Main"、生成多余的 Main 产物。
 executables:
   hsbisync:
     main:                Main.hs
@@ -34,5 +34,3 @@ executables:
     ghc-options:
     - -Wall
     - -O2
-    dependencies:
-    - hsbisync

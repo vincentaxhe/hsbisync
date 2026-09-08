@@ -1,6 +1,10 @@
 module Arg where
 
-import System.Directory (doesDirectoryExist)
+import Control.Exception (IOException, try)
+import Control.Monad (when)
+import System.Directory
+    ( createDirectoryIfMissing, doesDirectoryExist, doesFileExist
+    )
 import System.Environment (getArgs)
 import System.Exit (ExitCode(..), exitFailure)
 import System.Process (readProcessWithExitCode)
@@ -39,6 +43,36 @@ checkRoot (Remote host path) = do
     (code, _, _) <- readProcessWithExitCode "ssh" [host, "test", "-d", path] ""
     return (code == ExitSuccess)
 
+-- | 确保同步根目录存在；不存在则创建空目录。
+--
+--   本地用 createDirectoryIfMissing（mkdir -p 语义）；
+--   远程通过 ssh 先 test -d，不存在则 ssh mkdir -p。
+--   目录已存在或创建成功才返回，否则报错退出。
+ensureRoot :: Root -> IO ()
+ensureRoot (Local path) = do
+    isDir <- doesDirectoryExist path
+    if isDir
+        then return ()
+        else do
+            isFile <- doesFileExist path
+            when isFile $
+                die $ path ++ ": exists but is not a directory"
+            r <- (try (createDirectoryIfMissing True path)
+                    :: IO (Either IOException ()))
+            case r of
+                Left e -> die $ path ++ ": cannot create directory: " ++ show e
+                Right () -> putStrLn $ "  created root: " ++ path
+ensureRoot (Remote host path) = do
+    let label = host ++ ":" ++ path
+    (code, _, _) <- readProcessWithExitCode "ssh" [host, "test", "-d", path] ""
+    if code == ExitSuccess
+        then return ()
+        else do
+            (code', _, err) <- readProcessWithExitCode "ssh" [host, "mkdir", "-p", path] ""
+            when (code' /= ExitSuccess) $
+                die $ label ++ ": cannot create remote directory: " ++ err
+            putStrLn $ "  created root: " ++ label
+
 -- ============================================================================
 -- 命令行解析
 -- ============================================================================
@@ -73,20 +107,17 @@ validateProfile name
     | name == "." || name == ".." = die "Profile name cannot be '.' or '..'"
     | otherwise                 = return ()
 
--- | 从字符串列表解析 profile + 两个 Root 并验证可达性
+-- | 从字符串列表解析 profile + 两个 Root，并确保两个同步根目录都存在。
 --   [profile, r1, r2] → (profile, root1, root2)
+--   目录不存在时自动创建空目录（创建成功才继续）。
 parseSyncThree :: [String] -> IO (String, Root, Root)
 parseSyncThree [profile, r1, r2] = do
     validateProfile profile
     let root1 = parseRoot r1
         root2 = parseRoot r2
-    ok1 <- checkRoot root1
-    ok2 <- checkRoot root2
-    case (ok1, ok2) of
-        (True,  True)  -> return (profile, root1, root2)
-        (False, True)  -> die $ rootLabel root1 ++ ": not accessible"
-        (True,  False) -> die $ rootLabel root2 ++ ": not accessible"
-        _              -> die $ rootLabel root1 ++ " and " ++ rootLabel root2 ++ ": not accessible"
+    ensureRoot root1
+    ensureRoot root2
+    return (profile, root1, root2)
 parseSyncThree _ = die "Usage: hsbisync sync <profile> <root1> <root2>"
 
 -- | 打印错误并退出
