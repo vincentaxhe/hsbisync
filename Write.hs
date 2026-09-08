@@ -1,5 +1,6 @@
 module Write where
 
+import Control.Exception (IOException, try)
 import Data.Bits ((.&.))
 import System.Directory (createDirectoryIfMissing, doesFileExist, removeFile, renameFile)
 import System.FilePath (takeDirectory)
@@ -183,22 +184,29 @@ writeFileVerified
     -> IO (Either String ())
 writeFileVerified path content mode_ mtime_ expectedHash = do
     let dir = takeDirectory path
-    createDirectoryIfMissing True dir
-    (tmpPath, h) <- openTempFile dir ".tmp"
-    BS.hPut h content
-    hClose h
-    -- 属性在 rename 前设好，保证新文件立即可用
-    setFileMode tmpPath (fromIntegral mode_)
-    setFileTimes tmpPath (fromIntegral mtime_) (fromIntegral mtime_)
-    -- 核⼼：校验在 rename 之前，不通过则丢弃临时文件
-    let actualHash = hashBytes content
-    if actualHash /= expectedHash
-        then do
-            removeFile tmpPath
-            return $ Left "verification failed before commit; target untouched"
-        else do
-            renameFile tmpPath path
-            return $ Right ()
+    -- rsync 风格：目标目录不存在时只创建这一层（仅当其父目录存在时）；
+    -- 若父级也不存在则不递归 mkdir -p，直接报错，目标文件不受影响。
+    r <- (try (createDirectoryIfMissing False dir)
+            :: IO (Either IOException ()))
+    case r of
+        Left _ ->
+            return $ Left ("cannot create directory " ++ dir ++ ": parent does not exist")
+        Right () -> do
+            (tmpPath, h) <- openTempFile dir ".tmp"
+            BS.hPut h content
+            hClose h
+            -- 属性在 rename 前设好，保证新文件立即可用
+            setFileMode tmpPath (fromIntegral mode_)
+            setFileTimes tmpPath (fromIntegral mtime_) (fromIntegral mtime_)
+            -- 核⼼：校验在 rename 之前，不通过则丢弃临时文件
+            let actualHash = hashBytes content
+            if actualHash /= expectedHash
+                then do
+                    removeFile tmpPath
+                    return $ Left "verification failed before commit; target untouched"
+                else do
+                    renameFile tmpPath path
+                    return $ Right ()
 
 -- | 安全删除文件：不存在则静默跳过，不抛异常
 removeFileSafe :: FilePath -> IO ()

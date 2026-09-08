@@ -1,6 +1,6 @@
 module Helper where
 
-import Control.Exception (catch, IOException)
+import Control.Exception (catch, try, IOException)
 import Control.Monad (unless)
 import Data.Bits ((.&.))
 import Data.Char (toUpper)
@@ -180,18 +180,24 @@ cmdRecv root params =
                             let filename = unwords (reverse revFilename)
                                 fullPath = root </> filename
                                 dstDir   = takeDirectory fullPath
-                            createDirectoryIfMissing True dstDir
-                            putStrLn "OK"
-                            hFlush stdout
-                            hSetBinaryMode stdin True
-                            content <- BS.hGet stdin sz
-                            hSetBinaryMode stdin False
-                            hSetEncoding stdin utf8   -- 重新显式设置 utf8：C locale 下二进制开关不会恢复编码
-                            result <- writeFileVerified fullPath content md mt hashStr
-                            case result of
-                                Right () -> putStrLn "OK"
-                                Left err -> putStrLn ("ERROR " ++ err)
-                            hFlush stdout
+                            -- rsync 风格：只单层创建目标目录，父级不存在则不递归
+                            r <- (try (createDirectoryIfMissing False dstDir)
+                                    :: IO (Either IOException ()))
+                            case r of
+                                Left _ ->
+                                    putStrLn ("ERROR cannot create directory " ++ dstDir ++ ": parent does not exist")
+                                Right () -> do
+                                    putStrLn "OK"
+                                    hFlush stdout
+                                    hSetBinaryMode stdin True
+                                    content <- BS.hGet stdin sz
+                                    hSetBinaryMode stdin False
+                                    hSetEncoding stdin utf8   -- C locale 下二进制开关不恢复编码，显式重设
+                                    result <- writeFileVerified fullPath content md mt hashStr
+                                    case result of
+                                        Right () -> putStrLn "OK"
+                                        Left err -> putStrLn ("ERROR " ++ err)
+                                    hFlush stdout
                         _ -> putStrLn "ERROR Invalid RECV params"
                 _ -> putStrLn "ERROR Invalid RECV params"
         _ -> putStrLn "ERROR Invalid RECV params"

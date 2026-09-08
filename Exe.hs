@@ -160,7 +160,7 @@ syncIgnore profile sideA sideB = do
             copyIgnore profile sideB sideA "root1" b
         (Just a, Just b)
             | hashOf a == hashOf b ->
-                putStrLn "  (ignore already identical on root1 and root2)"
+                putStrLn "  ignore identical on root1 and root2"
             | otherwise ->
                 case compare (mtOf a) (mtOf b) of
                     GT -> copyIgnore profile sideA sideB "root2" a
