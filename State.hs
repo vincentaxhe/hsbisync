@@ -91,16 +91,17 @@ readProfileIgnore root mTag = do
         then parse <$> TIO.readFile ignoreFile
         else return emptyIgnore
 
--- | 扫描目录，返回所有非隐藏文件的相对路径（深度优先）
+-- | 扫描目录，返回所有文件的相对路径（深度优先）
 --
---   隐藏文件/目录（以 @.@ 开头）会被跳过，隐藏目录不进入。
---   同时读取 @.bisync/<profile>/ignore@ 文件，按规则过滤条目。
+--   不做隐藏文件过滤：所有文件/目录（含以 @.@ 开头的）都参与同步，
+--   需要排除的条目通过 ignore 规则（@.bisync/<profile>/ignore@）过滤。
+--   仅在同步根目录下额外跳过工具自身状态目录 @.bisync@。
 scanFiles :: FilePath -> Maybe String -> IO [FilePath]
 scanFiles root mTag = do
     ign <- readProfileIgnore root mTag
     scanRel' root root ign
 
--- | 扫描 root 目录，返回所有非隐藏文件的 FileState 列表（相对路径）
+-- | 扫描 root 目录，返回所有文件的 FileState 列表（相对路径）
 --
 --   等同于 @scanFiles + statRel@
 currentState :: FilePath -> Maybe String -> IO [FileState]
@@ -114,10 +115,16 @@ scanRel :: FilePath -> FilePath -> IO [FilePath]
 scanRel root dir = scanRel' root dir emptyIgnore
 
 -- | 递归扫描，使用给定的 gitignore 规则过滤所有条目
+--
+--   不过滤隐藏文件（以 @.@ 开头的条目同样参与同步）。
+--   当 @dir@ 为同步根目录时，额外跳过工具自身状态目录 @.bisync@，
+--   其余排除一律交给 ignore 规则。
 scanRel' :: FilePath -> FilePath -> Ignore -> IO [FilePath]
 scanRel' root dir ignoreRules = do
     entries <- listDirectory dir
-    let visible = filter (not . isHidden . takeFileName) entries
+    let atRoot  = dir == root
+        visible = [ e | e <- entries
+                      , not (atRoot && takeFileName e == ".bisync") ]
 
     -- 判断每个条目是否为目录
     let fullPaths  = [dir </> e | e <- visible]
@@ -268,11 +275,6 @@ mergeAdds adds st =
 -- ============================================================================
 -- Helpers
 -- ============================================================================
-
--- | 文件名是否以 '.' 开头
-isHidden :: FilePath -> Bool
-isHidden ('.':_) = True
-isHidden _       = False
 
 -- | 按换行分割 ByteString（纯字节，不涉及编码）
 bsLines :: BS.ByteString -> [BS.ByteString]
