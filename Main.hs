@@ -13,7 +13,7 @@ import qualified Data.ByteString as BS
 import qualified Data.Text.Encoding as T
 import qualified Data.Text as T (unpack)
 
-import Arg (Root(..), parseRoot, parseSyncThree, ensureRoot)
+import Arg (Root(..), parseRoot, parseSyncThree, requireRoot)
 import Exe (runSync)
 import Helper (runHelper)
 import State
@@ -154,10 +154,10 @@ syncFromRepo profile = do
            ++ "\n  echo 'user@host:/path' > " ++ repoFile
 
     peer <- filter (not . (`elem` "\n\r")) <$> readFile repoFile
-    let root1 = Local cwd
+    let root1 = Local cwd          -- 当前目录，必然存在
         root2 = parseRoot peer
-    ensureRoot root1
-    ensureRoot root2
+    -- profile 免参同步：对端地址必须已存在，不自动创建目录
+    requireRoot root2
     runSync profile root1 root2
 
 -- ============================================================================

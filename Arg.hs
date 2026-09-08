@@ -1,7 +1,7 @@
 module Arg where
 
 import Control.Exception (IOException, try)
-import Control.Monad (when)
+import Control.Monad (unless, when)
 import System.Directory
     ( createDirectoryIfMissing, doesDirectoryExist, doesFileExist
     )
@@ -72,6 +72,17 @@ ensureRoot (Remote host path) = do
             when (code' /= ExitSuccess) $
                 die $ label ++ ": cannot create remote directory: " ++ err
             putStrLn $ "  created root: " ++ label
+
+-- | 严格要求 Root 已存在且为目录（不自动创建）。
+--
+--   用于 profile 免参同步（hsbisync sync <profile>）：对端地址必须真实存在；
+--   只有显式两端地址的 sync 才通过 'ensureRoot' 自动创建目录。
+requireRoot :: Root -> IO ()
+requireRoot root = do
+    ok <- checkRoot root
+    unless ok $
+        die $ rootLabel root ++ ": target does not exist\n"
+           ++ "  (auto-create only happens with `hsbisync sync <profile> <root1> <root2>`)"
 
 -- ============================================================================
 -- 命令行解析
