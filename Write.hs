@@ -2,7 +2,7 @@ module Write where
 
 import Control.Exception (IOException, try)
 import Data.Bits ((.&.))
-import System.Directory (createDirectoryIfMissing, doesFileExist, removeFile, renameFile)
+import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist, removeFile, renameFile)
 import System.FilePath (takeDirectory)
 import System.IO
     ( Handle, hClose, hFlush
@@ -174,39 +174,48 @@ writeFileAtomic path content = do
 --   * 校验通过才原子替换——新文件从出现的第一刻起内容和属性就完全正确
 --   * 不会出现"写完了才发现不对但原文件已经没了"的情况
 --
---   返回 @Right ()@ 表示写入和校验均成功，@Left err@ 表示校验失败（原文件未动）。
+--   目录语义（与 rsync 一致）：
+--   * 同步根 @root@ 必须**已存在**——不自动创建，避免 root 写错（或对端路径
+--     不存在）时凭空造出一整棵树；
+--   * 根**之下**的中间目录（目标文件全路径的父目录）按需**递归**创建，
+--     否则往全新的空目录同步时，任何嵌套文件都会因"父目录不存在"而失败。
+--
+--   返回 @Right ()@ 表示写入和校验均成功，@Left err@ 表示失败（原文件未动）。
 writeFileVerified
-    :: FilePath       -- ^ 目标路径
+    :: FilePath       -- ^ 同步根（必须已存在，不会被自动创建）
+    -> FilePath       -- ^ 目标文件全路径（@root </> relPath@）
     -> BS.ByteString  -- ^ 文件内容
     -> Int            -- ^ 目标权限 mode
     -> Integer        -- ^ 目标 mtime（epoch 秒）
     -> String         -- ^ 期望的 SHA512 哈希（hex）
     -> IO (Either String ())
-writeFileVerified path content mode_ mtime_ expectedHash = do
-    let dir = takeDirectory path
-    -- rsync 风格：目标目录不存在时只创建这一层（仅当其父目录存在时）；
-    -- 若父级也不存在则不递归 mkdir -p，直接报错，目标文件不受影响。
-    r <- (try (createDirectoryIfMissing False dir)
-            :: IO (Either IOException ()))
-    case r of
-        Left _ ->
-            return $ Left ("cannot create directory " ++ dir ++ ": parent does not exist")
-        Right () -> do
-            (tmpPath, h) <- openTempFile dir ".tmp"
-            BS.hPut h content
-            hClose h
-            -- 属性在 rename 前设好，保证新文件立即可用
-            setFileMode tmpPath (fromIntegral mode_)
-            setFileTimes tmpPath (fromIntegral mtime_) (fromIntegral mtime_)
-            -- 核⼼：校验在 rename 之前，不通过则丢弃临时文件
-            let actualHash = hashBytes content
-            if actualHash /= expectedHash
-                then do
-                    removeFile tmpPath
-                    return $ Left "verification failed before commit; target untouched"
-                else do
-                    renameFile tmpPath path
-                    return $ Right ()
+writeFileVerified root path content mode_ mtime_ expectedHash = do
+    rootExists <- doesDirectoryExist root
+    if not rootExists
+        then return $ Left ("sync root does not exist: " ++ root)
+        else do
+            let dir = takeDirectory path
+            mk <- (try (createDirectoryIfMissing True dir)
+                    :: IO (Either IOException ()))
+            case mk of
+                Left e ->
+                    return $ Left ("cannot create directory " ++ dir ++ ": " ++ show e)
+                Right () -> do
+                    (tmpPath, h) <- openTempFile dir ".tmp"
+                    BS.hPut h content
+                    hClose h
+                    -- 属性在 rename 前设好，保证新文件立即可用
+                    setFileMode tmpPath (fromIntegral mode_)
+                    setFileTimes tmpPath (fromIntegral mtime_) (fromIntegral mtime_)
+                    -- 核⼼：校验在 rename 之前，不通过则丢弃临时文件
+                    let actualHash = hashBytes content
+                    if actualHash /= expectedHash
+                        then do
+                            removeFile tmpPath
+                            return $ Left "verification failed before commit; target untouched"
+                        else do
+                            renameFile tmpPath path
+                            return $ Right ()
 
 -- | 安全删除文件：不存在则静默跳过，不抛异常
 removeFileSafe :: FilePath -> IO ()

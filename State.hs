@@ -83,6 +83,8 @@ data FileChange
 -- ============================================================================
 
 -- | 从 @.bisync/<profile>/ignore@ 读取忽略规则
+--
+--   文件名与文件内容一律按 UTF-8 处理（进程入口已固定编码，见 Main.main）。
 readProfileIgnore :: FilePath -> Maybe String -> IO Ignore
 readProfileIgnore root mTag = do
     let ignoreFile = root </> ".bisync" </> fromMaybe "" mTag </> "ignore"

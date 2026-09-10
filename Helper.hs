@@ -1,17 +1,17 @@
 module Helper where
 
-import Control.Exception (catch, try, IOException)
+import Control.Exception (catch, IOException)
 import Control.Monad (unless)
 import Data.Bits ((.&.))
 import Data.Char (toUpper)
 import Data.Maybe (fromMaybe)
 import System.Directory (createDirectoryIfMissing, doesFileExist, removeFile)
-import System.FilePath ((</>), takeDirectory)
+import System.FilePath ((</>))
 import System.IO
     ( BufferMode(..), hFlush, hLookAhead
     , hSetBinaryMode, hSetBuffering, hSetEncoding, utf8, stdin, stdout
     )
-import GHC.IO.Encoding (setFileSystemEncoding)
+
 import System.Posix.Files
     ( getFileStatus, fileMode, modificationTime
     , setFileTimes, setFileMode
@@ -37,11 +37,12 @@ runHelper root mTag = do
     let stateDir = root </> ".bisync" </> maybe "" id mTag
     createDirectoryIfMissing True stateDir
 
+    -- 全局编码（setFileSystemEncoding/setLocaleEncoding）已在 Main.main 入口统一
+    -- 钉死为 UTF-8；这里只需保证本协议所用句柄是行缓冲 + UTF-8。
     hSetBuffering stdout LineBuffering
     hSetBuffering stdin  LineBuffering
     hSetEncoding stdout utf8
     hSetEncoding stdin  utf8
-    setFileSystemEncoding utf8   -- SSH 远程 locale 通常是 C，强制 UTF-8 读文件名
 
     putStrLn "OK"
     hFlush stdout
@@ -166,8 +167,12 @@ cmdSend root filename = do
 --   流程：
 --   1. 解析参数，回复 "OK" 表示准备接收
 --   2. 读取 <size> 字节二进制数据
---   3. 写临时文件 + 设 mode/mtime + 算哈希比对
+--   3. 写临时文件 + 设 mode/mtime + 算哈希比对（目录：root 必须存在，
+--      root 之下的中间目录由 'writeFileVerified' 递归创建）
 --   4. 通过 → rename + 回复 "OK"；不通过 → 删临时文件 + 回复 "ERROR ..."
+--
+--   注意：先收完数据再校验目录，协议不会因为目录问题而错位——
+--   失败时目标文件不受影响，父进程会从第二步响应里拿到 ERROR。
 cmdRecv :: FilePath -> String -> IO ()
 cmdRecv root params =
     case break (== ',') params of
@@ -179,25 +184,17 @@ cmdRecv root params =
                         ([(sz, "")], [(md, "")], [(mt, "")]) -> do
                             let filename = unwords (reverse revFilename)
                                 fullPath = root </> filename
-                                dstDir   = takeDirectory fullPath
-                            -- rsync 风格：只单层创建目标目录，父级不存在则不递归
-                            r <- (try (createDirectoryIfMissing False dstDir)
-                                    :: IO (Either IOException ()))
-                            case r of
-                                Left _ ->
-                                    putStrLn ("ERROR cannot create directory " ++ dstDir ++ ": parent does not exist")
-                                Right () -> do
-                                    putStrLn "OK"
-                                    hFlush stdout
-                                    hSetBinaryMode stdin True
-                                    content <- BS.hGet stdin sz
-                                    hSetBinaryMode stdin False
-                                    hSetEncoding stdin utf8   -- C locale 下二进制开关不恢复编码，显式重设
-                                    result <- writeFileVerified fullPath content md mt hashStr
-                                    case result of
-                                        Right () -> putStrLn "OK"
-                                        Left err -> putStrLn ("ERROR " ++ err)
-                                    hFlush stdout
+                            putStrLn "OK"
+                            hFlush stdout
+                            hSetBinaryMode stdin True
+                            content <- BS.hGet stdin sz
+                            hSetBinaryMode stdin False
+                            hSetEncoding stdin utf8   -- C locale 下二进制开关不恢复编码，显式重设
+                            result <- writeFileVerified root fullPath content md mt hashStr
+                            case result of
+                                Right () -> putStrLn "OK"
+                                Left err -> putStrLn ("ERROR " ++ err)
+                            hFlush stdout
                         _ -> putStrLn "ERROR Invalid RECV params"
                 _ -> putStrLn "ERROR Invalid RECV params"
         _ -> putStrLn "ERROR Invalid RECV params"

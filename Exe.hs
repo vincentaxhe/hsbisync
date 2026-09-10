@@ -221,8 +221,21 @@ spawnHelper host path profileName = do
     (Just hin, Just hout, _, _) <- createProcess cmdArgs
     hSetEncoding hout utf8
     hSetEncoding hin  utf8
-    _ <- hGetLine hout
+    -- helper 若启动即崩溃（远端缺 hsbisync / locale 非 UTF-8 / ssh 认证失败），
+    -- 这里会读到管道 EOF，给出可读错误而不是裸的 "hGetLine: end of file"。
+    _ <- hGetLine hout `catch` helperStartFailure host path
     return $ HelperHandle hin hout
+
+-- | 远端 helper 启动失败时的可读诊断
+helperStartFailure :: String -> FilePath -> IOException -> IO String
+helperStartFailure host path e = error $ unlines
+    [ "cannot start remote helper on " ++ host ++ " (root=" ++ path ++ "): " ++ show e
+    , "  possible causes:"
+    , "    * remote hsbisync missing or not the same version"
+    , "    * ssh authentication failed (see ssh output above)"
+    , "    * remote locale is not UTF-8 (ssh non-interactive sessions often have LANG unset),"
+    , "      making the helper crash while reading UTF-8 state/ignore files"
+    ]
 
 destroyHelper :: HelperHandle -> IO ()
 destroyHelper hh = do
@@ -327,7 +340,7 @@ transferContent (Lcl srcRoot) (Lcl dstRoot) relPath srcMode srcMtime = do
         d = dstRoot </> relPath
     content <- BS.readFile s
     let expectedHash = hashBytes content
-    writeFileVerified d content srcMode srcMtime expectedHash
+    writeFileVerified dstRoot d content srcMode srcMtime expectedHash
 
 transferContent (Rmt hhSrc) (Lcl dstRoot) relPath srcMode srcMtime = do
     let d = dstRoot </> relPath
@@ -338,7 +351,7 @@ transferContent (Rmt hhSrc) (Lcl dstRoot) relPath srcMode srcMtime = do
     content <- hGetExactly (hhOut hhSrc) sz
     hSetBinaryMode (hhOut hhSrc) False             -- 恢复文本模式，供后续行协议读取
     hSetEncoding (hhOut hhSrc) utf8                -- 显式重设 utf8（C locale 下二进制开关不恢复编码）
-    writeFileVerified d content srcMode srcMtime expectedHash
+    writeFileVerified dstRoot d content srcMode srcMtime expectedHash
 
 transferContent (Lcl srcRoot) (Rmt hhDst) relPath srcMode srcMtime = do
     let s = srcRoot </> relPath

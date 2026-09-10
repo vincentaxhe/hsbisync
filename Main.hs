@@ -13,6 +13,8 @@ import qualified Data.ByteString as BS
 import qualified Data.Text.Encoding as T
 import qualified Data.Text as T (unpack)
 
+import GHC.IO.Encoding (setFileSystemEncoding, setLocaleEncoding, utf8)
+
 import Arg (Root(..), parseRoot, parseSyncThree, requireRoot)
 import Exe (runSync)
 import Helper (runHelper)
@@ -28,6 +30,14 @@ import State
 
 main :: IO ()
 main = do
+    -- 全进程编码固定为 UTF-8，一行搞定，之后所有代码都按"文件名与内容都是
+    -- UTF-8"来写（本地与远端 helper 是同一入口，行为一致）：
+    --   * setFileSystemEncoding — 文件名、argv（中文文件名）
+    --   * setLocaleEncoding     — 文件内容与句柄默认编码（readFile/TIO.readFile/
+    --                             putStrLn），不再受 LANG/LC_ALL=C 影响
+    -- 顺序很重要：必须在创建句柄、读参数之前执行。
+    setFileSystemEncoding utf8
+    setLocaleEncoding utf8
     args <- getArgs
     case args of
         "--helper" : rest  -> helperMain rest

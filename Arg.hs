@@ -43,11 +43,16 @@ checkRoot (Remote host path) = do
     (code, _, _) <- readProcessWithExitCode "ssh" [host, "test", "-d", path] ""
     return (code == ExitSuccess)
 
--- | 确保同步根目录存在；不存在则创建空目录。
+-- | 确保同步根目录存在；不存在则创建**一层**空目录。
 --
---   本地用 createDirectoryIfMissing（mkdir -p 语义）；
---   远程通过 ssh 先 test -d，不存在则 ssh mkdir -p。
---   目录已存在或创建成功才返回，否则报错退出。
+--   规则（与 rsync 的 "--mkpath" 默认行为相反，故意的）：
+--   * 目标地址（同步根）本身不存在 → 只创建它一层，**要求其父目录已存在**；
+--     父目录不存在则报错退出，避免路径写错时凭空造出一整棵树；
+--   * 根**内部**的中间目录（同步内容的一部分）则由
+--     Write.writeFileVerified 递归创建，不受此限制。
+--
+--   本地用 createDirectoryIfMissing False（父目录缺失即失败）；
+--   远程用 ssh mkdir（不加 -p）。
 ensureRoot :: Root -> IO ()
 ensureRoot (Local path) = do
     isDir <- doesDirectoryExist path
@@ -57,10 +62,11 @@ ensureRoot (Local path) = do
             isFile <- doesFileExist path
             when isFile $
                 die $ path ++ ": exists but is not a directory"
-            r <- (try (createDirectoryIfMissing True path)
+            r <- (try (createDirectoryIfMissing False path)
                     :: IO (Either IOException ()))
             case r of
-                Left e -> die $ path ++ ": cannot create directory: " ++ show e
+                Left _ -> die $ path ++ ": cannot create target root\n"
+                    ++ "  (only one level is created: the parent directory must already exist)"
                 Right () -> putStrLn $ "  created root: " ++ path
 ensureRoot (Remote host path) = do
     let label = host ++ ":" ++ path
@@ -68,9 +74,11 @@ ensureRoot (Remote host path) = do
     if code == ExitSuccess
         then return ()
         else do
-            (code', _, err) <- readProcessWithExitCode "ssh" [host, "mkdir", "-p", path] ""
+            -- 不加 -p：只创建目标地址这一层
+            (code', _, err) <- readProcessWithExitCode "ssh" [host, "mkdir", path] ""
             when (code' /= ExitSuccess) $
                 die $ label ++ ": cannot create remote directory: " ++ err
+                   ++ "  (only one level is created: the parent directory must exist)"
             putStrLn $ "  created root: " ++ label
 
 -- | 严格要求 Root 已存在且为目录（不自动创建）。
