@@ -13,7 +13,7 @@ import System.IO
     ( hClose, hFlush, hGetLine, hSetBinaryMode
     , hSetEncoding, utf8, stdout, stdin
     , hSetEcho, hSetBuffering, BufferMode(..)
-    , isEOF
+    , hReady
     )
 import System.Process (createProcess, proc, StdStream(..), CreateProcess(..))
 
@@ -94,10 +94,13 @@ runSync profile root1 root2 = do
 
     putStrLn "\nSync complete."
 
--- | 读一个按键作为确认（不回显），并把行了余下的输入丢掉。
+-- | 读一个按键作为确认（不回显），并把**已经可读**的该行剩余输入丢掉。
 --
---   必须清行：同步流程里会问不止一次（链接阶段、文件阶段），而 getChar 读走 'y'
---   后，回车会留在终端输入队列里，下一个提示会立刻吃到那个换行当成"取消"。
+--   为什么要清行：同步流程里会问不止一次（链接阶段、文件阶段），而 getChar 只取走
+--   一个字节，剩下的回车会被下一个提示当成"取消"。
+--
+--   但清行绝对不能阻塞：终端可能把按键即时送达（没有跟回车），此时阻塞等回车
+--   会让人以为"要按两次 y"。所以只看 hReady —— 有就丢，没有就立刻返回。
 --   EOF 视为 No（管道输入不足时不会抛异常挂掉）。
 askYesNo :: String -> IO Bool
 askYesNo prompt = do
@@ -108,19 +111,26 @@ askYesNo prompt = do
     answer <- getChar `catch` eofAsNo
     hSetEcho stdin True
     putStrLn [answer]
-    drainLine
+    drainAvailable
     return (toLower answer == 'y')
   where
     eofAsNo :: IOException -> IO Char
     eofAsNo _ = return 'n'
 
-    drainLine = do
-        eof <- isEOF
-        if eof
+    drainAvailable = do
+        -- hReady 在 handle 已 EOF 时是抛异常而不是返回 False；EOF 就当"没有可丢的"。
+        ready <- hReady stdin `catch` eofAsFalse
+        if not ready
             then return ()
             else do
-                c <- getChar
-                if c == '\n' then return () else drainLine
+                c <- getChar `catch` eofAsNewline
+                if c == '\n' then return () else drainAvailable
+
+    eofAsFalse :: IOException -> IO Bool
+    eofAsFalse _ = return False
+
+    eofAsNewline :: IOException -> IO Char
+    eofAsNewline _ = return '\n'
 
 -- ============================================================================
 -- 链接同步阶段

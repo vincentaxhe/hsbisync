@@ -136,36 +136,28 @@ scanRel' root dir ignoreRules = scanRelFrom [] root dir ignoreRules
 -- 扫描：文件阶段（跟随软链接，内容透明）
 -- ============================================================================
 
--- | 条目分类（文件阶段）
+-- | 条目分类（文件阶段）：**完全按普通文件路径看待**
 --
---   * 软链接本身**不**在文件阶段记条目——链接由链接阶段（@link_state@）负责。
---     否则文件阶段会"穿透"叶链接：writeFileVerified 走的是 rename(2)，而 rename
---     替换的是**链接本身**，会把刚建好的链接变成真实文件，两个阶段互相打架；
---   * 悬空链接（目标不存在）当作"那里什么都没有"：整条跳过，让 diff 自然得到
---     Deleted / None 的结果——不做任何特殊处理（该删就删，删除动作有确认关卡）。
+--   跟随 stat，所以指向目录的链接就是目录（进去取内容）、指向文件的链接就是文件
+--   （size/mtime 取自目标、写入时穿透到目标），无需单独的"链接"分类；
+--   唯一的例外是悬空链接（目标不存在）：那里没有内容可比，整条跳过
+--   （链接本身仍由链接阶段负责）。
 data EntryKind
-    = SkipEntry   -- ^ 指向文件的链接 / 悬空链接 / 扫描期间消失：整条跳过
-    | RealDir     -- ^ 真实目录（递归进去，不记条目）
-    | LinkDir     -- ^ 指向目录的链接（递归进去取内容，链接本身不记在文件阶段）
-    | RealFile    -- ^ 真实文件（记为条目）
+    = SkipEntry   -- ^ 悬空链接 / 扫描期间消失：整条跳过
+    | DirEntry    -- ^ 目录：递归进去取内容（目录自身不记条目）
+    | FileEntry   -- ^ 文件：记为条目（size/mtime 取自跟随后的目标）
     deriving (Eq, Show)
 
--- | 分类单个条目：以 lstat 为准区分"链接 / 真实节点"，链接再跟随看目标是否存在
---
---   @getFileStatus@ 失败 = 悬空链接；与叶链接一样只是跳过，没有后续处理。
 classifyEntry :: FilePath -> IO EntryKind
 classifyEntry path = do
     lst <- (try (getSymbolicLinkStatus path) :: IO (Either IOException FileStatus))
     case lst of
         Left _ -> return SkipEntry
-        Right st
-            | isSymbolicLink st -> do
-                tgt <- (try (getFileStatus path) :: IO (Either IOException FileStatus))
-                case tgt of
-                    Right tg | isDirectory tg -> return LinkDir
-                    _                         -> return SkipEntry
-            | isDirectory st -> return RealDir
-            | otherwise      -> return RealFile
+        Right _ -> do
+            tgt <- (try (getFileStatus path) :: IO (Either IOException FileStatus))
+            case tgt of
+                Left _   -> return SkipEntry
+                Right tg -> return (if isDirectory tg then DirEntry else FileEntry)
 
 -- | 目录解析后的身份 (dev, ino)，跟随软链接；不存在返回 Nothing
 --   用于切断软链接环（例如 @link -> .@ 这类指回祖先目录的链接）
@@ -178,8 +170,8 @@ dirIdent path = do
 
 -- | 递归扫描（文件阶段）：返回文件相对路径
 --
---   悬空链接、指向文件的链接都只是"那里什么都没有"，不做特殊处理——
---   让上层 diff 自然得到 Deleted / None。
+--   软链接在这里就是普通路径（stat 跟随、写入穿透到目标）；
+--   悬空链接扫不到东西，diff 自然得到 Deleted / None，不做特殊处理。
 scanRelFrom
     :: [(DeviceID, FileID)]   -- ^ 当前路径上各级目录（解析后）的身份，用于环检测
     -> FilePath -> FilePath -> Ignore -> IO [FilePath]
@@ -195,14 +187,14 @@ scanRelFrom visited root dir ignoreRules = do
     -- 将路径转为相对于 root 的形式，供 gitignore 匹配
     let relPaths = map (makeRelative root) fullPaths
     osPaths  <- mapM encodeFS relPaths
-    let isDirFlag k = case k of RealDir -> True; LinkDir -> True; _ -> False
+    let isDirFlag k = case k of DirEntry -> True; _ -> False
         ignored  = zipWith (ignores ignoreRules) osPaths (map isDirFlag kinds)
         kept     = [ (fp, k)
                    | (fp, k, ign) <- zip3 fullPaths kinds ignored
                    , k /= SkipEntry, not ign ]
 
-    let dirs  = [ d | (d, RealDir) <- kept ] ++ [ d | (d, LinkDir) <- kept ]
-        files = [ f | (f, RealFile) <- kept ]
+    let dirs  = [ d | (d, DirEntry)  <- kept ]
+        files = [ f | (f, FileEntry) <- kept ]
 
     subs <- mapM (descend visited root ignoreRules) dirs
     let relFiles = map (makeRelative root) files

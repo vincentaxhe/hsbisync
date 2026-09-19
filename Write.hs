@@ -259,7 +259,9 @@ writeFileVerified root path content mode_ mtime_ expectedHash = do
     if not rootExists
         then return $ Left ("sync root does not exist: " ++ root)
         else do
-            let dir = takeDirectory path
+            -- 目标位置若是"指向文件的链接"：写到它指向的真实文件上，保留链接本身
+            target <- resolveLeafLink path
+            let dir = takeDirectory target
             mk <- ensureDirChain dir
             case mk of
                 Left e -> return $ Left e
@@ -277,14 +279,18 @@ writeFileVerified root path content mode_ mtime_ expectedHash = do
                             removeFile tmpPath
                             return $ Left "verification failed before commit; target untouched"
                         else do
-                            renameFile tmpPath path
+                            renameFile tmpPath target
                             return $ Right ()
 
--- | 安全删除文件：不存在则静默跳过，不抛异常
+-- | 安全删除文件：不存在则静默跳过，不抛异常。
+--
+--   与写入路径对称：目标位置是"指向文件的链接"时删除**它指向的文件**（保留链接），
+--   否则删链接只会留下目标、删目标才会真正镜像对端的删除。
 removeFileSafe :: FilePath -> IO ()
 removeFileSafe fp = do
-    exists <- doesFileExist fp
-    if exists then removeFile fp else return ()
+    target <- resolveLeafLink fp
+    exists <- doesFileExist target
+    if exists then removeFile target else return ()
 
 -- | 本地写入文件，确保完整落盘后同步属性（保留旧名，兼容已有调用）
 --
@@ -426,6 +432,31 @@ removeEntryForcibly path = do
     quiet action = action `catch` handler
     handler :: IOException -> IO ()
     handler _ = return ()
+
+-- | 解析路径**末端**的符号链接（父目录不动）：返回实际应当读写的目标路径。
+--
+--   为什么需要：文件阶段对"指向文件的链接"是按**指向的文件**比较的，落地时必须写到
+--   目标上——writeFileVerified 用 rename(2) 提交，而 rename 替换的是**链接本身**，
+--   直接 rename 到链接名会把链接变成真实文件。链接链逐级解析，有上限保护。
+resolveLeafLink :: FilePath -> IO FilePath
+resolveLeafLink = go (0 :: Int)
+  where
+    go depth path
+        | depth > 8 = return path
+        | otherwise = do
+            isLink <- isSymLink path
+            if not isLink
+                then return path
+                else do
+                    r <- (try (readSymbolicLink path) :: IO (Either IOException FilePath))
+                    case r of
+                        Left _ -> return path
+                        Right t -> do
+                            let p  = takeDirectory path
+                                t' = normalise (if isAbsolute t then t else p </> t)
+                            -- 指向目录时不再往下解析（文件阶段不会把目录当条目写入）
+                            isDir <- doesDirectoryExist t'
+                            if isDir then return t' else go (depth + 1) t'
 
 -- | 创建/更新符号链接（先校验后落地，与 'writeFileVerified' 完全同构）：
 --

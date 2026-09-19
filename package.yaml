@@ -34,3 +34,9 @@ executables:
     ghc-options:
     - -Wall
     - -O2
+    # -threaded 是必需的：
+    #  * 与 helper 的协议里有阻塞读（hGetLine/BS.hGet），非 threaded RTS 下主线程
+    #    卡住时其他 Haskell 线程（停滞看门狗、concurrently 的另一端）完全无法调度，
+    #    表现为整个程序"静默卡死"且无法诊断；
+    #  * concurrently 并行读两端状态也需要它才真正并行。
+    - -threaded

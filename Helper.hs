@@ -5,7 +5,7 @@ import Control.Monad (unless)
 import Data.Bits ((.&.))
 import Data.Char (toUpper)
 import Data.Maybe (fromMaybe)
-import System.Directory (createDirectoryIfMissing, doesFileExist, removeFile)
+import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.FilePath ((</>))
 import System.IO
     ( BufferMode(..), hFlush, hLookAhead
@@ -27,7 +27,10 @@ import State
     , currentState, currentLinkState, lastStateKind
     , stateJSON, discardStateUnder
     )
-import Write (writeFileVerified, writeLinkVerified, readLinkContent, removeLinkSafe)
+import Write
+    ( writeFileVerified, writeLinkVerified, readLinkContent
+    , removeLinkSafe, removeFileSafe
+    )
 
 -- ============================================================================
 -- 入口
@@ -148,7 +151,9 @@ cmdAdd root mTag filename = do
 
 cmdUnlink :: FilePath -> String -> IO ()
 cmdUnlink root filename = do
-    catch (removeFile (root </> filename)) handler
+    -- removeFileSafe 会解析"指向文件的链接"，删的是目标文件（保留链接），
+    -- 与写入路径对称；链接阶段自己的删除走 LINKUNLINK。
+    catch (removeFileSafe (root </> filename)) handler
     putStrLn "OK"
   where
     handler :: IOException -> IO ()
