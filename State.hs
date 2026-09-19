@@ -1,6 +1,6 @@
 module State where
 
-import Control.Exception (catch, IOException)
+import Control.Exception (catch, IOException, try)
 import Control.Monad (when)
 import Data.Bits ((.&.))
 import Data.Maybe (fromMaybe)
@@ -8,14 +8,18 @@ import Data.Time (UTCTime)
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime, utcTimeToPOSIXSeconds)
 
 import System.Directory
-    ( createDirectoryIfMissing, doesDirectoryExist, doesFileExist
+    ( createDirectoryIfMissing, doesFileExist
     , listDirectory, removeFile, renameFile
     )
-import System.FilePath (takeFileName, (</>), takeDirectory)
+import System.FilePath (takeFileName, (</>), takeDirectory, dropTrailingPathSeparator)
+import System.IO (hPutStrLn, stderr)
 import System.OsPath (encodeFS)
 import System.Posix.Files
-    ( getFileStatus, fileSize, fileMode, modificationTime
+    ( FileStatus
+    , getFileStatus, getSymbolicLinkStatus, fileSize, fileMode, modificationTime
+    , deviceID, fileID, isDirectory, isSymbolicLink
     )
+import System.Posix.Types (DeviceID, FileID)
 import Text.JSON
 
 import Ignore (Ignore, parse, ignores)
@@ -101,15 +105,19 @@ readProfileIgnore root mTag = do
 scanFiles :: FilePath -> Maybe String -> IO [FilePath]
 scanFiles root mTag = do
     ign <- readProfileIgnore root mTag
-    scanRel' root root ign
+    scanRelFrom [] root root ign
 
 -- | 扫描 root 目录，返回所有文件的 FileState 列表（相对路径）
 --
---   等同于 @scanFiles + statRel@
+--   等同于 @scanFiles + statRel@。
+--   起始时用同步根自身的 (dev,ino) 播种环检测，这样 @link -> .@ 这类
+--   指回根目录的链接在第 1 层就会被切断。
 currentState :: FilePath -> Maybe String -> IO [FileState]
 currentState root mTag = do
     ign <- readProfileIgnore root mTag
-    files <- scanRel' root root ign
+    mRootId <- dirIdent root
+    let seed = maybe [] (:[]) mRootId
+    files <- scanRelFrom seed root root ign
     mapM (statRel root) files
 
 -- | 内部递归扫描（兼容旧接口，不使用任何忽略规则）
@@ -122,32 +130,95 @@ scanRel root dir = scanRel' root dir emptyIgnore
 --   当 @dir@ 为同步根目录时，额外跳过工具自身状态目录 @.bisync@，
 --   其余排除一律交给 ignore 规则。
 scanRel' :: FilePath -> FilePath -> Ignore -> IO [FilePath]
-scanRel' root dir ignoreRules = do
+scanRel' root dir ignoreRules = scanRelFrom [] root dir ignoreRules
+
+-- ============================================================================
+-- 扫描：文件阶段（跟随软链接，内容透明）
+-- ============================================================================
+
+-- | 条目分类（文件阶段）
+--
+--   * 软链接本身**不**在文件阶段记条目——链接由链接阶段（@link_state@）负责。
+--     否则文件阶段会"穿透"叶链接：writeFileVerified 走的是 rename(2)，而 rename
+--     替换的是**链接本身**，会把刚建好的链接变成真实文件，两个阶段互相打架；
+--   * 悬空链接（目标不存在）当作"那里什么都没有"：整条跳过，让 diff 自然得到
+--     Deleted / None 的结果——不做任何特殊处理（该删就删，删除动作有确认关卡）。
+data EntryKind
+    = SkipEntry   -- ^ 指向文件的链接 / 悬空链接 / 扫描期间消失：整条跳过
+    | RealDir     -- ^ 真实目录（递归进去，不记条目）
+    | LinkDir     -- ^ 指向目录的链接（递归进去取内容，链接本身不记在文件阶段）
+    | RealFile    -- ^ 真实文件（记为条目）
+    deriving (Eq, Show)
+
+-- | 分类单个条目：以 lstat 为准区分"链接 / 真实节点"，链接再跟随看目标是否存在
+--
+--   @getFileStatus@ 失败 = 悬空链接；与叶链接一样只是跳过，没有后续处理。
+classifyEntry :: FilePath -> IO EntryKind
+classifyEntry path = do
+    lst <- (try (getSymbolicLinkStatus path) :: IO (Either IOException FileStatus))
+    case lst of
+        Left _ -> return SkipEntry
+        Right st
+            | isSymbolicLink st -> do
+                tgt <- (try (getFileStatus path) :: IO (Either IOException FileStatus))
+                case tgt of
+                    Right tg | isDirectory tg -> return LinkDir
+                    _                         -> return SkipEntry
+            | isDirectory st -> return RealDir
+            | otherwise      -> return RealFile
+
+-- | 目录解析后的身份 (dev, ino)，跟随软链接；不存在返回 Nothing
+--   用于切断软链接环（例如 @link -> .@ 这类指回祖先目录的链接）
+dirIdent :: FilePath -> IO (Maybe (DeviceID, FileID))
+dirIdent path = do
+    r <- (try (getFileStatus path) :: IO (Either IOException FileStatus))
+    return $ case r of
+        Right st -> Just (deviceID st, fileID st)
+        Left _   -> Nothing
+
+-- | 递归扫描（文件阶段）：返回文件相对路径
+--
+--   悬空链接、指向文件的链接都只是"那里什么都没有"，不做特殊处理——
+--   让上层 diff 自然得到 Deleted / None。
+scanRelFrom
+    :: [(DeviceID, FileID)]   -- ^ 当前路径上各级目录（解析后）的身份，用于环检测
+    -> FilePath -> FilePath -> Ignore -> IO [FilePath]
+scanRelFrom visited root dir ignoreRules = do
     entries <- listDirectory dir
     let atRoot  = dir == root
         visible = [ e | e <- entries
                       , not (atRoot && takeFileName e == ".bisync") ]
 
-    -- 判断每个条目是否为目录
     let fullPaths  = [dir </> e | e <- visible]
-    isDirFlags <- mapM doesDirectoryExist fullPaths
+    kinds <- mapM classifyEntry fullPaths
 
     -- 将路径转为相对于 root 的形式，供 gitignore 匹配
     let relPaths = map (makeRelative root) fullPaths
     osPaths  <- mapM encodeFS relPaths
-    let ignored  = zipWith (ignores ignoreRules) osPaths isDirFlags
-        kept     = [ (fp, isDir)
-                   | (fp, isDir, ign) <- zip3 fullPaths isDirFlags ignored
-                   , not ign ]
+    let isDirFlag k = case k of RealDir -> True; LinkDir -> True; _ -> False
+        ignored  = zipWith (ignores ignoreRules) osPaths (map isDirFlag kinds)
+        kept     = [ (fp, k)
+                   | (fp, k, ign) <- zip3 fullPaths kinds ignored
+                   , k /= SkipEntry, not ign ]
 
-    let dirs  = [d | (d, True ) <- kept]
-        files = [f | (f, False) <- kept]
+    let dirs  = [ d | (d, RealDir) <- kept ] ++ [ d | (d, LinkDir) <- kept ]
+        files = [ f | (f, RealFile) <- kept ]
 
-    subFiles <- concat <$> mapM (\d -> scanRel' root d ignoreRules) dirs
+    subs <- mapM (descend visited root ignoreRules) dirs
     let relFiles = map (makeRelative root) files
-    return (subFiles ++ relFiles)
+    return (concat subs ++ relFiles)
+  where
+    descend vs rt ign d = do
+        mIdent <- dirIdent d
+        case mIdent of
+            Just ident
+                | ident `elem` vs -> do
+                    hPutStrLn stderr $ "WARNING: symlink loop skipped: " ++ d
+                    return []
+                | otherwise -> scanRelFrom (ident : vs) rt d ign
+            Nothing -> return []   -- 竞态：扫描期间消失
 
--- | 获取单个文件的 FileState（填充 size、mtime、mode）
+-- | 获取单个文件的 FileState（跟随软链接：size/mtime 取自目标）
 statRel :: FilePath -> FilePath -> IO FileState
 statRel root relPath = do
     let fullPath = root </> relPath
@@ -158,23 +229,131 @@ statRel root relPath = do
     return $ FileState sz mt md relPath
 
 -- ============================================================================
+-- 扫描：链接阶段（不跟随，只收链接本身）
+-- ============================================================================
+
+-- | 链接扫描的条目分类
+--
+--   注意：指向目录的链接**不**递归进去——链接阶段只负责把链接结构弄一致，
+--   链接下的内容由文件阶段（跟随链接）处理。
+data LinkEntryKind
+    = LinkEntry       -- ^ 指向文件的链接，或悬空链接：都是一条链接条目
+    | LinkDirEntry    -- ^ 指向目录的链接：一条链接条目，不递归
+    | RealDirEntry    -- ^ 真实目录：递归
+    | OtherEntry      -- ^ 普通文件/消失的条目：跳过
+    deriving (Eq, Show)
+
+classifyLinkEntry :: FilePath -> IO LinkEntryKind
+classifyLinkEntry path = do
+    lst <- (try (getSymbolicLinkStatus path) :: IO (Either IOException FileStatus))
+    case lst of
+        Left _ -> return OtherEntry
+        Right st
+            | isSymbolicLink st -> do
+                tgt <- (try (getFileStatus path) :: IO (Either IOException FileStatus))
+                return $ case tgt of
+                    Right tg | isDirectory tg -> LinkDirEntry
+                    _                         -> LinkEntry
+            | isDirectory st -> return RealDirEntry
+            | otherwise      -> return OtherEntry
+
+-- | 递归收集软链接（不跟随：目录链接不进入），返回相对路径
+--
+--   与文件阶段同口径：跳过根目录下的 @.bisync@、按 ignore 规则过滤
+--   （目录链接按"目录"参与匹配，使 @dir/@ 这类规则能命中）。
+scanRelLinks :: FilePath -> FilePath -> Ignore -> IO [FilePath]
+scanRelLinks root dir ignoreRules = do
+    entries <- listDirectory dir
+    let atRoot  = dir == root
+        visible = [ e | e <- entries
+                      , not (atRoot && takeFileName e == ".bisync") ]
+
+    let fullPaths = [dir </> e | e <- visible]
+    kinds <- mapM classifyLinkEntry fullPaths
+
+    let relPaths = map (makeRelative root) fullPaths
+    osPaths <- mapM encodeFS relPaths
+    let isDirFlag k = case k of LinkDirEntry -> True; RealDirEntry -> True; _ -> False
+        ignored  = zipWith (ignores ignoreRules) osPaths (map isDirFlag kinds)
+        kept     = [ (fp, k)
+                   | (fp, k, ign) <- zip3 fullPaths kinds ignored
+                   , k /= OtherEntry, not ign ]
+
+    let links = [ l | (l, k) <- kept, k == LinkEntry || k == LinkDirEntry ]
+        dirs  = [ d | (d, RealDirEntry) <- kept ]
+
+    subs <- concat <$> mapM (\d -> scanRelLinks root d ignoreRules) dirs
+    return (map (makeRelative root) links ++ subs)
+
+-- | 扫描同步目录中所有"可见"软链接（相对路径）
+scanLinks :: FilePath -> Maybe String -> IO [FilePath]
+scanLinks root mTag = do
+    ign <- readProfileIgnore root mTag
+    scanRelLinks root root ign
+
+-- | 扫描所有软链接的 FileState 列表（相对路径）
+currentLinkState :: FilePath -> Maybe String -> IO [FileState]
+currentLinkState root mTag = do
+    links <- scanLinks root mTag
+    mapM (statLinkRel root) links
+
+-- | 链接条目的元信息：lstat（不跟随）
+--
+--   size = st_size = 指向字符串长度，因此判定键 "(长度, 链接自身 mtime)" 就是
+--   现有 'sameFile' 那套比较，完全不需要新比较函数。
+statLinkRel :: FilePath -> FilePath -> IO FileState
+statLinkRel root relPath = do
+    fs <- getSymbolicLinkStatus (root </> relPath)
+    let sz = fromIntegral (fileSize fs)
+        mt = posixSecondsToUTCTime (realToFrac (modificationTime fs))
+        md = fromIntegral (fileMode fs) .&. 0o7777
+    return $ FileState sz mt md relPath
+
+-- ============================================================================
 -- 获取上次同步状态（从 .bisync/ 目录读取）
 -- ============================================================================
 
--- | 从 @.bisync/@ 目录读取上次同步状态（只读，不写回不删文件）
+-- ============================================================================
+-- 状态文件：文件条目 / 链接条目
+-- ============================================================================
+
+-- | 状态文件种类
 --
---   自动合并 @state@、@added@、@deleted@ 三个文件：
---   * @state@ — 上次同步时的基准状态
---   * @added@ — 上次同步后新增的文件（覆盖/追加到 state）
---   * @deleted@ — 上次同步后删除的文件（从 state 中移除）
+--   链接条目**完全复用**文件条目的机制与行格式（@size,mtime,path@）：
+--   链接的 size = st_size = 指向字符串长度、mtime = 链接自身 mtime，
+--   而指向字符串本身作为"内容"在传输阶段传递，不落在状态文件里。
+data StateKind = FileKind | LinkKind
+    deriving (Eq, Show)
+
+-- | 各类别使用的三个文件名
+kindFileNames :: StateKind -> (FilePath, FilePath, FilePath)
+kindFileNames FileKind = ("state",      "added",      "deleted")
+kindFileNames LinkKind = ("link_state", "link_added", "link_deleted")
+
+-- | 取某个条目的元信息（相对路径 → FileState）
 --
---   与 'lastState' 不同，此函数不修改任何文件。
-readLastState :: FilePath -> Maybe String -> IO [FileState]
-readLastState root mTag = do
-    let stateDir   = root </> ".bisync" </> fromMaybe "" mTag
-        stateFile   = stateDir </> "state"
-        addedFile   = stateDir </> "added"
-        deletedFile = stateDir </> "deleted"
+--   * 文件条目：跟随软链接（内容语义）
+--   * 链接条目：lstat（链接自身语义）
+statKindRel :: StateKind -> FilePath -> FilePath -> IO FileState
+statKindRel FileKind = statRel
+statKindRel LinkKind = statLinkRel
+
+-- | 从状态目录读取上次同步状态（只读，不写回不删文件）
+--
+--   自动合并 state / added / deleted 三个文件（链接阶段对应
+--   @link_state@ / @link_added@ / @link_deleted@）：
+--   * state   — 上次同步时的基准状态
+--   * added   — 上次同步后新增的条目（覆盖/追加到 state）
+--   * deleted — 上次同步后删除的条目（从 state 中移除）
+--
+--   与 'lastStateKind' 不同，此函数不修改任何文件。
+readLastStateKind :: StateKind -> FilePath -> Maybe String -> IO [FileState]
+readLastStateKind kind root mTag = do
+    let stateDir = root </> ".bisync" </> fromMaybe "" mTag
+        (stateName, addedName, deletedName) = kindFileNames kind
+        stateFile   = stateDir </> stateName
+        addedFile   = stateDir </> addedName
+        deletedFile = stateDir </> deletedName
 
     st <- readEntries stateFile
 
@@ -191,17 +370,18 @@ readLastState root mTag = do
             return $ filter (\(FileState _ _ _ fn) -> fn `notElem` dels) st'
         else return st'
 
--- | 从 @.bisync/@ 目录读取上次同步状态，合并后写回并清理
+-- | 从状态目录读取上次同步状态，合并后写回并清理
 --
---   内部调用 'readLastState'，然后写回 @state@ 并删除 @added@ / @deleted@。
-lastState :: FilePath -> Maybe String -> IO [FileState]
-lastState root mTag = do
-    let stateDir   = root </> ".bisync" </> fromMaybe "" mTag
-        stateFile   = stateDir </> "state"
-        addedFile   = stateDir </> "added"
-        deletedFile = stateDir </> "deleted"
+--   内部调用 'readLastStateKind'，然后写回 state 并删除 added / deleted。
+lastStateKind :: StateKind -> FilePath -> Maybe String -> IO [FileState]
+lastStateKind kind root mTag = do
+    let stateDir = root </> ".bisync" </> fromMaybe "" mTag
+        (stateName, addedName, deletedName) = kindFileNames kind
+        stateFile   = stateDir </> stateName
+        addedFile   = stateDir </> addedName
+        deletedFile = stateDir </> deletedName
 
-    st <- readLastState root mTag
+    st <- readLastStateKind kind root mTag
 
     hasAdded <- doesFileExist addedFile
     hasDeleted <- doesFileExist deletedFile
@@ -211,6 +391,13 @@ lastState root mTag = do
         when hasDeleted $ removeFileSilent deletedFile
 
     return st
+
+-- | 兼容旧签名（文件条目）
+readLastState :: FilePath -> Maybe String -> IO [FileState]
+readLastState = readLastStateKind FileKind
+
+lastState :: FilePath -> Maybe String -> IO [FileState]
+lastState = lastStateKind FileKind
 
 -- | 读取 state/added 文件（原始字节读，回避编码问题）
 --
@@ -330,16 +517,17 @@ diffState root mTag = do
 mkDiffEntry :: DiffState -> FileState -> DiffEntry
 mkDiffEntry ds fs = DiffEntry (show ds) (size fs) (posixSecs (mtime fs)) (filename fs)
 
--- | 追加一条记录到 @.bisync/added@（写入必须成功）
-appendAdded :: FilePath -> Maybe String -> FilePath -> IO ()
-appendAdded root mTag relPath = do
+-- | 追加一条记录到 added / link_added（写入必须成功）
+--
+--   元信息按 kind 取：文件条目跟随软链接，链接条目用 lstat。
+appendAddedKind :: StateKind -> FilePath -> Maybe String -> FilePath -> IO ()
+appendAddedKind kind root mTag relPath = do
     let stateDir = root </> ".bisync" </> fromMaybe "" mTag
+        (_, addedName, _) = kindFileNames kind
+        addedFp = stateDir </> addedName
     createDirectoryIfMissing True stateDir
-    let addedFp = stateDir </> "added"
-    fs <- getFileStatus (root </> relPath)
-    let sz = fileSize fs
-        mt = modificationTime fs
-        line = T.encodeUtf8 (T.pack (show sz ++ "," ++ show mt ++ ","))
+    fs <- statKindRel kind root relPath
+    let line = T.encodeUtf8 (T.pack (show (size fs) ++ "," ++ show (posixSecs (mtime fs)) ++ ","))
             <> T.encodeUtf8 (T.pack relPath)
             <> BS.singleton 10
     BS.appendFile addedFp line
@@ -348,18 +536,48 @@ appendAdded root mTag relPath = do
     when (not (BS.isSuffixOf line content)) $
         error $ "appendAdded: verification failed for " ++ addedFp
 
--- | 追加一条记录到 @.bisync/deleted@（写入必须成功）
-appendDeleted :: FilePath -> Maybe String -> FilePath -> IO ()
-appendDeleted root mTag relPath = do
+-- | 追加一条记录到 deleted / link_deleted（写入必须成功）
+appendDeletedKind :: StateKind -> FilePath -> Maybe String -> FilePath -> IO ()
+appendDeletedKind kind root mTag relPath = do
     let stateDir = root </> ".bisync" </> fromMaybe "" mTag
+        (_, _, deletedName) = kindFileNames kind
+        deletedFp = stateDir </> deletedName
     createDirectoryIfMissing True stateDir
-    let deletedFp = stateDir </> "deleted"
     let line = T.encodeUtf8 (T.pack relPath) <> BS.singleton 10
     BS.appendFile deletedFp line
     -- 确认写入
     content <- BS.readFile deletedFp
     when (not (BS.isSuffixOf line content)) $
         error $ "appendDeleted: verification failed for " ++ deletedFp
+
+-- | 兼容旧签名（文件条目）
+appendAdded :: FilePath -> Maybe String -> FilePath -> IO ()
+appendAdded = appendAddedKind FileKind
+
+appendDeleted :: FilePath -> Maybe String -> FilePath -> IO ()
+appendDeleted = appendDeletedKind FileKind
+
+-- | 刚在本端建/改了链接 @linkRel@：把本端文件状态里该链接**子树**下的基线条目作废。
+--
+--   为什么：链接此前在本端不可达（目标不存在、或本端原本是真实目录），扫描看不到
+--   链接下的内容，那些基线条目已经过期。若不作废，diff 会得出 Deleted，进而让
+--   **对端删掉自己的真实内容**；作废后这里对文件阶段就是"从未有过"（None），
+--   走接收，等文件传过来（顺带把链接目标目录建出来）再以 added 记回正确状态。
+--
+--   只有一个副作用要注意：它会把合并后的基线写回 state（与 lastStateKind 一致）。
+discardStateUnder :: FilePath -> Maybe String -> FilePath -> IO ()
+discardStateUnder root mTag linkRel = do
+    st <- lastStateKind FileKind root mTag
+    let (stateName, _, _) = kindFileNames FileKind
+        stateFile = root </> ".bisync" </> fromMaybe "" mTag </> stateName
+        prefix  = dropTrailingPathSeparator linkRel
+        under f = f == prefix || take (length prefix + 1) f == prefix ++ "/"
+        dropped = [ filename fs | fs <- st, under (filename fs) ]
+        kept    = [ fs | fs <- st, not (under (filename fs)) ]
+    when (not (null dropped)) $ do
+        writeEntries stateFile kept
+        hPutStrLn stderr $ "  (baseline dropped under new symlink " ++ linkRel
+            ++ ": " ++ show (length dropped) ++ " entries)"
 
 -- | 比较两个 FileState 是否相同（基于 size 和整数秒级 mtime）
 --   mode 不参与比较——权限变更不触发重新同步

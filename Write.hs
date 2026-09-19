@@ -1,23 +1,33 @@
 module Write where
 
-import Control.Exception (IOException, try)
+import Control.Exception (IOException, catch, try)
 import Data.Bits ((.&.))
-import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist, removeFile, renameFile)
-import System.FilePath (takeDirectory)
+import System.Directory
+    ( createDirectory, createDirectoryIfMissing, doesDirectoryExist, doesFileExist
+    , listDirectory, removeDirectory, removeFile, renameFile
+    )
+import System.FilePath (takeDirectory, isAbsolute, normalise, (</>))
 import System.IO
     ( Handle, hClose, hFlush
     , hPutStrLn, hSetBinaryMode
     , hGetLine, openTempFile
     )
 import System.Posix.Files
-    ( getFileStatus, fileMode, modificationTime
+    ( FileStatus
+    , getFileStatus, fileMode, modificationTime
     , setFileMode, setFileTimes
+    , getSymbolicLinkStatus, isDirectory, isSymbolicLink
+    , readSymbolicLink, createSymbolicLink, removeLink
+    , setSymbolicLinkTimesHiRes
     )
 
 import Crypto.Hash (hash, SHA512, Digest)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as B8
 import qualified Data.ByteString.Lazy as BL
+import qualified Data.Text as T (pack, unpack)
+import qualified Data.Text.Encoding as T (encodeUtf8, decodeUtf8With)
+import qualified Data.Text.Encoding.Error as TEE (lenientDecode)
 
 -- ============================================================================
 -- Types
@@ -167,6 +177,61 @@ writeFileAtomic path content = do
     hClose h
     renameFile tmpPath path
 
+-- ============================================================================
+-- 目录创建：穿透悬空软链接（让"路径透明"在写文件时真正成立）
+-- ============================================================================
+
+-- | 确保目录 @d@ 存在；路径上遇到的**悬空软链接**会被落实为它指向的目录。
+--
+--   为什么需要：同步是"先同步链接结构、再按路径透明地传文件"。写文件时路径可能
+--   穿过一个刚建好、目标还不存在的目录链接，此时：
+--   * @createDirectoryIfMissing@ 对链接名本身会 EEXIST（名字已存在但不是目录）；
+--   * 再往下（@L/sub@）内核解析链接就会 ENOENT → 写入失败。
+--   所以写入前先把链接指向的目录建出来，之后路径自然可达。
+--
+--   只建目录，**绝不建空文件**：若先造一个空文件，后续 size/mtime 比较全错。
+--   链接成环时靠 depth 上限退出并报错。
+ensureDirChain :: FilePath -> IO (Either String ())
+ensureDirChain = go (0 :: Int)
+  where
+    go depth d
+        | depth > 40 =
+            return $ Left ("too many symlink levels while creating directory " ++ d)
+        | otherwise = do
+            exists <- doesDirectoryExist d
+            if exists
+                then return (Right ())
+                else do
+                    let parent = takeDirectory d
+                    pRes <- if parent == d then return (Right ()) else go (depth + 1) parent
+                    case pRes of
+                        Left e -> return (Left e)
+                        Right () -> do
+                            isLink <- isSymLink d
+                            if isLink
+                                then do
+                                    -- 悬空链接：建出它指向的目录
+                                    tgt <- (try (readSymbolicLink d) :: IO (Either IOException FilePath))
+                                    case tgt of
+                                        Left e ->
+                                            return $ Left ("cannot read symlink " ++ d ++ ": " ++ show e)
+                                        Right t -> do
+                                            let t' = if isAbsolute t
+                                                        then t
+                                                        else normalise (parent </> t)
+                                            go (depth + 1) t'
+                                else do
+                                    r <- (try (createDirectory d) :: IO (Either IOException ()))
+                                    case r of
+                                        Right () -> return (Right ())
+                                        Left e -> do
+                                            -- 竞态：别人刚建好了同名目录
+                                            nowDir <- doesDirectoryExist d
+                                            if nowDir
+                                                then return (Right ())
+                                                else return $ Left
+                                                    ("cannot create directory " ++ d ++ ": " ++ show e)
+
 -- | 原子写入 + 校验：先写临时文件 → 设属性 → 算哈希比对 → 通过才 rename。
 --
 --   这是 rsync 的核心安全保证：
@@ -195,11 +260,9 @@ writeFileVerified root path content mode_ mtime_ expectedHash = do
         then return $ Left ("sync root does not exist: " ++ root)
         else do
             let dir = takeDirectory path
-            mk <- (try (createDirectoryIfMissing True dir)
-                    :: IO (Either IOException ()))
+            mk <- ensureDirChain dir
             case mk of
-                Left e ->
-                    return $ Left ("cannot create directory " ++ dir ++ ": " ++ show e)
+                Left e -> return $ Left e
                 Right () -> do
                     (tmpPath, h) <- openTempFile dir ".tmp"
                     BS.hPut h content
@@ -306,3 +369,112 @@ compareFileRemote h0 h1 filename = do
         (Left err, _) -> return $ Left ("hash 0: " ++ err)
         (_, Left err) -> return $ Left ("hash 1: " ++ err)
         (Right h0', Right h1') -> return $ Right (h0' == h1')
+
+-- ============================================================================
+-- 符号链接：把链接当成"内容 = 指向字符串"的文件
+--
+--   链接条目的 size = st_size = 指向字符串长度、mtime = 链接自身 mtime，
+--   而"内容"就是指向字符串本身 —— 因此 SEND/RECV/哈希校验/先校验后落地全部复用文件那套。
+-- ============================================================================
+
+-- | 路径本身是否为符号链接（lstat，不跟随）。不存在/不可访问 → False
+isSymLink :: FilePath -> IO Bool
+isSymLink path = do
+    r <- (try (getSymbolicLinkStatus path) :: IO (Either IOException FileStatus))
+    return $ case r of
+        Right st -> isSymbolicLink st
+        Left _   -> False
+
+-- | 读取符号链接的"内容"：它的指向字符串（UTF-8 字节，可直接参与哈希/SEND/RECV）
+readLinkContent :: FilePath -> IO BS.ByteString
+readLinkContent path = T.encodeUtf8 . T.pack <$> readSymbolicLink path
+
+-- | 指向字符串的字节 → FilePath（'readLinkContent' 的逆）
+linkTargetPath :: BS.ByteString -> FilePath
+linkTargetPath = T.unpack . T.decodeUtf8With TEE.lenientDecode
+
+-- | 删除链接本身（unlink），不跟随到目标；返回是否真的删掉了一个链接
+removeLinkSafe :: FilePath -> IO Bool
+removeLinkSafe path = do
+    isLink <- isSymLink path
+    if not isLink
+        then return False
+        else do
+            r <- (try (removeLink path) :: IO (Either IOException ()))
+            return (either (const False) (const True) r)
+
+-- | 强制移除路径上的占位节点（把真实节点替换成链接之前调用）：
+--
+--   * 符号链接 → unlink（不跟随，目标内容毫发无损）
+--   * 普通文件 → removeFile
+--   * 真实目录 → 递归整体删除（目录内部的链接只 unlink，不跟随——避免删到根外）
+--   * 不存在 → 静默返回
+removeEntryForcibly :: FilePath -> IO ()
+removeEntryForcibly path = do
+    r <- (try (getSymbolicLinkStatus path) :: IO (Either IOException FileStatus))
+    case r of
+        Left _ -> return ()
+        Right st
+            | isSymbolicLink st -> quiet (removeLink path)
+            | isDirectory st -> do
+                entries <- listDirectory path
+                mapM_ (removeEntryForcibly . (path </>)) entries
+                quiet (removeDirectory path)
+            | otherwise -> quiet (removeFile path)
+  where
+    quiet :: IO () -> IO ()
+    quiet action = action `catch` handler
+    handler :: IOException -> IO ()
+    handler _ = return ()
+
+-- | 创建/更新符号链接（先校验后落地，与 'writeFileVerified' 完全同构）：
+--
+--   1. 清掉目标位置的占位节点（若是真实目录 → 整体删除：这正是"文件夹被链接取代"的落地动作）
+--   2. 目标目录里建临时链接 → 设**链接自身**的 mtime（lutimes，不跟随）→ 读回指向做哈希校验
+--   3. 校验通过才 rename 到目标名
+--
+--   mode 参数只为与 'writeFileVerified' 保持同一签名：Linux 上链接权限恒为 0777 且不可设置
+--   （没有 lchmod，fchmodat(AT_SYMLINK_NOFOLLOW) 返回 ENOTSUP），而 setFileMode 会跟随链接
+--   改到**目标文件**的权限上，属于破坏性操作，绝对不能调用。
+writeLinkVerified
+    :: FilePath       -- ^ 同步根（必须已存在，不会被自动创建）
+    -> FilePath       -- ^ 目标链接全路径（@root </> relPath@）
+    -> BS.ByteString  -- ^ 链接指向（UTF-8 字节）
+    -> Int            -- ^ 目标权限 mode（链接不适用，忽略）
+    -> Integer        -- ^ 链接自身 mtime（epoch 秒）
+    -> String         -- ^ 期望的 SHA512（指向字符串的哈希）
+    -> IO (Either String ())
+writeLinkVerified root path targetBytes _mode mtime_ expectedHash = do
+    rootExists <- doesDirectoryExist root
+    if not rootExists
+        then return $ Left ("sync root does not exist: " ++ root)
+        else do
+            let dir = takeDirectory path
+            mk <- ensureDirChain dir
+            case mk of
+                Left e -> return $ Left e
+                Right () -> do
+                    -- 占位节点：真实目录必须整体删除，否则 rename 无法覆盖
+                    rm <- (try (removeEntryForcibly path) :: IO (Either IOException ()))
+                    case rm of
+                        Left e -> return $ Left ("cannot replace " ++ path ++ ": " ++ show e)
+                        Right () -> do
+                            (tmpPath, h) <- openTempFile dir ".tmp"
+                            hClose h
+                            removeFile tmpPath        -- 释放占位名，改为同名符号链接
+                            createSymbolicLink (linkTargetPath targetBytes) tmpPath
+                            setSymbolicLinkTimesHiRes tmpPath
+                                (fromIntegral mtime_) (fromIntegral mtime_)
+                            back <- readLinkContent tmpPath
+                            if hashBytes back /= expectedHash
+                                then do
+                                    quiet (removeLink tmpPath)
+                                    return $ Left "verification failed before commit; target untouched"
+                                else do
+                                    renameFile tmpPath path
+                                    return $ Right ()
+  where
+    quiet :: IO () -> IO ()
+    quiet action = action `catch` handler
+    handler :: IOException -> IO ()
+    handler _ = return ()

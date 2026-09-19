@@ -22,10 +22,12 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BL
 
 import State
-    ( diffState, appendAdded, appendDeleted
-    , currentState, lastState, stateJSON
+    ( StateKind(..)
+    , diffState, appendAddedKind, appendDeletedKind
+    , currentState, currentLinkState, lastStateKind
+    , stateJSON, discardStateUnder
     )
-import Write (writeFileVerified)
+import Write (writeFileVerified, writeLinkVerified, readLinkContent, removeLinkSafe)
 
 -- ============================================================================
 -- 入口
@@ -73,6 +75,15 @@ commandLoop root mTag = go
                 "SETSTAT" -> cmdSetStat  root params'
                 "RECV"    -> cmdRecv     root params'
                 "GETIGNORE"-> cmdGetIgnore root mTag
+                -- 链接阶段（与文件阶段一一对应）
+                "GETLINKSTATE" -> cmdGetLinkState root mTag
+                "GETLINKLAST"  -> cmdGetLinkLast  root mTag
+                "LINKADD"      -> cmdLinkAdd    root mTag params'
+                "LINKDEL"      -> cmdLinkDel    root mTag params'
+                "LINKHASH"     -> cmdLinkHash   root params'
+                "LINKSEND"     -> cmdLinkSend   root params'
+                "LINKRECV"     -> cmdLinkRecv   root mTag params'
+                "LINKUNLINK"   -> cmdLinkUnlink root params'
                 _         -> putStrLn ("ERROR Unknown command: " ++ cmd)
             hFlush stdout
             go
@@ -105,7 +116,23 @@ cmdGetState root mTag = do
 -- | GETLAST — 返回上次同步状态列表（JSON）
 cmdGetLast :: FilePath -> Maybe String -> IO ()
 cmdGetLast root mTag = do
-    st <- lastState root mTag
+    st <- lastStateKind FileKind root mTag
+    putStrLn "OK"
+    BL.hPutStr stdout (BL.snoc (stateJSON st) 10)
+    hFlush stdout
+
+-- | GETLINKSTATE — 当前链接状态列表（JSON，格式与 GETSTATE 同）
+cmdGetLinkState :: FilePath -> Maybe String -> IO ()
+cmdGetLinkState root mTag = do
+    st <- currentLinkState root mTag
+    putStrLn "OK"
+    BL.hPutStr stdout (BL.snoc (stateJSON st) 10)
+    hFlush stdout
+
+-- | GETLINKLAST — 上次链接状态列表（JSON）
+cmdGetLinkLast :: FilePath -> Maybe String -> IO ()
+cmdGetLinkLast root mTag = do
+    st <- lastStateKind LinkKind root mTag
     putStrLn "OK"
     BL.hPutStr stdout (BL.snoc (stateJSON st) 10)
     hFlush stdout
@@ -116,7 +143,7 @@ cmdGetLast root mTag = do
 
 cmdAdd :: FilePath -> Maybe String -> String -> IO ()
 cmdAdd root mTag filename = do
-    appendAdded root mTag filename
+    appendAddedKind FileKind root mTag filename
     putStrLn "OK"
 
 cmdUnlink :: FilePath -> String -> IO ()
@@ -129,7 +156,7 @@ cmdUnlink root filename = do
 
 cmdDelete :: FilePath -> Maybe String -> String -> IO ()
 cmdDelete root mTag filename = do
-    appendDeleted root mTag filename
+    appendDeletedKind FileKind root mTag filename
     putStrLn "OK"
 
 -- ============================================================================
@@ -147,8 +174,16 @@ cmdHash root filename = do
 -- ============================================================================
 
 cmdSend :: FilePath -> String -> IO ()
-cmdSend root filename = do
-    content <- BS.readFile (root </> filename)
+cmdSend root filename = sendContent (BS.readFile (root </> filename))
+
+-- | LINKSEND — 发送链接"内容"（指向字符串），帧格式与 SEND 完全相同
+cmdLinkSend :: FilePath -> String -> IO ()
+cmdLinkSend root filename = sendContent (readLinkContent (root </> filename))
+
+-- | 通用 SEND：内容由调用方提供（文件 → 读字节，链接 → 读指向字符串）
+sendContent :: IO BS.ByteString -> IO ()
+sendContent getContent = do
+    content <- getContent
     let sz = BS.length content
     putStrLn $ "OK " ++ show sz
     hFlush stdout
@@ -174,7 +209,29 @@ cmdSend root filename = do
 --   注意：先收完数据再校验目录，协议不会因为目录问题而错位——
 --   失败时目标文件不受影响，父进程会从第二步响应里拿到 ERROR。
 cmdRecv :: FilePath -> String -> IO ()
-cmdRecv root params =
+cmdRecv root params = recvContent (const (return ())) params writeFileVerified root
+
+-- | LINKRECV — 收链接"内容"（指向字符串），落地为符号链接。
+--
+--   落地成功后顺手作废本端在该链接子树下的文件基线条目（见 'discardStateUnder'）：
+--   链接此前在本端不可达，那些条目已过期，必须当作"从未有过"，
+--   否则 diff 会得出 Deleted，让对端删掉真实内容。
+cmdLinkRecv :: FilePath -> Maybe String -> String -> IO ()
+cmdLinkRecv root mTag params =
+    recvContent (discardStateUnder root mTag) params writeLinkVerified root
+
+-- | 通用 RECV：收 <size> 字节，交给 writer 落地（先校验后 rename）。
+--
+--   writer 共享同一签名，所以文件（writeFileVerified）与链接
+--   （writeLinkVerified，忽略 mode）可以用完全相同的协议实现。
+--   onCommit 在落地成功后调用（拿到相对路径），供链接阶段作废过期基线。
+recvContent
+    :: (FilePath -> IO ())   -- ^ 落地成功后的回调（相对路径）
+    -> String
+    -> (FilePath -> FilePath -> BS.ByteString -> Int -> Integer -> String -> IO (Either String ()))
+    -> FilePath
+    -> IO ()
+recvContent onCommit params writer root =
     case break (== ',') params of
         (sizeStr, ',' : rest) ->
             let revWords = reverse (words rest)
@@ -190,14 +247,45 @@ cmdRecv root params =
                             content <- BS.hGet stdin sz
                             hSetBinaryMode stdin False
                             hSetEncoding stdin utf8   -- C locale 下二进制开关不恢复编码，显式重设
-                            result <- writeFileVerified root fullPath content md mt hashStr
+                            result <- writer root fullPath content md mt hashStr
                             case result of
-                                Right () -> putStrLn "OK"
+                                Right () -> do
+                                    onCommit filename
+                                    putStrLn "OK"
                                 Left err -> putStrLn ("ERROR " ++ err)
                             hFlush stdout
                         _ -> putStrLn "ERROR Invalid RECV params"
                 _ -> putStrLn "ERROR Invalid RECV params"
         _ -> putStrLn "ERROR Invalid RECV params"
+
+-- | LINKUNLINK — 只删链接本身（unlink），不跟随到目标
+--
+--   占位不是链接时回 "OK NOTLINK"，主控端只告警、不强行删。
+cmdLinkUnlink :: FilePath -> String -> IO ()
+cmdLinkUnlink root filename = do
+    ok <- removeLinkSafe (root </> filename)
+    putStrLn (if ok then "OK" else "OK NOTLINK")
+
+-- ============================================================================
+-- 链接阶段：ADD / DELETE / HASH 的对应命令
+-- ============================================================================
+
+cmdLinkAdd :: FilePath -> Maybe String -> String -> IO ()
+cmdLinkAdd root mTag filename = do
+    appendAddedKind LinkKind root mTag filename
+    putStrLn "OK"
+
+cmdLinkDel :: FilePath -> Maybe String -> String -> IO ()
+cmdLinkDel root mTag filename = do
+    appendDeletedKind LinkKind root mTag filename
+    putStrLn "OK"
+
+-- | LINKHASH — 链接"内容"（指向字符串）的 SHA512
+cmdLinkHash :: FilePath -> String -> IO ()
+cmdLinkHash root filename = do
+    content <- readLinkContent (root </> filename)
+    let digest = hash content :: Digest SHA512
+    putStrLn $ "OK " ++ show digest
 
 -- ============================================================================
 -- GETSTAT / SETSTAT
