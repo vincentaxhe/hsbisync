@@ -1,8 +1,9 @@
 module Sync where
 
-import Data.List (nub, find)
+import qualified Data.Map as Map
+import qualified Data.Set as Set
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
-import State (FileState(..), FileChange(..), DiffState(..), sameFile, diffOneSide)
+import State (FileState(..), FileChange(..), DiffState(..), sameFile, diffOneSide, dedup)
 
 -- | 同步操作
 data SyncAction = Receive | Remove | Unsolvable | RecordAdd | RecordDelete
@@ -24,10 +25,11 @@ sync :: ([FileState], [FileState]) -> ([FileState], [FileState])
 sync (last1, last2) (cur1, cur2) =
     let diff1 = diffOneSide last1 cur1
         diff2 = diffOneSide last2 cur2
-        dm1 = lookupDiff diff1
-        dm2 = lookupDiff diff2
-        allFiles = nub $ map (filename . snd) diff1 ++ map (filename . snd) diff2
-        results = map (classifyOne dm1 dm2) allFiles
+        dm1 = indexDiffs diff1
+        dm2 = indexDiffs diff2
+        -- 顺序保持的去重（每个名字只在 root1 优先的位置出现一次）
+        allFiles = dedup (map (filename . snd) diff1 ++ map (filename . snd) diff2)
+        results = map (classifyOne (flip Map.lookup dm1) (flip Map.lookup dm2)) allFiles
         changes1 = [c1 | (c1, _) <- results]
         changes2 = [c2 | (_, c2) <- results]
     in ( zip changes1 (map toAct changes1)
@@ -49,38 +51,43 @@ resolveConflicts pairs1 pairs2 =
     let conflicts1 = [(fc, fs) | (fc@(Conflict fs _ _), _) <- pairs1]
         conflicts2 = [(fc, fs) | (fc@(Conflict fs _ _), _) <- pairs2]
 
+        -- root2 侧索引：文件名 → (本侧 DiffState, 本侧 FileState)
+        -- （`Conflict fs _ d2` 里 fs 与元组第二项同一个值，所以不再重复取出）
+        m2 = Map.fromListWith (\_ old -> old)
+                 [ (filename fs, (d2, fs)) | (Conflict fs _ d2, _) <- conflicts2 ]
+
         -- New/Updated/Unchanged + sameFile → RecordAdd
         --   * New+New / Updated+Updated / New+Updated → 双方内容相同则 ADD
         --   * Unchanged+New / New+Unchanged → 一侧未变一侧新增，
         --     内容相同则在新侧记 ADD（消解为已同步）
         --
-        -- 注意：每个 Conflict 都携带 (root1状态, root2状态) 两个字段。
-        -- d1 从 conflicts1（root1 侧）取第一个字段 = root1 的状态；
-        -- d2 必须从 conflicts2（root2 侧）取第二个字段 = root2 的状态，
-        -- 不能也取第一个字段，否则 Unchanged+New 会被误判成两边都 Unchanged。
+        -- 注意：每个 Conflict 都携带 (root1状态, root2状态) 两个 DiffState。
+        -- d1 来自 pairs1（root1 侧），d2 必须来自 pairs2（root2 侧），
+        -- 不能两边都取第一字段，否则 Unchanged+New 会被误判成两边都 Unchanged。
         resolvedAdd = [ (name, fs1)
-                      | ((Conflict fs1 d1 _), fs1') <- conflicts1, let name = filename fs1
+                      | (Conflict fs1 d1 _, _) <- conflicts1, let name = filename fs1
                       , d1 `elem` [New, Updated, Unchanged]
-                      , (Conflict fs2 _ d2, fs2') <- conflicts2
-                      , filename fs2 == name, d2 `elem` [New, Updated, Unchanged]
+                      , Just (d2, fs2) <- [Map.lookup name m2]
+                      , d2 `elem` [New, Updated, Unchanged]
                       , not (d1 == Unchanged && d2 == Unchanged)
-                      , sameFile fs1' fs2'
+                      , sameFile fs1 fs2
                       ]
 
         -- Deleted+Deleted → RecordDelete
         resolvedDel = [ name
                       | (Conflict fs1 Deleted Deleted, _) <- conflicts1, let name = filename fs1
-                      , (Conflict fs2 Deleted Deleted, _) <- conflicts2
-                      , filename fs2 == name
+                      , Just (Deleted, _) <- [Map.lookup name m2]
                       ]
 
-        resolvedNames = map fst resolvedAdd ++ resolvedDel
-        keepInPairs2 (Conflict fs _ _, _) = filename fs `notElem` resolvedNames
+        addNames = Set.fromList (map fst resolvedAdd)
+        delNames = Set.fromList resolvedDel
+        resolvedNames = Set.union addNames delNames
+        keepInPairs2 (Conflict fs _ _, _) = not (Set.member (filename fs) resolvedNames)
         keepInPairs2 _                    = True
 
         convert ((Conflict fs d1 d2), _)
-            | filename fs `elem` resolvedDel                                = (Del fs d1 d2, Just RecordDelete)
-            | filename fs `elem` map fst resolvedAdd                        = (Noop fs d1 d2, Just RecordAdd)
+            | Set.member (filename fs) delNames = (Del fs d1 d2, Just RecordDelete)
+            | Set.member (filename fs) addNames = (Noop fs d1 d2, Just RecordAdd)
         convert other = other
 
     in (resolvedAdd, map convert pairs1, filter keepInPairs2 pairs2)
@@ -89,9 +96,9 @@ toAct (Noop _ _ _)  = Nothing
 toAct (Added     _ _ _)  = Just Receive
 toAct (Del   _ _ _)  = Just Remove
 toAct (Conflict  _ _ _)  = Just Unsolvable
--- | 从 diff 列表构建文件名 → Maybe (DiffState, FileState) 的查找函数
-lookupDiff :: [(DiffState, FileState)] -> FilePath -> Maybe (DiffState, FileState)
-lookupDiff diffs name = find (\(_, fs) -> filename fs == name) diffs
+-- | 单侧 diff 的索引：文件名 → (DiffState, FileState)（同名重复保留先出现的）
+indexDiffs :: [(DiffState, FileState)] -> Map.Map FilePath (DiffState, FileState)
+indexDiffs = Map.fromListWith (\_ old -> old) . map (\(d, fs) -> (filename fs, (d, fs)))
 
 -- | 分类单个文件的双侧状态，产生两侧各自的 FileChange
 --

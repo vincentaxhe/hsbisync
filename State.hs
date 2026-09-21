@@ -20,12 +20,13 @@ import System.Posix.Files
     , deviceID, fileID, isDirectory, isSymbolicLink
     )
 import System.Posix.Types (DeviceID, FileID)
-import Text.JSON
-
 import Ignore (Ignore, parse, ignores)
+import qualified Data.Map as Map
+import qualified Data.Set as Set
+import qualified Msg
 
-import qualified Data.ByteString.Lazy as BL
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Builder as B
 import qualified Data.Text.Encoding as T
 import qualified Data.Text.IO as TIO
 import qualified Data.Text as T (pack, unpack)
@@ -51,14 +52,6 @@ data FileState = FileState
     , filename :: !FilePath
     } deriving (Show, Eq)
 
--- | diff 条目
-data DiffEntry = DiffEntry
-    { deState :: !String
-    , deSize  :: !Integer
-    , deMtime :: !Integer
-    , deFile  :: !FilePath
-    } deriving (Show, Eq)
--- | 单侧文件状态变化
 -- | 单侧文件差异（5 种）
 --
 --   * 'None'  — 该侧从未有过此文件
@@ -67,7 +60,7 @@ data DiffEntry = DiffEntry
 --   * 'Updated'  — 修改
 --   * 'Deleted'  — 删除
 data DiffState = None | Unchanged | New | Updated | Deleted
-    deriving (Show, Eq)
+    deriving (Show, Eq, Ord)
 
 -- | 文件变更决策，携带双方各自的 DiffState
 --
@@ -358,8 +351,8 @@ readLastStateKind kind root mTag = do
     if hasDeleted
         then do
             raw <- BS.readFile deletedFile
-            let dels = map (T.unpack . T.decodeUtf8) (bsLines raw)
-            return $ filter (\(FileState _ _ _ fn) -> fn `notElem` dels) st'
+            let dels = Set.fromList (map (T.unpack . T.decodeUtf8) (bsLines raw))
+            return $ filter (\fs -> not (Set.member (filename fs) dels)) st'
         else return st'
 
 -- | 从状态目录读取上次同步状态，合并后写回并清理
@@ -444,18 +437,47 @@ writeEntries fp entries = do
         error $ "writeEntries: verification failed for " ++ fp
 
 -- | 合并 added 条目到 state：同文件名则覆盖，否则追加
+--
+--   用 Map/Set 索引（O((|st|+|adds|) log n)，不再每次线性重找）：
+--   * 「同名覆盖」来自 Map，重复名字**保留先出现的那条**
+--     （与旧的关联表 @lookup@ 语义一致）
+--   * 追加部分先按名字去重：否则 added 里的重复行会在 state 里留两条同名记录
 mergeAdds :: [FileState] -> [FileState] -> [FileState]
 mergeAdds adds st =
-    let addMap = [(filename a, a) | a <- adds]
-        replaced = map (\fs -> case lookup (filename fs) addMap of
-                                  Just a  -> a
-                                  Nothing -> fs) st
-        newFiles = [a | a <- adds, filename a `notElem` map filename st]
-    in replaced ++ newFiles
+    let addM    = indexStates adds
+        stName  = nameSet st
+        newOnes = [ a | a <- dedupOn filename adds, not (Set.member (filename a) stName) ]
+    in map (\fs -> Map.findWithDefault fs (filename fs) addM) st ++ newOnes
 
 -- ============================================================================
 -- Helpers
 -- ============================================================================
+
+-- ============================================================================
+-- 索引 / 去重（全部用 Map/Set：不要再用 linear lookup / notElem / nub）
+-- ============================================================================
+
+-- | 文件名 → 条目。同名重复时**保留先出现的那条**（与关联表 @lookup@ 语义一致）
+indexStates :: [FileState] -> Map.Map FilePath FileState
+indexStates = Map.fromListWith (\_ old -> old) . map (\fs -> (filename fs, fs))
+
+-- | 一批条目占用哪些文件名
+nameSet :: [FileState] -> Set.Set FilePath
+nameSet = Set.fromList . map filename
+
+-- | 顺序保持的去重（O(n log n)，替代 @Data.List.nub@ 的 O(n²)）：
+--   按给定键判重，保留每个键**第一次**出现的那条
+--
+--   注意：**必须保序**（root1 的顺序在前），所以不能用 @Map.keys@ / @Set.toList@。
+dedupOn :: Ord k => (a -> k) -> [a] -> [a]
+dedupOn key = go Set.empty
+  where
+    go _    []       = []
+    go seen (x : xs) | Set.member (key x) seen = go seen xs
+                     | otherwise               = x : go (Set.insert (key x) seen) xs
+
+dedup :: Ord a => [a] -> [a]
+dedup = dedupOn id
 
 -- | 按换行分割 ByteString（纯字节，不涉及编码）
 bsLines :: BS.ByteString -> [BS.ByteString]
@@ -493,21 +515,8 @@ makeRelative root path =
         | otherwise     = p
 
 -- ============================================================================
--- Helper 复用：diff 计算 + added/deleted 追加
+-- Helper 复用：added/deleted 追加
 -- ============================================================================
-
--- | 计算上次状态与当前状态的差异（供 Helper 的 GETDIFF 命令使用）
---   返回 JSON 字节串
-diffState :: FilePath -> Maybe String -> IO BL.ByteString
-diffState root mTag = do
-    prev <- lastState root mTag
-    cur  <- currentState root mTag
-
-    let diffs = diffOneSide prev cur
-    return $ diffJSON [mkDiffEntry ds fs | (ds, fs) <- diffs]
-
-mkDiffEntry :: DiffState -> FileState -> DiffEntry
-mkDiffEntry ds fs = DiffEntry (show ds) (size fs) (posixSecs (mtime fs)) (filename fs)
 
 -- | 追加一条记录到 added / link_added（写入必须成功）
 --
@@ -583,14 +592,16 @@ posixSecs :: UTCTime -> Integer
 posixSecs = floor . utcTimeToPOSIXSeconds
 
 -- | 计算单侧差异：last vs cur → [(DiffState, FileState)]
+--
+--   索引化：一侧 O(n log n)，不再逐条线性查 prev / 线性 notElem 扫 cur
+--   （n 大时那是 O(n²)，每次运行都要跑）。
 diffOneSide :: [FileState] -> [FileState] -> [(DiffState, FileState)]
 diffOneSide prev cur =
-    let prevMap  = [(filename fs, fs) | fs <- prev]
-        curNames = map filename cur
-        lookupPrev name = lookup name prevMap
+    let prevM  = indexStates prev
+        curSet = nameSet cur
 
         curDiffs = map (\fs ->
-            case lookupPrev (filename fs) of
+            case Map.lookup (filename fs) prevM of
                 Nothing     -> (New,    fs)
                 Just prevFs -> if sameFile fs prevFs
                     then (Unchanged, fs)
@@ -599,60 +610,62 @@ diffOneSide prev cur =
 
         delDiffs = [ (Deleted, fs)
                    | fs <- prev
-                   , filename fs `notElem` curNames
+                   , not (Set.member (filename fs) curSet)
                    ]
     in curDiffs ++ delDiffs
 
 -- ============================================================================
--- JSON 编解码（json 包，纯 Haskell，无 C++ 依赖）
+-- 状态列表的消息编解码（见 Msg：一行一个规范 JSON）
 -- ============================================================================
 
--- | FileState 的 JSON 实例
-instance JSON FileState where
-    showJSON (FileState sz mt md fn) =
-        makeObj [ ("size",     showJSON sz)
-                , ("mtime",    showJSON (posixSecs mt))
-                , ("mode",     showJSON md)
-                , ("filename", showJSON fn)
-                ]
+-- | 状态列表 → 消息值（**位置式数组**，省掉每条重复的键名）：
+--
+--   > [[size,mtime,mode,name], ...]
+--
+--   设计取舍（2026-09-22 与用户定）：
+--   * 不用二进制 JSON（CBOR）—— 实测它只省字节（-21%），不省 CPU；
+--   * 批量数据用**数组**（对象形状 88.8 B/条 → 数组 55.8 B/条，解码也快一倍）；
+--   * 名字只在这里转一次（'Msg.bytes' 接 UTF-8 字节），不再 String↔Text 反复转。
+stateValue :: [FileState] -> Msg.Value
+stateValue = Msg.arr . map one
+  where
+    one fs = Msg.arr [ Msg.int (size fs)
+                     , Msg.int (posixSecs (mtime fs))
+                     , Msg.int (fromIntegral (mode fs))
+                     , Msg.bytes (T.encodeUtf8 (T.pack (filename fs)))
+                     ]
 
-    readJSON (JSObject obj) = do
-        sz <- valFromObj "size" obj
-        mt <- valFromObj "mtime" obj
-        md <- valFromObj "mode" obj
-        fn <- valFromObj "filename" obj
-        return $ FileState sz (posixSecondsToUTCTime (realToFrac (mt :: Integer))) md fn
-    readJSON _ = Error "FileState: expected object"
+-- | 状态列表的**流式编码**：直接写进 Builder，不建 `[Value]` 中间树。
+--
+--   输出字节与 'stateValue' 完全一致（同一套规范形状），只是省掉每条 4 个
+--   `Value` 节点的分配——这就是 aeson `toEncoding` 那套“不建中间结构”的思路，
+--   在 bytestring 上自己写只要十来行，不用引依赖。
+stateBuilder :: [FileState] -> B.Builder
+stateBuilder sts = B.word8 91 <> go sts <> B.word8 93
+  where
+    go []       = mempty
+    go [x]      = one x
+    go (x : xs) = one x <> B.word8 44 <> go xs
+    one fs = B.word8 91
+          <> Msg.intBuilder (size fs)                <> B.word8 44
+          <> Msg.intBuilder (posixSecs (mtime fs))   <> B.word8 44
+          <> Msg.intBuilder (fromIntegral (mode fs)) <> B.word8 44
+          <> Msg.strBuilder (T.encodeUtf8 (T.pack (filename fs)))
+          <> B.word8 93
 
--- | DiffEntry 的 JSON 实例
-instance JSON DiffEntry where
-    showJSON (DiffEntry st sz mt fn) =
-        makeObj [ ("deState", showJSON st)
-                , ("deSize",  showJSON sz)
-                , ("deMtime", showJSON mt)
-                , ("deFile",  showJSON fn)
-                ]
-
-    readJSON (JSObject obj) = do
-        st <- valFromObj "deState" obj
-        sz <- valFromObj "deSize" obj
-        mt <- valFromObj "deMtime" obj
-        fn <- valFromObj "deFile" obj
-        return $ DiffEntry st sz mt fn
-    readJSON _ = Error "DiffEntry: expected object"
-
--- | 将 FileState 列表编码为 JSON（供 GETSTATE/GETLAST 使用）
-stateJSON :: [FileState] -> BL.ByteString
-stateJSON = BL.fromStrict . T.encodeUtf8 . T.pack . encode
-
--- | 从 JSON 解析 FileState 列表
-parseStateJSON :: BL.ByteString -> [FileState]
-parseStateJSON bs = case decode (T.unpack (T.decodeUtf8 (BL.toStrict bs))) of
-    Ok fs   -> fs
-    Error e -> error $ "parseStateJSON: invalid JSON: " ++ e
-
--- | 将 diff 列表编码为 JSON
-diffJSON :: [DiffEntry] -> BL.ByteString
-diffJSON = BL.fromStrict . T.encodeUtf8 . T.pack . encode
-
+-- | 从消息值解析状态列表（形状见 'stateValue'）
+parseStateValue :: Msg.Value -> [FileState]
+parseStateValue v = case Msg.asArr v of
+    Nothing -> error "parseStateValue: expected an array"
+    Just xs -> map oneEntry xs
+  where
+    oneEntry e = case Msg.asArr e of
+        Just [a, b, c, d]
+            | Just sz <- Msg.asInt a
+            , Just mt <- Msg.asInt b
+            , Just md <- Msg.asInt c
+            , Just nm <- Msg.asStr d ->
+                FileState sz (posixSecondsToUTCTime (fromIntegral mt))
+                          (fromIntegral md) (T.unpack (T.decodeUtf8 nm))
+        _ -> error "parseStateValue: expected [size,mtime,mode,name]"
 

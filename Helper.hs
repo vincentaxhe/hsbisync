@@ -1,16 +1,15 @@
 module Helper where
 
-import Control.Exception (catch, IOException)
-import Control.Monad (unless)
+import Control.Exception (ErrorCall, IOException, catch, displayException)
+import Control.Monad (unless, when)
 import Data.Bits ((.&.))
-import Data.Char (toUpper)
 import Data.Maybe (fromMaybe, listToMaybe)
 import System.Directory (createDirectoryIfMissing, doesFileExist)
-import System.Environment (lookupEnv)
+import System.Environment (getExecutablePath, lookupEnv)
 import System.FilePath ((</>))
 import System.IO
     ( BufferMode(..), hFlush, hLookAhead
-    , hSetBinaryMode, hSetBuffering, hSetEncoding, utf8, stdin, stdout
+    , hSetBinaryMode, hSetBuffering, stdin, stdout
     )
 
 import System.Posix.Files
@@ -20,79 +19,120 @@ import System.Posix.Files
 
 import Crypto.Hash (hash, SHA512, Digest)
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Char8 as B8
 import qualified Data.ByteString.Lazy as BL
 
 import State
-    ( StateKind(..)
-    , diffState, appendAddedKind, appendDeletedKind
+    ( FileState(..), StateKind(..)
+    , appendAddedKind, appendDeletedKind
     , currentState, currentLinkState, lastStateKind
-    , stateJSON, discardStateUnder
+    , stateBuilder, discardStateUnder
     )
 import Write
     ( writeFileVerified, writeLinkVerified, readLinkContent
     , removeLinkSafe, removeFileSafe, writeRepoFile, setMtimeOnly
+    , hGetExactly
     )
+import qualified Msg
 
 -- ============================================================================
 -- 入口
 -- ============================================================================
 
--- | 以 helper 模式运行，通过 stdin/stdout 与主控端通信
+-- | 以 helper 模式运行，通过 stdin/stdout 与主控端通信。
+--
+--   协议：**一行一个规范 JSON**（见 'Msg'）
+--     * 请求：{"cmd":"…", …}
+--     * 响应：{"ok":true,…} / {"ok":false,"error":"…"}
+--     * 文件内容不走 JSON：send/recv 的响应里给出 size，紧跟其后的就是裸字节载荷
+--
+--   句柄全程二进制（协议是字节流，不经过文本编码层）——既没有
+--   hSetBinaryMode/hSetEncoding 来回切换的坑，也不受远端 locale 影响。
 runHelper :: FilePath -> Maybe String -> IO ()
 runHelper root mTag = do
     let stateDir = root </> ".bisync" </> maybe "" id mTag
     createDirectoryIfMissing True stateDir
 
-    -- 全局编码（setFileSystemEncoding/setLocaleEncoding）已在 Main.main 入口统一
-    -- 钉死为 UTF-8；这里只需保证本协议所用句柄是行缓冲 + UTF-8。
+    hSetBinaryMode stdout True
+    hSetBinaryMode stdin  True
     hSetBuffering stdout LineBuffering
     hSetBuffering stdin  LineBuffering
-    hSetEncoding stdout utf8
-    hSetEncoding stdin  utf8
 
-    putStrLn "OK"
-    hFlush stdout
+    -- 打招呼 = 自报家门：自己这个**正在运行的文件**的真实路径（Linux 下来自
+    -- /proc/self/exe，已解析符号链接）+ 家目录。主控端据此知道"远端这份
+    -- hsbisync 到底是哪个文件"，之后直接按绝对路径调用，不用再查 PATH。
+    exe  <- getExecutablePath
+    home <- fromMaybe "" <$> lookupEnv "HOME"
+    reply (Msg.obj [ ("ok",   Msg.JBool True)
+                   , ("exe",  Msg.str exe)
+                   , ("home", Msg.str home) ])
 
     commandLoop root mTag
 
--- | 命令循环
+-- | 回一条响应（一行规范 JSON）
+reply :: Msg.Value -> IO ()
+reply v = BL.hPut stdout (Msg.encodeLine v) >> hFlush stdout
+
+replyOk :: [(String, Msg.Value)] -> IO ()
+replyOk kvs = reply (Msg.obj (("ok", Msg.JBool True) : kvs))
+
+replyErr :: String -> IO ()
+replyErr e = reply (Msg.obj [("ok", Msg.JBool False), ("error", Msg.str e)])
+
+-- | 命令循环：读一行请求 → 执行 → 回一行响应
 commandLoop :: FilePath -> Maybe String -> IO ()
 commandLoop root mTag = go
   where
     go = do
         done <- isEOF
         unless done $ do
-            line <- getLine
-            let (cmd, params) = break (== ' ') line
-                params'       = dropWhile (== ' ') params
-            case map toUpper cmd of
-                "QUIT"    -> putStrLn "OK" >> hFlush stdout
-                "GETDIFF" -> cmdGetDiff  root mTag
-                "GETSTATE"-> cmdGetState root mTag
-                "GETLAST" -> cmdGetLast  root mTag
-                "ADD"     -> cmdAdd      root mTag params'
-                "UNLINK"  -> cmdUnlink   root params'
-                "DELETE"  -> cmdDelete   root mTag params'
-                "HASH"    -> cmdHash     root params'
-                "SEND"    -> cmdSend     root params'
-                "GETSTAT" -> cmdGetStat  root params'
-                "SETSTAT" -> cmdSetStat  root params'
-                "SETTIME" -> cmdSetTime  root params'
-                "RECV"    -> cmdRecv     root params'
-                "GETIGNORE"-> cmdGetIgnore root mTag
-                "PUTREPO"  -> cmdPutRepo   root mTag params'
-                -- 链接阶段（与文件阶段一一对应）
-                "GETLINKSTATE" -> cmdGetLinkState root mTag
-                "GETLINKLAST"  -> cmdGetLinkLast  root mTag
-                "LINKADD"      -> cmdLinkAdd    root mTag params'
-                "LINKDEL"      -> cmdLinkDel    root mTag params'
-                "LINKHASH"     -> cmdLinkHash   root params'
-                "LINKSEND"     -> cmdLinkSend   root params'
-                "LINKRECV"     -> cmdLinkRecv   root mTag params'
-                "LINKUNLINK"   -> cmdLinkUnlink root params'
-                _         -> putStrLn ("ERROR Unknown command: " ++ cmd)
-            hFlush stdout
+            line <- B8.hGetLine stdin
+            case Msg.decodeStrict line of
+                Left e    -> replyErr ("bad request: " ++ e)
+                Right req -> (dispatch req `catch` ioErr) `catch` callErr
             go
+
+    ioErr :: IOException -> IO ()
+    ioErr e = replyErr (show e)
+
+    callErr :: ErrorCall -> IO ()
+    callErr e = replyErr (displayException e)
+
+    dispatch req = case Msg.fieldStr "cmd" req of
+        Nothing  -> replyErr "missing \"cmd\""
+        Just cmd -> case kindOf req of
+            Left e     -> replyErr e
+            Right kind -> dispatch' cmd kind req
+
+    -- 需要 "path" 的命令走 withPath；其余（state/last/getignore/putrepo…）不需要
+    dispatch' cmd kind req = case cmd of
+        "quit"      -> replyOk []
+        "state"     -> cmdState     root mTag kind
+        "last"      -> cmdLast      root mTag kind
+        "getignore" -> cmdGetIgnore root mTag
+        "putrepo"   -> cmdPutRepo   root mTag req
+        "setstat"   -> cmdSetStat   root req
+        "settime"   -> cmdSetTime   root req
+        "add"       -> withPath $ cmdAdd    root mTag kind
+        "delete"    -> withPath $ cmdDelete root mTag kind
+        "unlink"    -> withPath $ cmdUnlink root kind
+        "hash"      -> withPath $ cmdHash   root kind
+        "send"      -> withPath $ cmdSend   root kind
+        "recv"      -> withPath $ cmdRecv   root mTag kind req
+        "getstat"   -> withPath $ cmdGetStat root
+        other       -> replyErr ("unknown command: " ++ other)
+      where
+        withPath k = case Msg.fieldStr "path" req of
+            Just p  -> k p
+            Nothing -> replyErr "missing \"path\""
+
+    -- "kind"：file（默认）或 link —— 文件与链接在协议层面是同一套命令，
+    -- 差别只在"内容是什么"（文件字节 vs 指向字符串）与"怎么落地"。
+    kindOf req = case Msg.fieldStr "kind" req of
+        Just "link" -> Right LinkKind
+        Just "file" -> Right FileKind
+        Nothing     -> Right FileKind
+        Just other  -> Left ("unknown kind: " ++ other)
 
 isEOF :: IO Bool
 isEOF = catch (hLookAhead stdin >> return False) handler
@@ -101,271 +141,156 @@ isEOF = catch (hLookAhead stdin >> return False) handler
     handler _ = return True
 
 -- ============================================================================
--- GETDIFF
+-- 状态（state = 本次扫描，last = 上次基线）
 -- ============================================================================
 
-cmdGetDiff :: FilePath -> Maybe String -> IO ()
-cmdGetDiff root mTag = do
-    json <- diffState root mTag
-    putStrLn "OK"
-    BL.hPutStr stdout (BL.snoc json 10)
-    hFlush stdout
+-- | @{"cmd":"state"|"last","kind":…}@ → @{"entries":[[size,mtime,mode,name],…]}@
+cmdState :: FilePath -> Maybe String -> StateKind -> IO ()
+cmdState root mTag kind = replyOk . entries =<< currentKind kind root mTag
 
--- | GETSTATE — 返回当前文件状态列表（JSON）
-cmdGetState :: FilePath -> Maybe String -> IO ()
-cmdGetState root mTag = do
-    st <- currentState root mTag
-    putStrLn "OK"
-    BL.hPutStr stdout (BL.snoc (stateJSON st) 10)
-    hFlush stdout
+cmdLast :: FilePath -> Maybe String -> StateKind -> IO ()
+cmdLast root mTag kind = replyOk . entries =<< lastStateKind kind root mTag
 
--- | GETLAST — 返回上次同步状态列表（JSON）
-cmdGetLast :: FilePath -> Maybe String -> IO ()
-cmdGetLast root mTag = do
-    st <- lastStateKind FileKind root mTag
-    putStrLn "OK"
-    BL.hPutStr stdout (BL.snoc (stateJSON st) 10)
-    hFlush stdout
+entries :: [FileState] -> [(String, Msg.Value)]
+entries st = [("entries", Msg.raw (stateBuilder st))]
 
--- | GETLINKSTATE — 当前链接状态列表（JSON，格式与 GETSTATE 同）
-cmdGetLinkState :: FilePath -> Maybe String -> IO ()
-cmdGetLinkState root mTag = do
-    st <- currentLinkState root mTag
-    putStrLn "OK"
-    BL.hPutStr stdout (BL.snoc (stateJSON st) 10)
-    hFlush stdout
-
--- | GETLINKLAST — 上次链接状态列表（JSON）
-cmdGetLinkLast :: FilePath -> Maybe String -> IO ()
-cmdGetLinkLast root mTag = do
-    st <- lastStateKind LinkKind root mTag
-    putStrLn "OK"
-    BL.hPutStr stdout (BL.snoc (stateJSON st) 10)
-    hFlush stdout
+currentKind :: StateKind -> FilePath -> Maybe String -> IO [FileState]
+currentKind FileKind root mTag = currentState root mTag
+currentKind LinkKind root mTag = currentLinkState root mTag
 
 -- ============================================================================
--- ADD / UNLINK / DELETE
+-- ADD / DELETE / UNLINK
 -- ============================================================================
 
-cmdAdd :: FilePath -> Maybe String -> String -> IO ()
-cmdAdd root mTag filename = do
-    appendAddedKind FileKind root mTag filename
-    putStrLn "OK"
+cmdAdd :: FilePath -> Maybe String -> StateKind -> FilePath -> IO ()
+cmdAdd root mTag kind path = do
+    appendAddedKind kind root mTag path
+    replyOk []
 
-cmdUnlink :: FilePath -> String -> IO ()
-cmdUnlink root filename = do
-    -- removeFileSafe 会解析"指向文件的链接"，删的是目标文件（保留链接），
-    -- 与写入路径对称；链接阶段自己的删除走 LINKUNLINK。
-    catch (removeFileSafe (root </> filename)) handler
-    putStrLn "OK"
-  where
-    handler :: IOException -> IO ()
-    handler e = putStrLn ("ERROR " ++ show e)
+cmdDelete :: FilePath -> Maybe String -> StateKind -> FilePath -> IO ()
+cmdDelete root mTag kind path = do
+    appendDeletedKind kind root mTag path
+    replyOk []
 
-cmdDelete :: FilePath -> Maybe String -> String -> IO ()
-cmdDelete root mTag filename = do
-    appendDeletedKind FileKind root mTag filename
-    putStrLn "OK"
+-- | 文件：删的是**目标**（'removeFileSafe' 先解析末端链接，保留链接本身）；
+--   链接：只 unlink 链接自己。占位不是链接时回 @notLink@，主控端只告警不删。
+cmdUnlink :: FilePath -> StateKind -> FilePath -> IO ()
+cmdUnlink root kind path = case kind of
+    FileKind -> removeFileSafe (root </> path) >> replyOk []
+    LinkKind -> do
+        ok <- removeLinkSafe (root </> path)
+        replyOk (if ok then [] else [("notLink", Msg.JBool True)])
 
 -- ============================================================================
 -- HASH
 -- ============================================================================
 
-cmdHash :: FilePath -> String -> IO ()
-cmdHash root filename = do
-    content <- BS.readFile (root </> filename)
-    let digest = hash content :: Digest SHA512
-    putStrLn $ "OK " ++ show digest
+cmdHash :: FilePath -> StateKind -> FilePath -> IO ()
+cmdHash root kind path = do
+    content <- kindContent kind root path
+    replyOk [("hash", Msg.str (show (hash content :: Digest SHA512)))]
+
+-- | 条目的"内容"：文件 = 文件字节；链接 = 指向字符串
+kindContent :: StateKind -> FilePath -> FilePath -> IO BS.ByteString
+kindContent FileKind root path = BS.readFile (root </> path)
+kindContent LinkKind root path = readLinkContent (root </> path)
 
 -- ============================================================================
--- SEND / RECV
+-- SEND：{"ok":true,"size":N} + N 字节裸数据
 -- ============================================================================
 
-cmdSend :: FilePath -> String -> IO ()
-cmdSend root filename = sendContent (BS.readFile (root </> filename))
-
--- | LINKSEND — 发送链接"内容"（指向字符串），帧格式与 SEND 完全相同
-cmdLinkSend :: FilePath -> String -> IO ()
-cmdLinkSend root filename = sendContent (readLinkContent (root </> filename))
-
--- | 通用 SEND：内容由调用方提供（文件 → 读字节，链接 → 读指向字符串）
-sendContent :: IO BS.ByteString -> IO ()
-sendContent getContent = do
-    content <- getContent
-    let sz = BS.length content
-    putStrLn $ "OK " ++ show sz
-    hFlush stdout
-    hSetBinaryMode stdout True
+cmdSend :: FilePath -> StateKind -> FilePath -> IO ()
+cmdSend root kind path = do
+    content <- kindContent kind root path
+    replyOk [("size", Msg.int (fromIntegral (BS.length content)))]
     BS.hPut stdout content
     hFlush stdout
-    hSetBinaryMode stdout False                  -- 恢复文本模式，供后续行响应输出
-    hSetEncoding stdout utf8                     -- C locale 下二进制开关不会恢复编码，显式重设
-
--- | RECV 命令（扩展协议）：接收文件并在 rename 之前校验。
---
---   协议格式：RECV <size>,<filename> <mode> <mtime> <expectedHash>
---   其中 filename 是 size 之后到倒数第 3 个空格之前的所有内容（可含空格），
---   mode、mtime、expectedHash 是最后 3 个以空格分隔的字段。
---
---   流程：
---   1. 解析参数，回复 "OK" 表示准备接收
---   2. 读取 <size> 字节二进制数据
---   3. 写临时文件 + 设 mode/mtime + 算哈希比对（目录：root 必须存在，
---      root 之下的中间目录由 'writeFileVerified' 递归创建）
---   4. 通过 → rename + 回复 "OK"；不通过 → 删临时文件 + 回复 "ERROR ..."
---
---   注意：先收完数据再校验目录，协议不会因为目录问题而错位——
---   失败时目标文件不受影响，父进程会从第二步响应里拿到 ERROR。
-cmdRecv :: FilePath -> String -> IO ()
-cmdRecv root params = recvContent (const (return ())) params writeFileVerified root
-
--- | LINKRECV — 收链接"内容"（指向字符串），落地为符号链接。
---
---   落地成功后顺手作废本端在该链接子树下的文件基线条目（见 'discardStateUnder'）：
---   链接此前在本端不可达，那些条目已过期，必须当作"从未有过"，
---   否则 diff 会得出 Deleted，让对端删掉真实内容。
-cmdLinkRecv :: FilePath -> Maybe String -> String -> IO ()
-cmdLinkRecv root mTag params =
-    recvContent (discardStateUnder root mTag) params writeLinkVerified root
-
--- | 通用 RECV：收 <size> 字节，交给 writer 落地（先校验后 rename）。
---
---   writer 共享同一签名，所以文件（writeFileVerified）与链接
---   （writeLinkVerified，忽略 mode）可以用完全相同的协议实现。
---   onCommit 在落地成功后调用（拿到相对路径），供链接阶段作废过期基线。
-recvContent
-    :: (FilePath -> IO ())   -- ^ 落地成功后的回调（相对路径）
-    -> String
-    -> (FilePath -> FilePath -> BS.ByteString -> Int -> Integer -> String -> IO (Either String ()))
-    -> FilePath
-    -> IO ()
-recvContent onCommit params writer root =
-    case break (== ',') params of
-        (sizeStr, ',' : rest) ->
-            let revWords = reverse (words rest)
-            in case revWords of
-                (hashStr : mtimeStr : modeStr : revFilename) ->
-                    case (reads sizeStr, reads modeStr, reads mtimeStr) of
-                        ([(sz, "")], [(md, "")], [(mt, "")]) -> do
-                            let filename = unwords (reverse revFilename)
-                                fullPath = root </> filename
-                            putStrLn "OK"
-                            hFlush stdout
-                            hSetBinaryMode stdin True
-                            content <- BS.hGet stdin sz
-                            hSetBinaryMode stdin False
-                            hSetEncoding stdin utf8   -- C locale 下二进制开关不恢复编码，显式重设
-                            result <- writer root fullPath content md mt hashStr
-                            case result of
-                                Right () -> do
-                                    onCommit filename
-                                    putStrLn "OK"
-                                Left err -> putStrLn ("ERROR " ++ err)
-                            hFlush stdout
-                        _ -> putStrLn "ERROR Invalid RECV params"
-                _ -> putStrLn "ERROR Invalid RECV params"
-        _ -> putStrLn "ERROR Invalid RECV params"
-
--- | LINKUNLINK — 只删链接本身（unlink），不跟随到目标
---
---   占位不是链接时回 "OK NOTLINK"，主控端只告警、不强行删。
-cmdLinkUnlink :: FilePath -> String -> IO ()
-cmdLinkUnlink root filename = do
-    ok <- removeLinkSafe (root </> filename)
-    putStrLn (if ok then "OK" else "OK NOTLINK")
 
 -- ============================================================================
--- 链接阶段：ADD / DELETE / HASH 的对应命令
+-- RECV：两步 —— 先 {"ok":true} 表示准备好，收完载荷再回一条结果
 -- ============================================================================
 
-cmdLinkAdd :: FilePath -> Maybe String -> String -> IO ()
-cmdLinkAdd root mTag filename = do
-    appendAddedKind LinkKind root mTag filename
-    putStrLn "OK"
-
-cmdLinkDel :: FilePath -> Maybe String -> String -> IO ()
-cmdLinkDel root mTag filename = do
-    appendDeletedKind LinkKind root mTag filename
-    putStrLn "OK"
-
--- | LINKHASH — 链接"内容"（指向字符串）的 SHA512
-cmdLinkHash :: FilePath -> String -> IO ()
-cmdLinkHash root filename = do
-    content <- readLinkContent (root </> filename)
-    let digest = hash content :: Digest SHA512
-    putStrLn $ "OK " ++ show digest
-
--- ============================================================================
--- GETSTAT / SETSTAT
--- ============================================================================
-
-cmdGetStat :: FilePath -> String -> IO ()
-cmdGetStat root filename = do
-    fs <- getFileStatus (root </> filename)
-    let mt   = modificationTime fs
-        mode = fileMode fs .&. 0o7777
-    putStrLn $ "OK " ++ show mt ++ " " ++ show mode
-
-cmdSetStat :: FilePath -> String -> IO ()
-cmdSetStat root params = do
-    let (filename, rest) = break (== ',') params
-        (mtimeStr, modeStr) = break (== ' ') (drop 1 rest)
-    case (reads mtimeStr, reads (dropWhile (== ' ') modeStr)) of
-        ([(mt, "")], [(md, "")]) -> do
-            let fullPath = root </> filename
-            setFileTimes fullPath (fromIntegral (mt :: Integer)) (fromIntegral (mt :: Integer))
-            setFileMode fullPath (fromIntegral (md :: Integer))
-            putStrLn "OK"
-        _ -> putStrLn "ERROR Invalid SETSTAT params"
-
--- | SETTIME — 只把 mtime/atime 对齐到给定秒数（不动内容、不动 mode）
+-- | @{"cmd":"recv","path":…,"size":…,"mode":…,"mtime":…,"hash":…}@
 --
---   协议：SETTIME <mtime_secs>,<path>（path = 逗号之后全部，允许空格）
---   用于传输前的“内容校验钩子”：内容实质相同、只差时间戳时，把较旧那端的 mtime
---   对齐到较新那端，使两端 (size, mtime) 一致（之后记成 added 即彻底收敛）。
-cmdSetTime :: FilePath -> String -> IO ()
-cmdSetTime root params =
-    case break (== ',') params of
-        (mtStr, ',' : relPath)
-            | [(mt, "")] <- reads mtStr, not (null relPath) ->
-                (setMtimeOnly (root </> relPath) (mt :: Integer) >> putStrLn "OK")
-                    `catch` handler
-        _ -> putStrLn "ERROR Invalid SETTIME params"
-  where
-    handler :: IOException -> IO ()
-    handler e = putStrLn ("ERROR " ++ show e)
+--   先回 OK 再收数据：失败时目标文件不受影响、协议也不会错位
+--   （父进程从第二步的响应里拿到 error）。链接忽略 mode（Linux 上不可设）。
+cmdRecv :: FilePath -> Maybe String -> StateKind -> Msg.Value -> FilePath -> IO ()
+cmdRecv root mTag kind req path =
+    case ( Msg.fieldInt "size" req, Msg.fieldInt "mode" req
+         , Msg.fieldInt "mtime" req, Msg.fieldStr "hash" req ) of
+        (Just sz, Just md, Just mt, Just h) -> do
+            replyOk []                                   -- 准备好接收
+            content <- hGetExactly stdin (fromIntegral sz)
+            let write = case kind of
+                    FileKind -> writeFileVerified
+                    LinkKind -> writeLinkVerified
+            result <- write root (root </> path) content (fromIntegral md) mt h
+            case result of
+                Right () -> do
+                    -- 链接刚建/改：本端该链接子树下的文件基线条目已过期，就地作废
+                    when (kind == LinkKind) $ discardStateUnder root mTag path
+                    replyOk []
+                Left err -> replyErr err
+        _ -> replyErr "recv: missing size/mode/mtime/hash"
+
+-- ============================================================================
+-- GETSTAT / SETSTAT / SETTIME
+-- ============================================================================
+
+cmdGetStat :: FilePath -> FilePath -> IO ()
+cmdGetStat root path = do
+    fs <- getFileStatus (root </> path)
+    replyOk [ ("mtime", Msg.int (floor (realToFrac (modificationTime fs) :: Double)))
+            , ("mode",  Msg.int (fromIntegral (fileMode fs .&. 0o7777))) ]
+
+cmdSetStat :: FilePath -> Msg.Value -> IO ()
+cmdSetStat root req =
+    case (Msg.fieldStr "path" req, Msg.fieldInt "mtime" req, Msg.fieldInt "mode" req) of
+        (Just path, Just mt, Just md) -> do
+            let full = root </> path
+            setFileTimes full (fromIntegral mt) (fromIntegral mt)
+            setFileMode full (fromIntegral md)
+            replyOk []
+        _ -> replyErr "setstat: missing path/mtime/mode"
+
+-- | 只把 mtime/atime 对齐到给定秒数（不动内容、不动 mode）。
+--
+--   用于内容校验钩子：内容实质相同、只差时间戳时，把较旧那端的 mtime 对齐到
+--   较新那端，使两端 (size, mtime) 一致（之后记成 added 即彻底收敛）。
+cmdSetTime :: FilePath -> Msg.Value -> IO ()
+cmdSetTime root req =
+    case (Msg.fieldStr "path" req, Msg.fieldInt "mtime" req) of
+        (Just path, Just mt) -> setMtimeOnly (root </> path) mt >> replyOk []
+        _ -> replyErr "settime: missing path/mtime"
 
 -- ============================================================================
 -- GETIGNORE — 读取 .bisync/<profile>/ignore 元信息（供 ignore 预同步比较）
 -- ============================================================================
 
--- | GETIGNORE 命令：读取 .bisync/<profile>/ignore 的元信息（供跨端比较）
---
---   协议：GETIGNORE
---   文件存在：OK <mtime> <mode> <sha512hex>
---   文件不存在：OK -
+-- | @{"cmd":"getignore"}@ → @{"exists":false}@ 或
+--   @{"exists":true,"mtime":…,"mode":…,"hash":…}@
 cmdGetIgnore :: FilePath -> Maybe String -> IO ()
 cmdGetIgnore root mTag = do
     let ignoreFile = root </> ".bisync" </> fromMaybe "" mTag </> "ignore"
     exists <- doesFileExist ignoreFile
     if not exists
-        then putStrLn "OK -"
+        then replyOk [("exists", Msg.JBool False)]
         else do
             fs <- getFileStatus ignoreFile
             content <- BS.readFile ignoreFile
-            let mt     = modificationTime fs
-                mode   = fileMode fs .&. 0o7777
-                digest = hash content :: Digest SHA512
-            putStrLn $ "OK " ++ show mt ++ " " ++ show mode ++ " " ++ show digest
+            replyOk [ ("exists", Msg.JBool True)
+                    , ("mtime",  Msg.int (floor (realToFrac (modificationTime fs) :: Double)))
+                    , ("mode",   Msg.int (fromIntegral (fileMode fs .&. 0o7777)))
+                    , ("hash",   Msg.str (show (hash content :: Digest SHA512))) ]
 
 -- ============================================================================
 -- PUTREPO — 远端把自己的 .bisync/<profile>/repo 写成"登录方（主控端）地址"
 -- ============================================================================
 
--- | PUTREPO 命令：由主控端发起，让**远端**也拥有 repo 文件，
---   这样远端以后直接 `hsbisync sync <profile>` 就能免参反向同步。
+-- | @{"cmd":"putrepo","user":<登录方用户名>,"path":<登录方路径>}@
+--   让**远端**也拥有 repo 文件，这样远端以后直接 `hsbisync sync <profile>`
+--   就能免参反向同步。
 --
---   协议：PUTREPO <user>,<path>
 --     user = 登录方（主控端）本机登录用户名，反向 ssh 时要用这个名字
 --     path = 登录方同步根路径；家目录之下是相对路径（不带 ~），否则绝对路径
 --            ——具体由主控端按 'formatOwnPath' 决定后传过来
@@ -376,23 +301,20 @@ cmdGetIgnore root mTag = do
 --   因此 host 部分由本端补上，主控端只提供用户名与路径。
 --   取不到（非 ssh 场景，如本地测试用的假 ssh）就不写。
 --
---   响应：
---     OK <addr>       写入成功，addr 是写进去的完整地址
---     OK NOCLIENT     取不到登录方地址 → 不写，主控端只提示
-cmdPutRepo :: FilePath -> Maybe String -> String -> IO ()
-cmdPutRepo root mTag params =
-    case break (== ',') params of
-        (user, ',' : path)
-            | not (null user) && not (null path) -> do
-                mip <- loginClientAddr
-                case mip of
-                    Nothing -> putStrLn "OK NOCLIENT"
-                    Just ip -> do
-                        let repoFile = root </> ".bisync" </> fromMaybe "" mTag </> "repo"
-                            addr     = user ++ "@" ++ ip ++ ":" ++ path
-                        writeRepoFile repoFile addr
-                        putStrLn $ "OK " ++ addr
-        _ -> putStrLn "ERROR Invalid PUTREPO params"
+--   响应：{"addr":…}（写入成功）或 {"noclient":true}（取不到登录方地址，只提示）
+cmdPutRepo :: FilePath -> Maybe String -> Msg.Value -> IO ()
+cmdPutRepo root mTag req =
+    case (Msg.fieldStr "user" req, Msg.fieldStr "path" req) of
+        (Just user, Just path) | not (null user) && not (null path) -> do
+            mip <- loginClientAddr
+            case mip of
+                Nothing -> replyOk [("noclient", Msg.JBool True)]
+                Just ip -> do
+                    let repoFile = root </> ".bisync" </> fromMaybe "" mTag </> "repo"
+                        addr     = user ++ "@" ++ ip ++ ":" ++ path
+                    writeRepoFile repoFile addr
+                    replyOk [("addr", Msg.str addr)]
+        _ -> replyErr "putrepo: missing user/path"
 
 -- | 登录方（主控端）地址，取自 sshd 设置的环境变量。
 --   SSH_CONNECTION 是现代 sshd 的标准变量；SSH_CLIENT 是旧变量，

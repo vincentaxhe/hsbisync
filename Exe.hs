@@ -4,36 +4,39 @@ import Control.Concurrent.Async (concurrently)
 import Control.Exception (ErrorCall, IOException, bracket, catch, displayException)
 import Control.Monad (filterM, forM_, unless, when)
 import Data.Char (toLower)
-import Data.List (find, nub)
 import Data.Maybe (fromMaybe, isJust)
+import qualified Data.Map as Map
+import qualified Data.Set as Set
 import System.Directory (doesFileExist)
-import System.Environment (getExecutablePath)
 import System.FilePath ((</>))
 import System.IO
-    ( hClose, hFlush, hGetLine, hSetBinaryMode
-    , hSetEncoding, utf8, stdout, stdin
+    ( hFlush, stdout, stdin
     , hSetEcho, hSetBuffering, BufferMode(..)
     , hReady
     )
-import System.Process (createProcess, proc, StdStream(..), CreateProcess(..))
 import System.Posix.User (getEffectiveUserName)
 
 import qualified Data.ByteString as BS
 
+import Connect (destroyHelper, prepareRemotes, spawnHelper)
 import State
     ( FileState(..), FileChange(..), StateKind(..)
-    , parseStateJSON, statRel
+    , parseStateValue, statRel
     , currentState, currentLinkState
     , lastStateKind, appendAddedKind, appendDeletedKind, discardStateUnder, posixSecs
+    , indexStates, dedup
     )
 import Sync (sync, SyncAction(..), resolveConflicts)
 import Write
-    ( HelperHandle(..), Response(..), sendCommand, readResponse, readJSON
-    , hGetExactly, hPutFully, expectOK
+    ( HelperHandle(..), call, readMsg, hGetExactly, hPutFully
     , writeFileVerified, writeLinkVerified, readLinkContent
     , hashBytes, removeFileSafe, removeLinkSafe, getIgnoreRemote, setMtimeOnly
     )
-import Arg (Root(..), formatOwnPath, rootLabel)
+import qualified Msg
+import Arg
+    ( Root(..)
+    , formatOwnPath, rootLabel
+    )
 
 -- ============================================================================
 -- 统一入口
@@ -53,6 +56,10 @@ runSync profile root1 root2 = do
     putStrLn $ "\n  root1 = " ++ rootLabel root1
     putStrLn $ "  root2 = " ++ rootLabel root2
     putStrLn $ "  profile: " ++ profile
+
+    -- 准备工作：远端握手（hsbisync 在哪 + 它自报的真实路径/家目录）。
+    -- 入口（Main）在写 repo 之前已经握过一次，这里命中缓存不会重复 ssh/打印。
+    prepareRemotes profile [root1, root2]
 
     -- 阶段 1：无条件先同步当前 profile 的 ignore 文件（较新一端覆盖较旧一端）。
     -- 两端 ignore 必须先一致，之后各自扫描文件集合才不会出现偏差。
@@ -74,6 +81,11 @@ runSync profile root1 root2 = do
     putStrLn $ "  root1 (" ++ label1 ++ "): " ++ show (length cur1) ++ " files (last: " ++ show (length last1) ++ ")"
     putStrLn $ "  root2 (" ++ label2 ++ "): " ++ show (length cur2) ++ " files (last: " ++ show (length last2) ++ ")"
 
+    -- 名字索引：名字 → 当前状态。后面（内容校验）只做 O(log n) 查询，
+    -- 不再逐条线性重找（那是 O(n²)）。惰性：不会走到的路径就不会建索引。
+    let idx1 = indexStates cur1
+        idx2 = indexStates cur2
+
     -- 阶段 4：计算最终动作（diff + 形式冲突消解 + 额外内容校验）。
     -- 只处理两端扫描出的普通文件；ignore 文件已在阶段 1、软链接已在阶段 2 处理。
     putStrLn "\n[4/5] Computing sync actions ..."
@@ -87,7 +99,7 @@ runSync profile root1 root2 = do
         else withHelpers mHost1 path1 mHost2 path2 profile $ \side1 side2 -> do
                 -- 额外内容校验：冲突的、或要传输的，只要两端 size 相同就静默核对内容；
                 -- 一致的“只更新属性并记录”，不一致的维持原判（见 'verifySameSizeCandidates'）。
-                (pairs1'', pairs2'') <- verifySameSizeCandidates cur1 cur2 side1 side2 pairs1' pairs2'
+                (pairs1'', pairs2'') <- verifySameSizeCandidates idx1 idx2 side1 side2 pairs1' pairs2'
 
                 -- 阶段 5：列出最终动作、确认、执行（真正的传输与记录）
                 putStrLn "\n[5/5] Sync and record files ..."
@@ -105,10 +117,6 @@ runSync profile root1 root2 = do
 -- ============================================================================
 -- 校验钩子：文件比较阶段，冲突 / 要传输 + 两端 size 相同 → 立刻核对内容
 -- ============================================================================
-
--- | 某个文件在某一侧的当前状态（没扫到就是 Nothing）
-stateOf :: [FileState] -> FilePath -> Maybe FileState
-stateOf sts name = find ((== name) . filename) sts
 
 -- | FileChange 的文件名（不管哪个构造子）
 changeName :: FileChange -> FilePath
@@ -142,19 +150,20 @@ changeName fc = case fc of
 --   只在**文件阶段**做；链接阶段的"内容"是指向字符串，另有判定。
 --   调用点在展示摘要与确认之前，所以用户看到的是已经校完的最终结果。
 verifySameSizeCandidates
-    :: [FileState] -> [FileState]                -- ^ 两端当前状态（cur1 / cur2）
+    :: Map.Map FilePath FileState             -- ^ root1 当前状态索引（'indexStates'）
+    -> Map.Map FilePath FileState             -- ^ root2 当前状态索引
     -> Side -> Side
     -> [(FileChange, Maybe SyncAction)]          -- ^ pairs1
     -> [(FileChange, Maybe SyncAction)]          -- ^ pairs2
     -> IO ([(FileChange, Maybe SyncAction)], [(FileChange, Maybe SyncAction)])
-verifySameSizeCandidates cur1 cur2 side1 side2 pairs1 pairs2 = do
-    let names = nub $ [ filename fs | (Added fs _ _, Just Receive)      <- pairs1 ++ pairs2 ]
+verifySameSizeCandidates idx1 idx2 side1 side2 pairs1 pairs2 = do
+    let names = dedup $ [ filename fs | (Added fs _ _, Just Receive)      <- pairs1 ++ pairs2 ]
                     ++ [ filename fs | (Conflict fs _ _, Just Unsolvable) <- pairs1 ++ pairs2 ]
-        conflictNames = [ filename fs | (Conflict fs _ _, _) <- pairs1 ++ pairs2 ]
-        sameSize n = case (stateOf cur1 n, stateOf cur2 n) of
+        conflictNames = Set.fromList [ filename fs | (Conflict fs _ _, _) <- pairs1 ++ pairs2 ]
+        sameSize n = case (Map.lookup n idx1, Map.lookup n idx2) of
             (Just a, Just b) -> size a == size b
             _                -> False
-        sized = [ (n, if n `elem` conflictNames then CandConflict else CandTransfer)
+        sized = [ (n, if Set.member n conflictNames then CandConflict else CandTransfer)
                 | n <- names, sameSize n ]
     if null sized
         then return (pairs1, pairs2)
@@ -163,25 +172,31 @@ verifySameSizeCandidates cur1 cur2 side1 side2 pairs1 pairs2 = do
             -- 再把**确实一致**的按来时路分类列出——它们既不是真冲突、也不需要传输。
             putStrLn "\n  Extra content check ..."
             hFlush stdout
-            confirmed <- filterM (\(n, _) -> identicalAndAlign cur1 cur2 side1 side2 n) sized
+            confirmed <- filterM (\(n, _) -> identicalAndAlign idx1 idx2 side1 side2 n) sized
             let same = map fst confirmed
-                showGroup lbl ns = unless (null ns) $ do
-                    putStrLn $ "  " ++ lbl ++ ":"
-                    forM_ ns $ \n -> putStrLn $ "  - " ++ n
-            unless (null same) $ do
-                showGroup "Not real conflict" [ n | (n, CandConflict) <- confirmed ]
-                showGroup "No need transfer" [ n | (n, CandTransfer) <- confirmed ]
+            showGroupFor same confirmed
             if null same
                 then return (pairs1, pairs2)
                 else do
                     -- 冲突在两侧各有一条；转换后只让其中一侧发起记录即可
                     -- （'execute' 的 RecordAdd 同时记两端，两边都转会在 added 里留重复行）
-                    let conflicts1 = [ filename fs | (Conflict fs _ _, _) <- pairs1 ]
-                        pairs1'' = map (markRecordAdd same) pairs1
-                        pairs2'' = [ p | p@(fc, _) <- map (markRecordAdd same) pairs2
-                                       , not (changeName fc `elem` same
-                                              && changeName fc `elem` conflicts1) ]
+                    let sameSet     = Set.fromList same
+                        conflicts1S = Set.fromList [ filename fs | (Conflict fs _ _, _) <- pairs1 ]
+                        pairs1'' = map (markRecordAdd sameSet) pairs1
+                        pairs2'' = [ p | p@(fc, _) <- map (markRecordAdd sameSet) pairs2
+                                       , not (Set.member (changeName fc) sameSet
+                                              && Set.member (changeName fc) conflicts1S) ]
                     return (pairs1'', pairs2'')
+
+-- | 把校验结果按“本来是冲突”/“本来要传”分两组打印（一致的那些）
+showGroupFor :: [FilePath] -> [(FilePath, CandKind)] -> IO ()
+showGroupFor same confirmed = do
+    let showGroup lbl ns = unless (null ns) $ do
+            putStrLn $ "  " ++ lbl ++ ":"
+            forM_ ns $ \n -> putStrLn $ "  - " ++ n
+    unless (null same) $ do
+        showGroup "Not real conflict" [ n | (n, CandConflict) <- confirmed ]
+        showGroup "No need transfer" [ n | (n, CandTransfer) <- confirmed ]
 
 -- | 校验钩子里候选的来源：本来就报冲突的 / 本来要传输的
 --   （用来把"校验后一致"的文件分成两组显示：will not conflict / will not transfer）
@@ -190,9 +205,10 @@ data CandKind = CandConflict | CandTransfer
 
 -- | 核对一对文件：内容相同 → 把**较旧那端** mtime 对齐到较新那端并返回 True；
 --   内容不同 / 读不到 → 维持原样返回 False。两种都不打印（结果只在摘要里体现）。
-identicalAndAlign :: [FileState] -> [FileState] -> Side -> Side -> FilePath -> IO Bool
-identicalAndAlign cur1 cur2 side1 side2 name =
-    case (stateOf cur1 name, stateOf cur2 name) of
+identicalAndAlign :: Map.Map FilePath FileState -> Map.Map FilePath FileState
+                  -> Side -> Side -> FilePath -> IO Bool
+identicalAndAlign idx1 idx2 side1 side2 name =
+    case (Map.lookup name idx1, Map.lookup name idx2) of
         (Just fs1, Just fs2) -> do
             mh1 <- hashSideContent side1 name
             mh2 <- hashSideContent side2 name
@@ -209,14 +225,14 @@ identicalAndAlign cur1 cur2 side1 side2 name =
         _ -> return False
 
 -- | 把"实质相同"的一对改成"已同步、只需记录"（'execute' 会同时记两端）
-markRecordAdd :: [FilePath] -> (FileChange, Maybe SyncAction) -> (FileChange, Maybe SyncAction)
+markRecordAdd :: Set.Set FilePath -> (FileChange, Maybe SyncAction) -> (FileChange, Maybe SyncAction)
 markRecordAdd names (Conflict fs d1 d2, _)
-    | filename fs `elem` names = (Noop fs d1 d2, Just RecordAdd)
+    | Set.member (filename fs) names = (Noop fs d1 d2, Just RecordAdd)
 markRecordAdd names (Added fs d1 d2, _)
-    | filename fs `elem` names = (Noop fs d1 d2, Just RecordAdd)
+    | Set.member (filename fs) names = (Noop fs d1 d2, Just RecordAdd)
 markRecordAdd _ other = other
 
--- | 取某一端文件内容的 SHA512（本地读字节，远端用 HASH 命令）；读不到返回 Nothing
+-- | 取某一端文件内容的 SHA512（本地读字节，远端用 hash 命令）；读不到返回 Nothing
 hashSideContent :: Side -> FilePath -> IO (Maybe String)
 hashSideContent (Lcl root) relPath =
     fmap Just (hashBytes <$> BS.readFile (root </> relPath)) `catch` ioFail
@@ -225,18 +241,20 @@ hashSideContent (Lcl root) relPath =
     ioFail _ = return Nothing
 
 hashSideContent (Rmt hh) relPath = do
-    res <- expectOK hh ("HASH " ++ relPath)
+    res <- call hh (Msg.cmd "hash" [ ("kind", kindName FileKind)
+                                   , ("path", Msg.str relPath) ])
     return $ case res of
-        Right h -> Just h
+        Right v -> Msg.fieldStr "hash" v
         Left _  -> Nothing
 
 -- | 把某一端文件的 mtime 对齐到给定秒数（失败只告警：不影响后续传输/记录）
 setMtimeOnlySide :: Side -> FilePath -> Integer -> IO ()
 setMtimeOnlySide (Lcl root) relPath t = setMtimeOnly (root </> relPath) t
 setMtimeOnlySide (Rmt hh) relPath t = do
-    res <- expectOK hh ("SETTIME " ++ show t ++ "," ++ relPath)
+    res <- call hh (Msg.cmd "settime" [ ("path",  Msg.str relPath)
+                                      , ("mtime", Msg.int t) ])
     case res of
-        Left err -> putStrLn $ "  WARNING: SETTIME failed for " ++ relPath ++ ": " ++ err
+        Left err -> putStrLn $ "  WARNING: settime failed for " ++ relPath ++ ": " ++ err
         Right _  -> return ()
 
 -- | 读一个按键作为确认（不回显），并把**已经可读**的该行剩余输入丢掉。
@@ -465,18 +483,10 @@ kindDeleteVerb :: SyncKind -> String
 kindDeleteVerb SKFile = "rm"
 kindDeleteVerb SKLink = "unlink"
 
-kindHashCmd, kindSendCmd, kindRecvCmd, kindAddCmd, kindDelCmd :: SyncKind -> String
-kindHashCmd SKFile = "HASH"
-kindHashCmd SKLink = "LINKHASH"
-kindSendCmd SKFile = "SEND"
-kindSendCmd SKLink = "LINKSEND"
-kindRecvCmd SKFile = "RECV"
-kindRecvCmd SKLink = "LINKRECV"
-kindAddCmd  SKFile = "ADD"
-kindAddCmd  SKLink = "LINKADD"
-kindDelCmd  SKFile = "DELETE"
-kindDelCmd  SKLink = "LINKDEL"
-
+-- | 协议里的 "kind" 字段：文件与链接共用同一套命令（helper 侧只差"内容是什么/怎么落地"）
+kindName :: StateKind -> Msg.Value
+kindName FileKind = Msg.str "file"
+kindName LinkKind = Msg.str "link"
 -- | 本地读取"内容"：文件读字节，链接读指向字符串
 kindReadLocal :: SyncKind -> FilePath -> IO BS.ByteString
 kindReadLocal SKFile = BS.readFile
@@ -505,75 +515,26 @@ readSideK kind mTag mHost path =
             return ("local", (l, c))
         Just host -> do
             hh <- spawnHelper host path (fromMaybe "" mTag)
-            l <- getHelperLast hh (kindState kind)
-            c <- getHelperState hh (kindState kind)
+            l <- getHelperStates hh "last"  (kindState kind)
+            c <- getHelperStates hh "state" (kindState kind)
             destroyHelper hh
             return ("ssh " ++ host, (l, c))
 
--- | 读取对端上次状态（GETLAST / GETLINKLAST：纯数组）
-getHelperLast :: HelperHandle -> StateKind -> IO [FileState]
-getHelperLast hh kind = do
-    result <- readJSON hh (cmdOf kind)
-    case result of
-        Left err -> error $ cmdOf kind ++ " failed: " ++ err
-        Right bs -> return $ parseStateJSON bs
-  where
-    cmdOf FileKind = "GETLAST"
-    cmdOf LinkKind = "GETLINKLAST"
-
--- | 读取对端当前状态（GETSTATE / GETLINKSTATE：都是纯数组）
-getHelperState :: HelperHandle -> StateKind -> IO [FileState]
-getHelperState hh kind = do
-    result <- readJSON hh (cmdOf kind)
-    case result of
-        Left err -> error $ cmdOf kind ++ " failed: " ++ err
-        Right bs -> return $ parseStateJSON bs
-  where
-    cmdOf FileKind = "GETSTATE"
-    cmdOf LinkKind = "GETLINKSTATE"
+-- | 读对端状态：which = "state"（本次扫描）或 "last"（上次基线）
+getHelperStates :: HelperHandle -> String -> StateKind -> IO [FileState]
+getHelperStates hh which kind = do
+    r <- call hh (Msg.cmd which [("kind", kindName kind)])
+    case r of
+        Left err -> error $ which ++ " failed: " ++ err
+        Right v  -> case Msg.field "entries" v of
+            Just e  -> return (parseStateValue e)
+            Nothing -> error $ which ++ ": response has no \"entries\""
 
 -- ============================================================================
 -- Helper 管理
+--
+--   派生/销毁/握手都在 Connect.hs（"怎么在对面跑起 hsbisync"单独一层）。
 -- ============================================================================
-
-spawnHelper :: String -> FilePath -> String -> IO HelperHandle
-spawnHelper host path profileName = do
-    myExe <- getExecutablePath
-    let baseArgs = ["--helper", "--passcode=dontrunyourself", "--root=" ++ path]
-        tagArgs  = if null profileName then [] else ["--tag=" ++ profileName]
-        args     = baseArgs ++ tagArgs
-        cmdArgs = (proc "ssh" (host : myExe : args))
-            { std_in  = CreatePipe, std_out = CreatePipe, std_err = Inherit }
-    (Just hin, Just hout, _, _) <- createProcess cmdArgs
-    hSetEncoding hout utf8
-    hSetEncoding hin  utf8
-    -- helper 若启动即崩溃（远端缺 hsbisync / locale 非 UTF-8 / ssh 认证失败），
-    -- 这里会读到管道 EOF，给出可读错误而不是裸的 "hGetLine: end of file"。
-    _ <- hGetLine hout `catch` helperStartFailure host path
-    return $ HelperHandle hin hout
-
--- | 远端 helper 启动失败时的可读诊断
-helperStartFailure :: String -> FilePath -> IOException -> IO String
-helperStartFailure host path e = error $ unlines
-    [ "cannot start remote helper on " ++ host ++ " (root=" ++ path ++ "): " ++ show e
-    , "  possible causes:"
-    , "    * remote hsbisync missing or not the same version"
-    , "    * ssh authentication failed (see ssh output above)"
-    , "    * remote locale is not UTF-8 (ssh non-interactive sessions often have LANG unset),"
-    , "      making the helper crash while reading UTF-8 state/ignore files"
-    ]
-
-destroyHelper :: HelperHandle -> IO ()
-destroyHelper hh = do
-    ignoreIO $ sendCommand hh "QUIT"
-    ignoreIO $ hClose (hhIn hh)
-    ignoreIO $ hClose (hhOut hh)
-
-ignoreIO :: IO () -> IO ()
-ignoreIO action = action `catch` handler
-  where
-    handler :: IOException -> IO ()
-    handler _ = return ()
 
 -- ============================================================================
 -- 执行操作
@@ -630,21 +591,21 @@ execute kind mTag self other pairs = do
 delEnd :: SyncKind -> Side -> FilePath -> IO ()
 delEnd SKFile (Lcl root) relPath = removeFileSafe (root </> relPath)
 delEnd SKFile (Rmt hh)  relPath = do
-    res <- expectOK hh ("UNLINK " ++ relPath)
+    res <- call hh (Msg.cmd "unlink" [("kind", kindName FileKind), ("path", Msg.str relPath)])
     case res of
-        Left err -> error $ "FATAL: remote UNLINK failed: " ++ err
+        Left err -> error $ "FATAL: remote unlink failed: " ++ err
         Right _  -> return ()
 -- 链接阶段：只删链接本身（unlink），不跟随到目标；占位不是链接则不动
 delEnd SKLink (Lcl root) relPath = do
     ok <- removeLinkSafe (root </> relPath)
     unless ok $ putStrLn $ "  WARNING: not a symlink, left untouched: " ++ relPath
 delEnd SKLink (Rmt hh) relPath = do
-    res <- expectOK hh ("LINKUNLINK " ++ relPath)
+    res <- call hh (Msg.cmd "unlink" [("kind", kindName LinkKind), ("path", Msg.str relPath)])
     case res of
-        Left err -> error $ "FATAL: remote LINKUNLINK failed: " ++ err
-        Right "NOTLINK" ->
-            putStrLn $ "  WARNING: not a symlink, left untouched: " ++ relPath
-        Right _ -> return ()
+        Left err -> error $ "FATAL: remote unlink (link) failed: " ++ err
+        Right v  -> case Msg.asBool =<< Msg.field "notLink" v of
+            Just True -> putStrLn $ "  WARNING: not a symlink, left untouched: " ++ relPath
+            _         -> return ()
 
 appendEnd :: SyncKind -> Side -> Maybe String -> Rec -> FilePath -> IO ()
 appendEnd kind (Lcl root) mTag rec relPath =
@@ -652,8 +613,9 @@ appendEnd kind (Lcl root) mTag rec relPath =
         RecDelete -> appendDeletedKind (kindState kind) root mTag relPath
         RecAdd    -> appendAddedKind   (kindState kind) root mTag relPath
 appendEnd kind (Rmt hh) _mTag rec relPath = do
-    let cmd = case rec of RecAdd -> kindAddCmd kind; RecDelete -> kindDelCmd kind
-    res <- expectOK hh (cmd ++ " " ++ relPath)
+    let cmd = case rec of RecAdd -> "add"; RecDelete -> "delete"
+    res <- call hh (Msg.cmd cmd [ ("kind", kindName (kindState kind))
+                                , ("path", Msg.str relPath) ])
     case res of
         Left err -> error $ "FATAL: remote " ++ cmd ++ " failed: " ++ err
         Right _  -> return ()
@@ -684,12 +646,7 @@ transferContent kind (Lcl srcRoot) (Lcl dstRoot) relPath srcMode srcMtime = do
 transferContent kind (Rmt hhSrc) (Lcl dstRoot) relPath srcMode srcMtime = do
     let d = dstRoot </> relPath
     expectedHash <- hashRemote kind hhSrc relPath         -- 先拿到期望哈希
-    sendCommand hhSrc (kindSendCmd kind ++ " " ++ relPath)
-    sz <- readSendSize hhSrc
-    hSetBinaryMode (hhOut hhSrc) True
-    content <- hGetExactly (hhOut hhSrc) sz
-    hSetBinaryMode (hhOut hhSrc) False                    -- 恢复文本模式，供后续行协议读取
-    hSetEncoding (hhOut hhSrc) utf8                       -- 显式重设 utf8（C locale 下二进制开关不恢复编码）
+    content <- recvRemoteContent kind hhSrc relPath
     kindWriteLocal kind dstRoot d content srcMode srcMtime expectedHash
 
 transferContent kind (Lcl srcRoot) (Rmt hhDst) relPath srcMode srcMtime = do
@@ -700,57 +657,54 @@ transferContent kind (Lcl srcRoot) (Rmt hhDst) relPath srcMode srcMtime = do
 
 transferContent kind (Rmt hhSrc) (Rmt hhDst) relPath srcMode srcMtime = do
     expectedHash <- hashRemote kind hhSrc relPath
-    sendCommand hhSrc (kindSendCmd kind ++ " " ++ relPath)
-    sz <- readSendSize hhSrc
-    hSetBinaryMode (hhOut hhSrc) True
-    content <- hGetExactly (hhOut hhSrc) sz
-    hSetBinaryMode (hhOut hhSrc) False                    -- 恢复文本模式
-    hSetEncoding (hhOut hhSrc) utf8                       -- 显式重设 utf8
-    recvVerified kind hhDst sz relPath srcMode srcMtime expectedHash content
+    content <- recvRemoteContent kind hhSrc relPath
+    recvVerified kind hhDst (BS.length content) relPath srcMode srcMtime expectedHash content
 
--- | 向远端 helper 发送 RECV/LINKRECV 命令（扩展协议：带 mode/mtime/expectedHash），
---   传输数据后等待 helper 端完成写临时文件→设属性→校验→rename 并返回结果。
+-- | 向远端 helper 发 recv（带 size/mode/mtime/hash），传输数据后等它完成
+--   写临时文件 → 设属性 → 校验 → rename，并返回结果。
 --   链接阶段 mode 不适用（helper 端忽略）。
 recvVerified
     :: SyncKind -> HelperHandle -> Int -> FilePath -> Int -> Integer -> String
     -> BS.ByteString -> IO (Either String ())
 recvVerified kind hh sz relPath mode_ mtime_ expectedHash content = do
-    let cmd = kindRecvCmd kind ++ " " ++ show sz ++ "," ++ relPath
-              ++ " " ++ show mode_ ++ " " ++ show mtime_ ++ " " ++ expectedHash
-    sendCommand hh cmd
-    resp <- readResponse hh                     -- 第一步：helper 是否准备接收
-    case resp of
-        RErr msg -> return $ Left (kindRecvCmd kind ++ ": " ++ msg)
-        ROk _ -> do
-            hSetBinaryMode (hhIn hh) True
-            hPutFully (hhIn hh) content
+    r <- call hh (Msg.cmd "recv" [ ("kind",  kindName (kindState kind))
+                                  , ("path",  Msg.str relPath)
+                                  , ("size",  Msg.int (fromIntegral sz))
+                                  , ("mode",  Msg.int (fromIntegral mode_))
+                                  , ("mtime", Msg.int mtime_)
+                                  , ("hash",  Msg.str expectedHash) ])
+    case r of
+        Left err -> return $ Left ("recv: " ++ err)
+        Right _  -> do
+            hPutFully (hhIn hh) content     -- 载荷：size 字节裸数据
             hFlush (hhIn hh)
-            hSetBinaryMode (hhIn hh) False       -- 恢复文本模式：后续命令可能含非 ASCII 文件名
-            hSetEncoding (hhIn hh) utf8          -- 显式重设 utf8（C locale 下不恢复编码）
-            resp2 <- readResponse hh            -- 第二步：校验 + rename 结果
-            case resp2 of
-                ROk _    -> return $ Right ()
-                RErr msg -> return $ Left ("verify: " ++ msg)
+            r2 <- readMsg hh                -- 第二步：校验 + rename 结果
+            return $ either (Left . ("verify: " ++)) (const (Right ())) r2
 
 -- ============================================================================
 -- Helper 协议辅助
 -- ============================================================================
 
-readSendSize :: HelperHandle -> IO Int
-readSendSize hh = do
-    line <- hGetLine (hhOut hh)
-    case break (== ' ') line of
-        ("OK", rest) -> case reads (dropWhile (== ' ') rest) of
-            [(n, "")] -> return n
-            _         -> error $ "readSendSize: invalid size: " ++ line
-        _ -> error $ "readSendSize: expected OK, got: " ++ line
+-- | 让远端发来某条目内容：send 的响应带 size，紧跟其后的就是裸数据
+recvRemoteContent :: SyncKind -> HelperHandle -> FilePath -> IO BS.ByteString
+recvRemoteContent kind hh relPath = do
+    r <- call hh (Msg.cmd "send" [ ("kind", kindName (kindState kind))
+                                  , ("path", Msg.str relPath) ])
+    case r of
+        Left err -> error $ "send failed: " ++ err
+        Right v  -> case Msg.fieldInt "size" v of
+            Just sz -> hGetExactly (hhOut hh) (fromIntegral sz)
+            Nothing -> error "send: response has no \"size\""
 
 hashRemote :: SyncKind -> HelperHandle -> FilePath -> IO String
 hashRemote kind hh relPath = do
-    res <- expectOK hh (kindHashCmd kind ++ " " ++ relPath)
-    case res of
-        Right s  -> return s
-        Left err -> error $ "hashRemote failed: " ++ err
+    r <- call hh (Msg.cmd "hash" [ ("kind", kindName (kindState kind))
+                                  , ("path", Msg.str relPath) ])
+    case r of
+        Left err -> error $ "hash failed: " ++ err
+        Right v  -> case Msg.fieldStr "hash" v of
+            Just h  -> return h
+            Nothing -> error "hash: response has no \"hash\""
 
 -- ============================================================================
 -- 其他
@@ -762,9 +716,9 @@ showSummary pairs1 pairs2 = do
         del1 = [ (f, d1, d2) | (Del  fs d1 d2, Just Remove)  <- pairs1, let f = filename fs ]
         add2 = [ (f, d1, d2) | (Added    fs d1 d2, Just Receive) <- pairs2, let f = filename fs ]
         del2 = [ (f, d1, d2) | (Del  fs d1 d2, Just Remove)  <- pairs2, let f = filename fs ]
-        recAdds = nub [ f | (Noop fs _ _, Just RecordAdd)    <- pairs1 ++ pairs2, let f = filename fs ]
-        recDels = nub [ f | (Del  fs _ _, Just RecordDelete) <- pairs1 ++ pairs2, let f = filename fs ]
-        conf = nub [ (f, d1, d2) | (Conflict fs d1 d2, Just Unsolvable) <- pairs1 ++ pairs2, let f = filename fs ]
+        recAdds = dedup [ f | (Noop fs _ _, Just RecordAdd)    <- pairs1 ++ pairs2, let f = filename fs ]
+        recDels = dedup [ f | (Del  fs _ _, Just RecordDelete) <- pairs1 ++ pairs2, let f = filename fs ]
+        conf = dedup [ (f, d1, d2) | (Conflict fs d1 d2, Just Unsolvable) <- pairs1 ++ pairs2, let f = filename fs ]
 
     when (not (null del1)) $ do
         putStrLn "\nroot1 will delete:"
@@ -819,14 +773,17 @@ recordRemoteRepo host remotePath profile ownPath = do
             bracket (spawnHelper host remotePath profile) destroyHelper $ \hh -> do
                 user <- getEffectiveUserName
                 path <- formatOwnPath ownPath
-                expectOK hh ("PUTREPO " ++ user ++ "," ++ path)
+                call hh (Msg.cmd "putrepo" [ ("user", Msg.str user)
+                                           , ("path", Msg.str path) ])
     case r of
         Left err         -> note ("not written (" ++ err ++ ")")
         Right (Left err) -> note ("not written (" ++ err ++ ")")
-        Right (Right "NOCLIENT") ->
-            note "not written: cannot tell which address the peer sees us as (SSH_CONNECTION unset)"
-        Right (Right addr) ->
-            putStrLn $ "  " ++ host ++ ":" ++ remotePath ++ ": repo = " ++ addr ++ "  [OK]"
+        Right (Right v)
+            | Just True <- Msg.asBool =<< Msg.field "noclient" v ->
+                note "not written: cannot tell which address the peer sees us as (SSH_CONNECTION unset)"
+            | Just addr <- Msg.fieldStr "addr" v ->
+                putStrLn $ "  " ++ host ++ ":" ++ remotePath ++ ": repo = " ++ addr ++ "  [OK]"
+            | otherwise -> note "not written: unexpected response"
   where
     note msg = putStrLn $ "  NOTE: " ++ host ++ ":" ++ remotePath ++ ": repo " ++ msg
 

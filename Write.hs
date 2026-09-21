@@ -9,8 +9,7 @@ import System.Directory
 import System.FilePath (takeDirectory, isAbsolute, normalise, (</>))
 import System.IO
     ( Handle, hClose, hFlush
-    , hPutStrLn, hSetBinaryMode
-    , hGetLine, openTempFile
+    , openTempFile
     )
 import System.Posix.Files
     ( FileStatus
@@ -29,21 +28,17 @@ import qualified Data.Text as T (pack, unpack)
 import qualified Data.Text.Encoding as T (encodeUtf8, decodeUtf8With)
 import qualified Data.Text.Encoding.Error as TEE (lenientDecode)
 
+import qualified Msg
+
 -- ============================================================================
 -- Types
 -- ============================================================================
 
 -- | 连接到 helper 进程的句柄对
 data HelperHandle = HelperHandle
-    { hhIn  :: !Handle    -- ^ 写入 helper 的 stdin（发命令）
+    { hhIn  :: !Handle    -- ^ 写入 helper 的 stdin（发请求）
     , hhOut :: !Handle    -- ^ 读取 helper 的 stdout（收响应）
     }
-
--- | helper 响应
-data Response
-    = ROk  !String        -- ^ OK + 可选内容
-    | RErr !String        -- ^ ERROR + 错误信息
-    deriving (Show, Eq)
 
 -- ============================================================================
 -- 底层 I/O：确保完整读写
@@ -79,43 +74,34 @@ hPutFully h bs = go bs
             go rest
 
 -- ============================================================================
--- Helper 协议通信
+-- Helper 协议通信：一行一个规范 JSON（见 Msg）
+--
+--   * 请求：{"cmd":"…", …}
+--   * 响应：{"ok":true,…} / {"ok":false,"error":"…"}
+--   * 文件内容不走 JSON：SEND/RECV 的响应里给出 "size"，紧跟其后的就是 <size> 字节裸数据
+--   * 控制行全用 ByteString 读/写（不碰 Handle 的文本编码层）——
+--     所以不再需要 hSetBinaryMode / hSetEncoding 来回切换（那一对是以前的坑）
 -- ============================================================================
 
--- | 向 helper 发送命令
-sendCommand :: HelperHandle -> String -> IO ()
-sendCommand hh cmd = do
-    hPutStrLn (hhIn hh) cmd
+-- | 发一条请求（一行规范 JSON）
+sendMsg :: HelperHandle -> Msg.Value -> IO ()
+sendMsg hh req = do
+    BL.hPut (hhIn hh) (Msg.encodeLine req)
     hFlush (hhIn hh)
 
--- | 读取 helper 响应行
-readResponse :: HelperHandle -> IO Response
-readResponse hh = do
-    line <- hGetLine (hhOut hh)
-    return $ case break (== ' ') line of
-        ("OK",  rest) -> ROk  (dropWhile (== ' ') rest)
-        ("ERROR", msg) -> RErr (dropWhile (== ' ') msg)
-        _              -> RErr ("Unexpected response: " ++ line)
+-- | 读一条响应；@ok=false@ 或格式错都归成 Left
+readMsg :: HelperHandle -> IO (Either String Msg.Value)
+readMsg hh = do
+    line <- B8.hGetLine (hhOut hh)
+    return $ case Msg.decodeStrict line of
+        Left e  -> Left ("bad response (" ++ e ++ "): " ++ show line)
+        Right v -> case Msg.asBool =<< Msg.field "ok" v of
+            Just True -> Right v
+            _         -> Left (maybe ("remote error: " ++ show line) id (Msg.fieldStr "error" v))
 
--- | 发送命令并期望 OK 响应
-expectOK :: HelperHandle -> String -> IO (Either String String)
-expectOK hh cmd = do
-    sendCommand hh cmd
-    resp <- readResponse hh
-    return $ case resp of
-        ROk msg  -> Right msg
-        RErr msg -> Left msg
-
--- | 发送命令，读取 JSON 响应（用于 GETSTATE/GETLAST/GETDIFF）
-readJSON :: HelperHandle -> String -> IO (Either String BL.ByteString)
-readJSON hh cmd = do
-    sendCommand hh cmd
-    resp <- readResponse hh
-    case resp of
-        RErr msg -> return $ Left msg
-        ROk _    -> do
-            line <- B8.hGetLine (hhOut hh)
-            return $ Right (BL.fromStrict line)
+-- | 请求 → 响应（成功时返回响应对象，供调用方取字段）
+call :: HelperHandle -> Msg.Value -> IO (Either String Msg.Value)
+call hh req = sendMsg hh req >> readMsg hh
 
 -- ============================================================================
 -- repo 文件
@@ -141,17 +127,16 @@ writeRepoFile fp content = do
 --   流程：GETSTAT(src) → SETSTAT(dst)
 syncFileAttrs :: HelperHandle -> HelperHandle -> FilePath -> IO (Either String ())
 syncFileAttrs src dst filename = do
-    -- 获取源文件属性
-    res <- expectOK src ("GETSTAT " ++ filename)
-    case res of
-        Left err -> return $ Left ("GETSTAT failed: " ++ err)
-        Right statStr -> do
-            -- statStr = "mtime mode"
-            let setCmd = "SETSTAT " ++ filename ++ "," ++ statStr
-            res' <- expectOK dst setCmd
-            case res' of
-                Left err -> return $ Left ("SETSTAT failed: " ++ err)
-                Right _  -> return $ Right ()
+    r <- call src (Msg.cmd "getstat" [("path", Msg.str filename)])
+    case r of
+        Left err -> return $ Left ("getstat failed: " ++ err)
+        Right v  -> case (Msg.fieldInt "mtime" v, Msg.fieldInt "mode" v) of
+            (Just mt, Just md) -> do
+                r2 <- call dst (Msg.cmd "setstat" [ ("path",  Msg.str filename)
+                                                   , ("mtime", Msg.int mt)
+                                                   , ("mode",  Msg.int md) ])
+                return $ either (Left . ("setstat failed: " ++)) (const (Right ())) r2
+            _ -> return $ Left "getstat: missing mtime/mode"
 
 -- | 本地同步文件属性（不通过 helper 协议）
 --
@@ -335,71 +320,16 @@ writeFileLocal = writeFileAtomic
 --   返回 @(mtime, mode, sha512hex)@；文件不存在返回 @Nothing@
 getIgnoreRemote :: HelperHandle -> IO (Maybe (Integer, Int, String))
 getIgnoreRemote hh = do
-    res <- expectOK hh "GETIGNORE"
-    case res of
-        Left err -> error $ "GETIGNORE failed: " ++ err
-        Right "-" -> return Nothing
-        Right msg -> case words msg of
-            [mtStr, modeStr, hashStr] ->
-                case (reads mtStr, reads modeStr) of
-                    ([(mt, "")], [(md, "")]) -> return $ Just (mt, md, hashStr)
-                    _ -> error $ "GETIGNORE: invalid response: " ++ msg
-            _ -> error $ "GETIGNORE: invalid response: " ++ msg
-
--- | 通过 helper 协议在两个 helper 之间复制文件
---
---   流程：
---   1. SEND src → 获取文件大小
---   2. RECV dst → 目标端准备接收
---   3. 管道传输：src.stdout → dst.stdin
---   4. 同步属性：src.GETSTAT → dst.SETSTAT
-copyFileRemote :: HelperHandle -> HelperHandle -> FilePath -> IO (Either String ())
-copyFileRemote src dst filename = do
-    -- 1. 源端 SEND
-    sendCommand src ("SEND " ++ filename)
-    resp <- readResponse src
-    sz <- case resp of
-        ROk sizeStr ->
-            case reads sizeStr of
-                [(n, "")] -> return n
-                _         -> return (-1)
-        RErr _msg -> return (-1)
-
-    if sz < 0
-        then return $ Left "SEND failed"
-        else do
-            -- 2. 目标端 RECV
-            res <- expectOK dst ("RECV " ++ show sz ++ "," ++ filename)
-            case res of
-                Left err -> return $ Left ("RECV failed: " ++ err)
-                Right _ -> do
-                    -- 3. 管道传输
-                    hSetBinaryMode (hhOut src) True
-                    hSetBinaryMode (hhIn dst)  True
-
-                    content <- hGetExactly (hhOut src) sz
-                    hPutFully (hhIn dst) content
-                    hFlush (hhIn dst)
-
-                    -- 4. 同步属性
-                    syncRes <- syncFileAttrs src dst filename
-                    return syncRes
-
--- ============================================================================
--- 文件哈希验证
--- ============================================================================
-
--- | 对两个 helper 端的同一文件进行哈希对比
---
---   返回：Left err | Right True(相同) | Right False(不同)
-compareFileRemote :: HelperHandle -> HelperHandle -> FilePath -> IO (Either String Bool)
-compareFileRemote h0 h1 filename = do
-    res0 <- expectOK h0 ("HASH " ++ filename)
-    res1 <- expectOK h1 ("HASH " ++ filename)
-    case (res0, res1) of
-        (Left err, _) -> return $ Left ("hash 0: " ++ err)
-        (_, Left err) -> return $ Left ("hash 1: " ++ err)
-        (Right h0', Right h1') -> return $ Right (h0' == h1')
+    r <- call hh (Msg.cmd "getignore" [])
+    case r of
+        Left err -> error $ "getignore failed: " ++ err
+        Right v
+            | Just False <- Msg.asBool =<< Msg.field "exists" v -> return Nothing
+            | otherwise -> case ( Msg.fieldInt "mtime" v
+                                , Msg.fieldInt "mode" v
+                                , Msg.fieldStr "hash" v ) of
+                (Just mt, Just md, Just h) -> return $ Just (mt, fromIntegral md, h)
+                _ -> error $ "getignore: bad response: " ++ show v
 
 -- ============================================================================
 -- 符号链接：把链接当成"内容 = 指向字符串"的文件

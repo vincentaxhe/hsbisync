@@ -16,6 +16,7 @@ import qualified Data.Text as T (unpack)
 import GHC.IO.Encoding (setFileSystemEncoding, setLocaleEncoding, utf8)
 
 import Arg (Root(..), parseRoot, parseSyncThree, requireRoot)
+import Connect (prepareRemotes)
 import Exe (recordRemoteRepo, runSync)
 import Helper (runHelper)
 import State
@@ -107,6 +108,9 @@ syncCmd :: [String] -> IO ()
 syncCmd [profile] = syncFromRepo profile
 syncCmd args@[_, _, _] = do
     (profile, root1, root2) <- parseSyncThree args
+    -- 准备工作：先与远程端握手（问出 hsbisync 在远端的位置，让它自报真实路径），
+    -- 远端没有/起不来时在这里就报错，不会跑到中途才失败。
+    prepareRemotes profile [root1, root2]
     persistRepo profile root1 root2   -- 记录对端地址，供以后 hsbisync sync <profile>
     runSync profile root1 root2
 syncCmd _ = die "Usage: hsbisync sync <profile> [<root1> <root2>]"
@@ -169,6 +173,7 @@ syncFromRepo profile = do
         root2 = parseRoot peer
     -- profile 免参同步：对端地址必须已存在，不自动创建目录
     requireRoot root2
+    prepareRemotes profile [root1, root2]   -- 准备工作：与远端握手（hsbisync 在哪）
     runSync profile root1 root2
 
 -- ============================================================================
