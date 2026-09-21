@@ -57,7 +57,7 @@ runSync profile root1 root2 = do
     -- 阶段 1：无条件先同步当前 profile 的 ignore 文件（较新一端覆盖较旧一端）。
     -- 两端 ignore 必须先一致，之后各自扫描文件集合才不会出现偏差。
     -- 此阶段之后 ignore 文件不再参与文件同步。
-    putStrLn "\n[1/4] Syncing ignore rules ..."
+    putStrLn "\n[1/5] Syncing ignore rules ..."
     syncIgnoreFiles profile mHost1 path1 mHost2 path2
 
     -- 阶段 2：同步软链接（先让两端的链接结构完全一致）
@@ -67,16 +67,16 @@ runSync profile root1 root2 = do
     --
     --   悬空链接不做特殊处理：扫描跟随链接时那里自然"什么都没有"，
     --   diff 该得到 Deleted 就得到 Deleted（删除动作本身有确认关卡）。
-    putStrLn "\n[3/4] Reading states ..."
+    putStrLn "\n[3/5] Reading states ..."
     ((label1, (last1, cur1)), (label2, (last2, cur2))) <-
         concurrently (readSideK SKFile mTag mHost1 path1) (readSideK SKFile mTag mHost2 path2)
 
     putStrLn $ "  root1 (" ++ label1 ++ "): " ++ show (length cur1) ++ " files (last: " ++ show (length last1) ++ ")"
     putStrLn $ "  root2 (" ++ label2 ++ "): " ++ show (length cur2) ++ " files (last: " ++ show (length last2) ++ ")"
 
-    -- 阶段 4：计算差异并实际同步文件。此阶段只处理两端扫描出的普通文件，
-    -- ignore 文件已在上面的阶段 1 处理、软链接已在阶段 2 处理。
-    putStrLn "\n[4/4] Syncing files ..."
+    -- 阶段 4：计算最终动作（diff + 形式冲突消解 + 额外内容校验）。
+    -- 只处理两端扫描出的普通文件；ignore 文件已在阶段 1、软链接已在阶段 2 处理。
+    putStrLn "\n[4/5] Computing sync actions ..."
     -- 计算 + 消解形式冲突（同 size 同整数秒 mtime 的一对直接判作已同步）
     let (pairs1, pairs2) = sync (last1, last2) (cur1, cur2)
         (_, pairs1', pairs2') = resolveConflicts pairs1 pairs2
@@ -85,11 +85,12 @@ runSync profile root1 root2 = do
     if not hasWork
         then putStrLn "\nNothing to do."
         else withHelpers mHost1 path1 mHost2 path2 profile $ \side1 side2 -> do
-                -- 校验钩子（在展示冲突/传输请求与确认**之前**）：冲突的、或要传输的，
-                -- 只要两端 size 相同就立刻核对两端内容；结果只有两种——维持，
-                -- 或者“只更新属性并记录”（见 'verifySameSizeCandidates'）。
+                -- 额外内容校验：冲突的、或要传输的，只要两端 size 相同就静默核对内容；
+                -- 一致的“只更新属性并记录”，不一致的维持原判（见 'verifySameSizeCandidates'）。
                 (pairs1'', pairs2'') <- verifySameSizeCandidates cur1 cur2 side1 side2 pairs1' pairs2'
 
+                -- 阶段 5：列出最终动作、确认、执行（真正的传输与记录）
+                putStrLn "\n[5/5] Sync and record files ..."
                 showSummary pairs1'' pairs2''
 
                 yes <- askYesNo "\nProceed? [y/N] "
@@ -293,7 +294,7 @@ syncLinkPhase
     :: String -> Maybe String
     -> Maybe String -> FilePath -> Maybe String -> FilePath -> IO ()
 syncLinkPhase profile mTag mHost1 path1 mHost2 path2 = do
-    putStrLn "\n[2/4] Syncing symlinks ..."
+    putStrLn "\n[2/5] Syncing symlinks ..."
     ((label1, (last1, cur1)), (label2, (last2, cur2))) <-
         concurrently (readSideK SKLink mTag mHost1 path1) (readSideK SKLink mTag mHost2 path2)
 
@@ -582,7 +583,11 @@ ignoreIO action = action `catch` handler
 --
 data Rec = RecAdd | RecDelete
 
--- | 执行一侧的所有操作（文件/链接阶段共用，动作按 kind 区分）
+-- | 执行一侧的所有操作（文件/链接阶段共用，动作按 kind 区分）。
+--
+--   顺序固定为：**先"纯纪录"的动作**（只写状态、不动文件内容），**再删除，最后传输**
+--   —— 纯纪录是双方内容已经一致、只补状态的事，先落地它，确认环节里出现过的东西
+--   就不会因为后面的动作而变卦。
 execute :: SyncKind -> Maybe String -> Side -> Side -> [(FileChange, Maybe SyncAction)] -> IO ()
 execute kind mTag self other pairs = do
     let receives   = [ (filename fs, mode fs, posixSecs (mtime fs))
@@ -593,18 +598,6 @@ execute kind mTag self other pairs = do
                      | (Noop fs _ _, Just RecordAdd)     <- pairs ]
         recordDels = [ filename fs
                      | (Del   fs _ _, Just RecordDelete)  <- pairs ]
-    unless (null removes) $ do
-        putStrLn "\nDeleting..."
-        forM_ removes $ \(relPath, _, _) -> do
-            putStrLn $ "  " ++ kindDeleteVerb kind ++ " " ++ relPath
-            delEnd kind self relPath
-            appendEnd kind self  mTag RecDelete relPath
-            appendEnd kind other mTag RecDelete relPath
-    unless (null receives) $ do
-        putStrLn "\nReceiving..."
-        forM_ receives $ \(relPath, srcMode, srcMtime) -> do
-            putStrLn $ "  " ++ kindVerb kind ++ " " ++ relPath
-            copyEndToEnd kind other self mTag relPath srcMode srcMtime
     unless (null recordAdds) $ do
         putStrLn "\nRecording as added..."
         forM_ recordAdds $ \relPath -> do
@@ -617,6 +610,18 @@ execute kind mTag self other pairs = do
             putStrLn $ "  del " ++ relPath
             appendEnd kind self  mTag RecDelete relPath
             appendEnd kind other mTag RecDelete relPath
+    unless (null removes) $ do
+        putStrLn "\nDeleting then record..."
+        forM_ removes $ \(relPath, _, _) -> do
+            putStrLn $ "  " ++ kindDeleteVerb kind ++ " " ++ relPath
+            delEnd kind self relPath
+            appendEnd kind self  mTag RecDelete relPath
+            appendEnd kind other mTag RecDelete relPath
+    unless (null receives) $ do
+        putStrLn "\nReceiving then record..."
+        forM_ receives $ \(relPath, srcMode, srcMtime) -> do
+            putStrLn $ "  " ++ kindVerb kind ++ " " ++ relPath
+            copyEndToEnd kind other self mTag relPath srcMode srcMtime
 
 -- ============================================================================
 -- End 操作
