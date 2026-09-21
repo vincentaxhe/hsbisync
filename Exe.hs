@@ -2,9 +2,9 @@ module Exe where
 
 import Control.Concurrent.Async (concurrently)
 import Control.Exception (ErrorCall, IOException, bracket, catch, displayException)
-import Control.Monad (forM_, unless, when)
+import Control.Monad (filterM, forM_, unless, when)
 import Data.Char (toLower)
-import Data.List (nub)
+import Data.List (find, nub)
 import Data.Maybe (fromMaybe, isJust)
 import System.Directory (doesFileExist)
 import System.Environment (getExecutablePath)
@@ -31,7 +31,7 @@ import Write
     ( HelperHandle(..), Response(..), sendCommand, readResponse, readJSON
     , hGetExactly, hPutFully, expectOK
     , writeFileVerified, writeLinkVerified, readLinkContent
-    , hashBytes, removeFileSafe, removeLinkSafe, getIgnoreRemote
+    , hashBytes, removeFileSafe, removeLinkSafe, getIgnoreRemote, setMtimeOnly
     )
 import Arg (Root(..), formatOwnPath, rootLabel)
 
@@ -77,23 +77,166 @@ runSync profile root1 root2 = do
     -- 阶段 4：计算差异并实际同步文件。此阶段只处理两端扫描出的普通文件，
     -- ignore 文件已在上面的阶段 1 处理、软链接已在阶段 2 处理。
     putStrLn "\n[4/4] Syncing files ..."
-    -- 计算 + 消解形式冲突
+    -- 计算 + 消解形式冲突（同 size 同整数秒 mtime 的一对直接判作已同步）
     let (pairs1, pairs2) = sync (last1, last2) (cur1, cur2)
         (_, pairs1', pairs2') = resolveConflicts pairs1 pairs2
 
-    showSummary pairs1' pairs2'
-
     let hasWork = any (isJust . snd) pairs1' || any (isJust . snd) pairs2'
-    if not hasWork then putStrLn "\nNothing to do."
-    else do
-        yes <- askYesNo "\nProceed? [y/N] "
-        if not yes
-            then putStrLn "Aborted."
-            else withHelpers mHost1 path1 mHost2 path2 profile $ \side1 side2 -> do
-                    execute SKFile mTag side1 side2 pairs1'
-                    execute SKFile mTag side2 side1 pairs2'
+    if not hasWork
+        then putStrLn "\nNothing to do."
+        else withHelpers mHost1 path1 mHost2 path2 profile $ \side1 side2 -> do
+                -- 校验钩子（在展示冲突/传输请求与确认**之前**）：冲突的、或要传输的，
+                -- 只要两端 size 相同就立刻核对两端内容；结果只有两种——维持，
+                -- 或者“只更新属性并记录”（见 'verifySameSizeCandidates'）。
+                (pairs1'', pairs2'') <- verifySameSizeCandidates cur1 cur2 side1 side2 pairs1' pairs2'
+
+                showSummary pairs1'' pairs2''
+
+                yes <- askYesNo "\nProceed? [y/N] "
+                if not yes
+                    then putStrLn "Aborted."
+                    else do
+                        execute SKFile mTag side1 side2 pairs1''
+                        execute SKFile mTag side2 side1 pairs2''
 
     putStrLn "\nSync complete."
+
+-- ============================================================================
+-- 校验钩子：文件比较阶段，冲突 / 要传输 + 两端 size 相同 → 立刻核对内容
+-- ============================================================================
+
+-- | 某个文件在某一侧的当前状态（没扫到就是 Nothing）
+stateOf :: [FileState] -> FilePath -> Maybe FileState
+stateOf sts name = find ((== name) . filename) sts
+
+-- | FileChange 的文件名（不管哪个构造子）
+changeName :: FileChange -> FilePath
+changeName fc = case fc of
+    Noop fs _ _     -> filename fs
+    Added fs _ _    -> filename fs
+    Del fs _ _      -> filename fs
+    Conflict fs _ _ -> filename fs
+
+-- | 文件比较阶段的钩子：把"有冲突的"和"要传输的"文件里**两端 size 相同**的拿出来，
+--   安静地逐个校对两端内容（SHA512），然后把**确实一致**的按来时路分类列出：
+--
+--     Extra content check ...
+--     Not real conflict:      <- 本来报冲突，实际内容一致（属性已静默对齐、只记 added）
+--     - x.txt
+--     No need transfer:       <- 本来要传输，实际内容一致（同上）
+--     - y.txt
+--
+--   * **一致**（列表里的那些）——不传输：把**较旧那端**的 mtime 对齐到较新那端
+--     （本地 'setMtimeOnly' / 远端 SETTIME），然后把两端都记成 added（'RecordAdd'），
+--     它们会出现在下文的"已同步（纯纪录）"一段里。
+--     对齐 + 记录之后，两端真实文件的 (size, mtime) 与各自的基线都一致，
+--     下一次运行两边都是 Unchanged，这件事彻底消失。
+--   * **不一致**（读不到也一样）——原样保留、**完全不提**：该传的照旧传、
+--     该报的冲突照旧报，只在下文对应段落里出现。
+--
+--   为什么要做：mtime 不同但内容相同的文件（git checkout、cp 未保留时间戳、换机器
+--   重建…）在纯 (size,mtime) 判定下会被当成"要传"甚至"冲突"，白跑一趟、白问一次。
+--   只比 size 相同的对；size 不同必然不同内容，不浪费时间读字节。
+--
+--   只在**文件阶段**做；链接阶段的"内容"是指向字符串，另有判定。
+--   调用点在展示摘要与确认之前，所以用户看到的是已经校完的最终结果。
+verifySameSizeCandidates
+    :: [FileState] -> [FileState]                -- ^ 两端当前状态（cur1 / cur2）
+    -> Side -> Side
+    -> [(FileChange, Maybe SyncAction)]          -- ^ pairs1
+    -> [(FileChange, Maybe SyncAction)]          -- ^ pairs2
+    -> IO ([(FileChange, Maybe SyncAction)], [(FileChange, Maybe SyncAction)])
+verifySameSizeCandidates cur1 cur2 side1 side2 pairs1 pairs2 = do
+    let names = nub $ [ filename fs | (Added fs _ _, Just Receive)      <- pairs1 ++ pairs2 ]
+                    ++ [ filename fs | (Conflict fs _ _, Just Unsolvable) <- pairs1 ++ pairs2 ]
+        conflictNames = [ filename fs | (Conflict fs _ _, _) <- pairs1 ++ pairs2 ]
+        sameSize n = case (stateOf cur1 n, stateOf cur2 n) of
+            (Just a, Just b) -> size a == size b
+            _                -> False
+        sized = [ (n, if n `elem` conflictNames then CandConflict else CandTransfer)
+                | n <- names, sameSize n ]
+    if null sized
+        then return (pairs1, pairs2)
+        else do
+            -- 额外内容校验：两端 size 相同的逐个安静校对（一致的同时把属性对齐），
+            -- 再把**确实一致**的按来时路分类列出——它们既不是真冲突、也不需要传输。
+            putStrLn "\n  Extra content check ..."
+            hFlush stdout
+            confirmed <- filterM (\(n, _) -> identicalAndAlign cur1 cur2 side1 side2 n) sized
+            let same = map fst confirmed
+                showGroup lbl ns = unless (null ns) $ do
+                    putStrLn $ "  " ++ lbl ++ ":"
+                    forM_ ns $ \n -> putStrLn $ "  - " ++ n
+            unless (null same) $ do
+                showGroup "Not real conflict" [ n | (n, CandConflict) <- confirmed ]
+                showGroup "No need transfer" [ n | (n, CandTransfer) <- confirmed ]
+            if null same
+                then return (pairs1, pairs2)
+                else do
+                    -- 冲突在两侧各有一条；转换后只让其中一侧发起记录即可
+                    -- （'execute' 的 RecordAdd 同时记两端，两边都转会在 added 里留重复行）
+                    let conflicts1 = [ filename fs | (Conflict fs _ _, _) <- pairs1 ]
+                        pairs1'' = map (markRecordAdd same) pairs1
+                        pairs2'' = [ p | p@(fc, _) <- map (markRecordAdd same) pairs2
+                                       , not (changeName fc `elem` same
+                                              && changeName fc `elem` conflicts1) ]
+                    return (pairs1'', pairs2'')
+
+-- | 校验钩子里候选的来源：本来就报冲突的 / 本来要传输的
+--   （用来把"校验后一致"的文件分成两组显示：will not conflict / will not transfer）
+data CandKind = CandConflict | CandTransfer
+    deriving (Eq, Show)
+
+-- | 核对一对文件：内容相同 → 把**较旧那端** mtime 对齐到较新那端并返回 True；
+--   内容不同 / 读不到 → 维持原样返回 False。两种都不打印（结果只在摘要里体现）。
+identicalAndAlign :: [FileState] -> [FileState] -> Side -> Side -> FilePath -> IO Bool
+identicalAndAlign cur1 cur2 side1 side2 name =
+    case (stateOf cur1 name, stateOf cur2 name) of
+        (Just fs1, Just fs2) -> do
+            mh1 <- hashSideContent side1 name
+            mh2 <- hashSideContent side2 name
+            case (mh1, mh2) of
+                (Just h1, Just h2)
+                    | h1 == h2 -> do
+                        let t1    = posixSecs (mtime fs1)
+                            t2    = posixSecs (mtime fs2)
+                            newer = max t1 t2
+                        when (t1 /= t2) $
+                            setMtimeOnlySide (if t1 < t2 then side1 else side2) name newer
+                        return True
+                _ -> return False
+        _ -> return False
+
+-- | 把"实质相同"的一对改成"已同步、只需记录"（'execute' 会同时记两端）
+markRecordAdd :: [FilePath] -> (FileChange, Maybe SyncAction) -> (FileChange, Maybe SyncAction)
+markRecordAdd names (Conflict fs d1 d2, _)
+    | filename fs `elem` names = (Noop fs d1 d2, Just RecordAdd)
+markRecordAdd names (Added fs d1 d2, _)
+    | filename fs `elem` names = (Noop fs d1 d2, Just RecordAdd)
+markRecordAdd _ other = other
+
+-- | 取某一端文件内容的 SHA512（本地读字节，远端用 HASH 命令）；读不到返回 Nothing
+hashSideContent :: Side -> FilePath -> IO (Maybe String)
+hashSideContent (Lcl root) relPath =
+    fmap Just (hashBytes <$> BS.readFile (root </> relPath)) `catch` ioFail
+  where
+    ioFail :: IOException -> IO (Maybe String)
+    ioFail _ = return Nothing
+
+hashSideContent (Rmt hh) relPath = do
+    res <- expectOK hh ("HASH " ++ relPath)
+    return $ case res of
+        Right h -> Just h
+        Left _  -> Nothing
+
+-- | 把某一端文件的 mtime 对齐到给定秒数（失败只告警：不影响后续传输/记录）
+setMtimeOnlySide :: Side -> FilePath -> Integer -> IO ()
+setMtimeOnlySide (Lcl root) relPath t = setMtimeOnly (root </> relPath) t
+setMtimeOnlySide (Rmt hh) relPath t = do
+    res <- expectOK hh ("SETTIME " ++ show t ++ "," ++ relPath)
+    case res of
+        Left err -> putStrLn $ "  WARNING: SETTIME failed for " ++ relPath ++ ": " ++ err
+        Right _  -> return ()
 
 -- | 读一个按键作为确认（不回显），并把**已经可读**的该行剩余输入丢掉。
 --
@@ -614,8 +757,8 @@ showSummary pairs1 pairs2 = do
         del1 = [ (f, d1, d2) | (Del  fs d1 d2, Just Remove)  <- pairs1, let f = filename fs ]
         add2 = [ (f, d1, d2) | (Added    fs d1 d2, Just Receive) <- pairs2, let f = filename fs ]
         del2 = [ (f, d1, d2) | (Del  fs d1 d2, Just Remove)  <- pairs2, let f = filename fs ]
-        recAdds = [ f | (Noop fs _ _, Just RecordAdd)    <- pairs1, let f = filename fs ]
-        recDels = [ f | (Del   fs _ _, Just RecordDelete) <- pairs1, let f = filename fs ]
+        recAdds = nub [ f | (Noop fs _ _, Just RecordAdd)    <- pairs1 ++ pairs2, let f = filename fs ]
+        recDels = nub [ f | (Del  fs _ _, Just RecordDelete) <- pairs1 ++ pairs2, let f = filename fs ]
         conf = nub [ (f, d1, d2) | (Conflict fs d1 d2, Just Unsolvable) <- pairs1 ++ pairs2, let f = filename fs ]
 
     when (not (null del1)) $ do

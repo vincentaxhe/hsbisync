@@ -30,7 +30,7 @@ import State
     )
 import Write
     ( writeFileVerified, writeLinkVerified, readLinkContent
-    , removeLinkSafe, removeFileSafe, writeRepoFile
+    , removeLinkSafe, removeFileSafe, writeRepoFile, setMtimeOnly
     )
 
 -- ============================================================================
@@ -77,6 +77,7 @@ commandLoop root mTag = go
                 "SEND"    -> cmdSend     root params'
                 "GETSTAT" -> cmdGetStat  root params'
                 "SETSTAT" -> cmdSetStat  root params'
+                "SETTIME" -> cmdSetTime  root params'
                 "RECV"    -> cmdRecv     root params'
                 "GETIGNORE"-> cmdGetIgnore root mTag
                 "PUTREPO"  -> cmdPutRepo   root mTag params'
@@ -316,6 +317,23 @@ cmdSetStat root params = do
             setFileMode fullPath (fromIntegral (md :: Integer))
             putStrLn "OK"
         _ -> putStrLn "ERROR Invalid SETSTAT params"
+
+-- | SETTIME — 只把 mtime/atime 对齐到给定秒数（不动内容、不动 mode）
+--
+--   协议：SETTIME <mtime_secs>,<path>（path = 逗号之后全部，允许空格）
+--   用于传输前的“内容校验钩子”：内容实质相同、只差时间戳时，把较旧那端的 mtime
+--   对齐到较新那端，使两端 (size, mtime) 一致（之后记成 added 即彻底收敛）。
+cmdSetTime :: FilePath -> String -> IO ()
+cmdSetTime root params =
+    case break (== ',') params of
+        (mtStr, ',' : relPath)
+            | [(mt, "")] <- reads mtStr, not (null relPath) ->
+                (setMtimeOnly (root </> relPath) (mt :: Integer) >> putStrLn "OK")
+                    `catch` handler
+        _ -> putStrLn "ERROR Invalid SETTIME params"
+  where
+    handler :: IOException -> IO ()
+    handler e = putStrLn ("ERROR " ++ show e)
 
 -- ============================================================================
 -- GETIGNORE — 读取 .bisync/<profile>/ignore 元信息（供 ignore 预同步比较）

@@ -178,6 +178,16 @@ hashFile fp = do
     content <- BS.readFile fp
     return $ hashBytes content
 
+-- | 只把 mtime（与 atime）设成给定秒数：不动内容、不动 mode。
+--
+--   用于“内容实质相同、只差时间戳”时把较旧那端对齐到较新的 mtime：
+--   对齐后两端真实文件的 (size, mtime) 一致，记成 added 之后下次运行就是 Unchanged。
+--   与落盘写入一致地解析末端链接（作用到链接指向的目标上，保留链接本身）。
+setMtimeOnly :: FilePath -> Integer -> IO ()
+setMtimeOnly path t = do
+    target <- resolveLeafLink path
+    setFileTimes target (fromIntegral t) (fromIntegral t)
+
 -- | 原子写入文件：系统分配随机临时文件名，写入成功后原子 rename 到目标路径。
 --
 --   使用 'openTempFile' 确保临时文件名唯一，多进程并发写同一目标文件也不会冲突。
