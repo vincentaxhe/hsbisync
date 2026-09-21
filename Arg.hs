@@ -2,11 +2,14 @@ module Arg where
 
 import Control.Exception (IOException, try)
 import Control.Monad (unless, when)
+import Data.List (stripPrefix)
 import System.Directory
-    ( createDirectoryIfMissing, doesDirectoryExist, doesFileExist
+    ( canonicalizePath, createDirectoryIfMissing, doesDirectoryExist, doesFileExist
+    , getHomeDirectory
     )
 import System.Environment (getArgs)
 import System.Exit (ExitCode(..), exitFailure)
+import System.FilePath (dropTrailingPathSeparator, pathSeparator)
 import System.Process (readProcessWithExitCode)
 
 -- ============================================================================
@@ -28,11 +31,34 @@ rootLabel (Remote host path) = host ++ ":" ++ path
 --   "/path"          → Local "/path"
 --   "host:/path"     → Remote "host" "/path"
 --   "user@host:/path" → Remote "user@host" "/path"
+--
+--   只支持正常的 host:path（IPv6 不做特殊处理，如需支持请用 hostname 或 ssh 配置别名）。
 parseRoot :: String -> Root
 parseRoot s =
     case break (== ':') s of
         (h, ':' : p) | not (null h) && '/' `notElem` h -> Remote h p
         _ -> Local s
+
+-- | 本机路径 → 写进对端地址里的形式
+--
+--   规则（2026-09 与用户确认）：
+--   * 位于家目录**之下** → 相对家目录的路径（既不要绝对路径也不要 `~`：
+--     ssh 执行命令时的缺省工作目录就是登录用户的家目录，相对路径天然可用）；
+--   * 正好是家目录本身 → "."（同样是缺省目录）；
+--   * 其它位置 → 绝对路径。
+--
+--   只适用于 **host:path** 形式的对端地址（远端会把它交给 shell）。
+--   本机 Local 路径不经 shell，绝不能缩写成相对路径。
+formatOwnPath :: FilePath -> IO String
+formatOwnPath p = do
+    absP <- canonicalizePath p
+    home <- dropTrailingPathSeparator <$> getHomeDirectory
+    return $
+        if absP == home
+            then "."
+            else case stripPrefix (home ++ [pathSeparator]) absP of
+                    Just rel | not (null rel) -> rel
+                    _                         -> absP
 
 -- | 检查 Root 是否可达且为目录
 --   本地：直接 stat

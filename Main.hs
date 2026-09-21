@@ -2,7 +2,7 @@ module Main where
 
 import Control.Monad (forM_, unless)
 import System.Directory
-    ( canonicalizePath, createDirectoryIfMissing, doesDirectoryExist, doesFileExist
+    ( canonicalizePath, doesDirectoryExist, doesFileExist
     , getCurrentDirectory, listDirectory
     )
 import System.Environment (getArgs)
@@ -16,13 +16,14 @@ import qualified Data.Text as T (unpack)
 import GHC.IO.Encoding (setFileSystemEncoding, setLocaleEncoding, utf8)
 
 import Arg (Root(..), parseRoot, parseSyncThree, requireRoot)
-import Exe (runSync)
+import Exe (recordRemoteRepo, runSync)
 import Helper (runHelper)
 import State
     ( FileState(..), DiffState(..)
     , readLastState, currentState, diffOneSide
     , readEntries, bsLines
     )
+import Write (writeRepoFile)
 
 -- ============================================================================
 -- 入口
@@ -56,6 +57,7 @@ showHelp = putStrLn $ unlines
     , "  hsbisync sync <profile> [<root1> <root2>]"
     , "    With 1 arg:  read peer from .bisync/<profile>/repo and sync"
     , "    With 3 args: sync two roots and record the peer into repo file(s)"
+    , "                 (both ends are recorded when the peer is reached via ssh)"
     , "  hsbisync log <profile>             Show pending changes"
     , "  hsbisync state <profile>           Preview changes (read-only)"
     , "  hsbisync profile                   List all profiles"
@@ -113,11 +115,15 @@ syncCmd _ = die "Usage: hsbisync sync <profile> [<root1> <root2>]"
 -- repo 持久化：显式双端 sync 时把对端地址写入本地仓库的 repo 文件
 -- ============================================================================
 
--- | 显式双端同步时，把对端地址记录到本地仓库的 .bisync/<profile>/repo，
---   这样之后在仓库内直接 hsbisync sync <profile> 即可。
---   * 两端都是本地 → 两端互写对方的绝对路径
---   * 一端本地一端远程 → 只在本地端写远程地址（host:path）；
---     远程端不写——反向的 ssh 地址难以确定
+-- | 显式双端同步时，把对端地址强制写进双方的 .bisync/<profile>/repo，
+--   这样之后在任一端直接 hsbisync sync <profile> 都能免参同步。
+--   既然命令里已给出完整路径，它就是权威输入：直接覆盖，不与旧内容比较。
+--   * 两端都是本地 → 两端互写对方的绝对路径（本机 Local 路径不经 shell，
+--     不能用相对路径）
+--   * 一端本地一端远程 → 本地端写 host:<远端路径>（沿用你输入的原样路径）；
+--     远程端写 <本机用户>@<本机IP>:<本机路径>——IP 由远端 helper 从 sshd 的
+--     SSH_CONNECTION 里取，路径按家目录简写（见 'recordRemoteRepo'）
+--   * 两端都远程 → 都跳过（互相的地址在对方看来未必可用）
 persistRepo :: String -> Root -> Root -> IO ()
 persistRepo profile r1 r2 =
     case (r1, r2) of
@@ -126,28 +132,23 @@ persistRepo profile r1 r2 =
             a2 <- canonicalizePath p2
             writeRepo profile p1 a2
             writeRepo profile p2 a1
-        (Local p1, Remote _ _) -> writeRepo profile p1 (remoteAddr r2)
-        (Remote _ _, Local p2) -> writeRepo profile p2 (remoteAddr r1)
+        (Local p1, Remote h2 p2) -> do
+            writeRepo profile p1 (remoteAddr r2)
+            recordRemoteRepo h2 p2 profile p1
+        (Remote h1 p1, Local p2) -> do
+            writeRepo profile p2 (remoteAddr r1)
+            recordRemoteRepo h1 p1 profile p2
         (Remote _ _, Remote _ _) -> return ()
   where
     -- 仅在 r1/r2 为 Remote 时调用
     remoteAddr (Remote h p) = h ++ ":" ++ p
     remoteAddr (Local _)    = ""
 
--- | 把对端地址写入某个本地仓库（内容相同则跳过，不产生输出）
+-- | 把对端地址覆盖写入某个本地仓库
 writeRepo :: String -> FilePath -> String -> IO ()
 writeRepo profile localPath addr = do
-    let profDir = localPath </> ".bisync" </> profile
-        repoFp  = profDir </> "repo"
-    same <- doesFileExist repoFp >>= \e ->
-              if not e then return False
-              else (== addr) <$> filter (not . (`elem` "\n\r")) <$> readFile repoFp
-    if same
-        then return ()
-        else do
-            createDirectoryIfMissing True profDir
-            writeFile repoFp (addr ++ "\n")
-            putStrLn $ "  " ++ localPath ++ ": repo = " ++ addr ++ "  [OK]"
+    writeRepoFile (localPath </> ".bisync" </> profile </> "repo") addr
+    putStrLn $ "  " ++ localPath ++ ": repo = " ++ addr ++ "  [OK]"
 
 -- ============================================================================
 -- sync (profile only) — 读 .bisync/<profile>/repo，与记录的对端同步

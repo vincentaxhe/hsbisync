@@ -4,8 +4,9 @@ import Control.Exception (catch, IOException)
 import Control.Monad (unless)
 import Data.Bits ((.&.))
 import Data.Char (toUpper)
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, listToMaybe)
 import System.Directory (createDirectoryIfMissing, doesFileExist)
+import System.Environment (lookupEnv)
 import System.FilePath ((</>))
 import System.IO
     ( BufferMode(..), hFlush, hLookAhead
@@ -29,7 +30,7 @@ import State
     )
 import Write
     ( writeFileVerified, writeLinkVerified, readLinkContent
-    , removeLinkSafe, removeFileSafe
+    , removeLinkSafe, removeFileSafe, writeRepoFile
     )
 
 -- ============================================================================
@@ -78,6 +79,7 @@ commandLoop root mTag = go
                 "SETSTAT" -> cmdSetStat  root params'
                 "RECV"    -> cmdRecv     root params'
                 "GETIGNORE"-> cmdGetIgnore root mTag
+                "PUTREPO"  -> cmdPutRepo   root mTag params'
                 -- 链接阶段（与文件阶段一一对应）
                 "GETLINKSTATE" -> cmdGetLinkState root mTag
                 "GETLINKLAST"  -> cmdGetLinkLast  root mTag
@@ -337,3 +339,48 @@ cmdGetIgnore root mTag = do
                 mode   = fileMode fs .&. 0o7777
                 digest = hash content :: Digest SHA512
             putStrLn $ "OK " ++ show mt ++ " " ++ show mode ++ " " ++ show digest
+
+-- ============================================================================
+-- PUTREPO — 远端把自己的 .bisync/<profile>/repo 写成"登录方（主控端）地址"
+-- ============================================================================
+
+-- | PUTREPO 命令：由主控端发起，让**远端**也拥有 repo 文件，
+--   这样远端以后直接 `hsbisync sync <profile>` 就能免参反向同步。
+--
+--   协议：PUTREPO <user>,<path>
+--     user = 登录方（主控端）本机登录用户名，反向 ssh 时要用这个名字
+--     path = 登录方同步根路径；家目录之下是相对路径（不带 ~），否则绝对路径
+--            ——具体由主控端按 'formatOwnPath' 决定后传过来
+--
+--   为什么地址要由 helper 自己拼：只有登录方才可能知道"对面看到的我是谁"，
+--   而这个信息就在 sshd 设置的环境变量里：
+--       SSH_CONNECTION = "<client_addr> <client_port> <server_addr> <server_port>"
+--   因此 host 部分由本端补上，主控端只提供用户名与路径。
+--   取不到（非 ssh 场景，如本地测试用的假 ssh）就不写。
+--
+--   响应：
+--     OK <addr>       写入成功，addr 是写进去的完整地址
+--     OK NOCLIENT     取不到登录方地址 → 不写，主控端只提示
+cmdPutRepo :: FilePath -> Maybe String -> String -> IO ()
+cmdPutRepo root mTag params =
+    case break (== ',') params of
+        (user, ',' : path)
+            | not (null user) && not (null path) -> do
+                mip <- loginClientAddr
+                case mip of
+                    Nothing -> putStrLn "OK NOCLIENT"
+                    Just ip -> do
+                        let repoFile = root </> ".bisync" </> fromMaybe "" mTag </> "repo"
+                            addr     = user ++ "@" ++ ip ++ ":" ++ path
+                        writeRepoFile repoFile addr
+                        putStrLn $ "OK " ++ addr
+        _ -> putStrLn "ERROR Invalid PUTREPO params"
+
+-- | 登录方（主控端）地址，取自 sshd 设置的环境变量。
+--   SSH_CONNECTION 是现代 sshd 的标准变量；SSH_CLIENT 是旧变量，
+--   两者首字段都是客户端地址。
+loginClientAddr :: IO (Maybe String)
+loginClientAddr = do
+    mConn   <- lookupEnv "SSH_CONNECTION"
+    mClient <- lookupEnv "SSH_CLIENT"
+    return $ listToMaybe [ ip | Just s <- [mConn, mClient], ip : _ <- [words s] ]

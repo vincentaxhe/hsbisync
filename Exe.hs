@@ -1,7 +1,7 @@
 module Exe where
 
 import Control.Concurrent.Async (concurrently)
-import Control.Exception (bracket, catch, IOException)
+import Control.Exception (ErrorCall, IOException, bracket, catch, displayException)
 import Control.Monad (forM_, unless, when)
 import Data.Char (toLower)
 import Data.List (nub)
@@ -16,6 +16,7 @@ import System.IO
     , hReady
     )
 import System.Process (createProcess, proc, StdStream(..), CreateProcess(..))
+import System.Posix.User (getEffectiveUserName)
 
 import qualified Data.ByteString as BS
 
@@ -32,7 +33,7 @@ import Write
     , writeFileVerified, writeLinkVerified, readLinkContent
     , hashBytes, removeFileSafe, removeLinkSafe, getIgnoreRemote
     )
-import Arg (Root(..), rootLabel)
+import Arg (Root(..), formatOwnPath, rootLabel)
 
 -- ============================================================================
 -- 统一入口
@@ -647,3 +648,47 @@ showSummary pairs1 pairs2 = do
             putStrLn $ "  - " ++ f ++ "  [r1:" ++ show d1 ++ " r2:" ++ show d2 ++ "]"
     let total = length add1 + length del1 + length add2 + length del2 + length recAdds + length recDels
     putStrLn $ "\nTotal: " ++ show total ++ " operations, " ++ show (length conf) ++ " conflicts"
+
+-- ============================================================================
+-- repo 记录：让远端也写下"本机（登录方）地址"
+-- ============================================================================
+
+-- | 让远端 helper 把它自己的 .bisync/<profile>/repo 写成**本机（登录方）地址**：
+--
+--     <本机用户名>@<本机IP>:<本机路径>
+--
+--   * IP 只有对面知道（sshd 把 SSH_CONNECTION 放进远端进程的环境里），
+--     所以 host 部分由 helper 补上，本机只提供用户名与路径；
+--   * 用户名取本机当前登录用户 —— 反向 ssh 到本机时用的就是这个名字；
+--   * 路径取本机同步根，按家目录简写规则 'formatOwnPath' 处理
+--     （家目录之下写相对路径，其余写绝对路径）。
+--
+--   这样远端也具备 repo，在远端直接 `hsbisync sync <profile>` 即可反向免参同步。
+--   repo 只是"下次免参同步"的缓存，所以任何失败都只提示、不中断同步。
+recordRemoteRepo :: String -> FilePath -> String -> FilePath -> IO ()
+recordRemoteRepo host remotePath profile ownPath = do
+    r <- tryOurErrors $
+            bracket (spawnHelper host remotePath profile) destroyHelper $ \hh -> do
+                user <- getEffectiveUserName
+                path <- formatOwnPath ownPath
+                expectOK hh ("PUTREPO " ++ user ++ "," ++ path)
+    case r of
+        Left err         -> note ("not written (" ++ err ++ ")")
+        Right (Left err) -> note ("not written (" ++ err ++ ")")
+        Right (Right "NOCLIENT") ->
+            note "not written: cannot tell which address the peer sees us as (SSH_CONNECTION unset)"
+        Right (Right addr) ->
+            putStrLn $ "  " ++ host ++ ":" ++ remotePath ++ ": repo = " ++ addr ++ "  [OK]"
+  where
+    note msg = putStrLn $ "  NOTE: " ++ host ++ ":" ++ remotePath ++ ": repo " ++ msg
+
+-- | 只捕获"我们自己的"失败（IO 异常 + 我们 error 出来的 ErrorCall），
+--   不吞 Ctrl-C 之类的异步异常。Left 是可读的失败原因。
+tryOurErrors :: IO a -> IO (Either String a)
+tryOurErrors act = (Right <$> act) `catch` ioToLeft `catch` callToLeft
+  where
+    ioToLeft :: IOException -> IO (Either String a)
+    ioToLeft e = return (Left (show e))
+
+    callToLeft :: ErrorCall -> IO (Either String a)
+    callToLeft = return . Left . displayException
