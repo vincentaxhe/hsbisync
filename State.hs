@@ -24,7 +24,6 @@ import Ignore (Ignore, parse, ignores)
 import qualified Data.Map as Map
 import qualified Data.Set as Set
 import qualified Msg
-import qualified Tmp
 
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Builder as B
@@ -120,11 +119,9 @@ scanRel root dir = scanRel' root dir emptyIgnore
 
 -- | 递归扫描，使用给定的 gitignore 规则过滤所有条目
 --
---   不过滤隐藏文件（以 @.@ 开头的条目同样参与同步），两个例外：
---   * 同步根目录下的工具状态目录 @.bisync@；
---   * 工具自己的临时文件（'Tmp.isTempName'，任意层级）—— 临时文件不是内容：
---     传输被打断留下的残骸如果被当成内容，下一次运行会把它传回给对端（反流）。
---   其余排除一律交给 ignore 规则。
+--   不过滤隐藏文件（以 @.@ 开头的条目同样参与同步），唯一例外是同步根目录下的
+--   工具状态目录 @.bisync@；其余一律交给 ignore 规则 —— 包括工具自己的临时文件：
+--   扫描只看文件树的真相，要排除什么就写进 ignore（见 'Tmp'）。
 scanRel' :: FilePath -> FilePath -> Ignore -> IO [FilePath]
 scanRel' root dir ignoreRules = scanRelFrom [] root dir ignoreRules
 
@@ -175,8 +172,7 @@ scanRelFrom visited root dir ignoreRules = do
     entries <- listDirectory dir
     let atRoot  = dir == root
         visible = [ e | e <- entries
-                      , not (atRoot && takeFileName e == ".bisync")
-                      , not (Tmp.isTempName e) ]   -- 我们的临时文件不是内容
+                      , not (atRoot && takeFileName e == ".bisync") ]
 
     let fullPaths  = [dir </> e | e <- visible]
     kinds <- mapM classifyEntry fullPaths
@@ -255,8 +251,7 @@ scanRelLinks root dir ignoreRules = do
     entries <- listDirectory dir
     let atRoot  = dir == root
         visible = [ e | e <- entries
-                      , not (atRoot && takeFileName e == ".bisync")
-                      , not (Tmp.isTempName e) ]   -- 我们的临时文件不是内容
+                      , not (atRoot && takeFileName e == ".bisync") ]
 
     let fullPaths = [dir </> e | e <- visible]
     kinds <- mapM classifyLinkEntry fullPaths

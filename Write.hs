@@ -1,6 +1,6 @@
 module Write where
 
-import Control.Exception (IOException, catch, onException, try)
+import Control.Exception (IOException, catch, try)
 import Data.Bits ((.&.))
 import System.Directory
     ( createDirectory, createDirectoryIfMissing, doesDirectoryExist, doesFileExist
@@ -34,14 +34,15 @@ import qualified Tmp
 -- 临时文件脚手架
 -- ============================================================================
 
--- | 在临时文件上干活：**中途一旦抛异常（包括 Ctrl-C 的异步中断）立刻丢掉它**，
---   绝不留半成品给下一次扫描（反流的根源）。
+-- | 在临时文件上干活：创建 → 交给 @act@（写完由调用方 rename 到目标名 = 提交）。
 --
---   正常路径由 @act@ 自己决定：rename 到目标 = 提交；显式 removeFile = 丢弃。
+--   **不做任何自动清理**：中断（Ctrl-C / 断线 / 断电）留下的临时文件就留在磁盘上，
+--   下一次扫描会看到它（文件树保持真实），要不要排除由 ignore 决定，要清就手工删。
+--   命名可识别（见 'Tmp'）就是为了让这件事做得成。
 withTemp :: FilePath -> (FilePath -> Handle -> IO a) -> IO a
 withTemp dir act = do
     (tmpPath, h) <- Tmp.createTemp dir
-    act tmpPath h `onException` Tmp.discardTemp tmpPath h
+    act tmpPath h
 
 -- ============================================================================
 -- Types
@@ -71,20 +72,17 @@ hGetExactly h n = BS.concat . reverse <$> go n []
             then return chunks
             else go (remaining - got) (chunk : chunks)
 
--- | 向 Handle 完整写入 ByteString，分块写保证全部写出
+-- | 向 Handle 完整写入 ByteString，末尾 flush 一次。
 --
---   ByteString 的 'hPut' 理论上写全部，但大文件时分块更安全
+--   为什么不再分块：'BS.hPut' 自己会写满 —— 实测单次调用 1 MB / 64 MB / 512 MB
+--   经管道全部到达，不会短写；分块只是白做一次 'BS.splitAt' 拷贝。
+--
+--   为什么不再每块 flush：老实现每 8 KB 就 flush 一次，1 GB 就是 13 万次
+--   write+flush 系统调用，纯粹是吞吐损耗（管道本身有 64 KB 缓冲、ssh 会持续排空，
+--   阻塞写天然就是需要的背压）。缓冲区尾巴由函数末尾这一次 'hFlush' 推出 ——
+--   调用方随后会在通道上等响应，所以必须确保已经发出。
 hPutFully :: Handle -> BS.ByteString -> IO ()
-hPutFully h bs = go bs
-  where
-    chunkSize = 8192   -- 8KB 块
-    go b
-        | BS.null b = return ()
-        | otherwise = do
-            let (chunk, rest) = BS.splitAt chunkSize b
-            BS.hPut h chunk
-            hFlush h
-            go rest
+hPutFully h bs = BS.hPut h bs >> hFlush h
 
 -- ============================================================================
 -- Helper 协议通信：一行一个规范 JSON（见 Msg）

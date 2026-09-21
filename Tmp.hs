@@ -1,30 +1,25 @@
--- | 临时文件：**一条命名约定 + 一个"没确认成功就删"的规则**（刻意保持最小）。
+-- | 临时文件的命名约定 —— 只负责"起个可识别的名字 + 原子创建"，别的什么都不做。
 --
---   1. **名字**：@.hsbisync-tmp\<pid\>-\<n\>.tmp@（隐藏 + 固定前缀，一眼认出是我们的）。
---      老写法 @openTempFile dir ".tmp"@ 生成的是 @\<pid\>-\<n\>.tmp@，跟真人文件无法区分。
---   2. **生命周期**：临时文件只有一个成功出口 = 校验通过后 rename 到目标名；
---      其它任何情况（校验不过、写失败、Ctrl-C、断线）都走 'Write.withTemp' 的
---      @onException@ 把它删掉 —— 就是"没确认成功就删"，不留半成品。
+--   为什么还需要一个模块：原子写入（先写临时文件、校验通过再 rename 到目标名）是
+--   不可省的；而临时文件名必须**可识别**，否则中断留下的残骸和真人文件无法区分，
+--   你既没法用一条 ignore 规则排除它，也没法用一条 find 手工清掉它。
 --
---   扫描端只认一条：**我们的临时文件不是内容**（'isTempName'），永不参与同步。
---   这不是"多一层防护"，而是"内容"的定义 —— 否则残骸会被当成新文件传给对端（反流）。
+--   **设计取舍（用户 2026-09-22 定）**：工具**不自动清理、也不自动忽略**临时文件。
+--   文件树保持真实 —— 扫描看到什么就是什么，只有 ignore 规则能影响同步内容。
+--   于是：
+--   * 中断留下的临时文件会一直被看见（也可能被同步），这是**已知且接受**的行为；
+--   * 想排除它，在你的 ignore 文件里加一行（gitignore 语法，任意层级匹配）：
+--         .hsbisync-tmp*
+--   * 想清理它，手工跑：
+--         find <root> -name '.hsbisync-tmp*' -delete
 --
---   诚实说明做不到的部分：SIGKILL、断电、远端 helper 被 sshd 杀掉时，进程没有机会
---   运行任何清理代码，残骸会留在磁盘上。此时靠上面那条"不是内容"的规则保证它不参与
---   同步（不反流、不污染对端）；要回收空间就手工删：
---   @find \<root\> -name '.hsbisync-tmp*' -delete@。
---   明确**不做断点续传**：残骸没有价值，一律丢弃。
+--   生成的名字形如 @.hsbisync-tmp\<pid\>-\<n\>.tmp@：隐藏文件、固定前缀、
+--   pid 与序号由 'openTempFile' 填（天然唯一，多进程并发写同一目录也不会撞名）。
 module Tmp
     ( createTemp
-    , isTempName
-    , discardTemp
     ) where
 
-import Control.Exception (IOException, catch)
-import Data.List (isPrefixOf, isSuffixOf)
-import System.Directory (removeFile)
-import System.FilePath (takeFileName)
-import System.IO (Handle, hClose, hSetBinaryMode, openTempFile)
+import System.IO (Handle, hSetBinaryMode, openTempFile)
 
 -- | 公共前缀（隐藏文件，不会跟真人文件撞名）
 tmpPrefix :: String
@@ -35,7 +30,6 @@ tmpSuffix :: String
 tmpSuffix = ".tmp"
 
 -- | 交给 'openTempFile' 的模板：生成名 = @前缀 ++ \<本进程 pid\> ++ "-" ++ \<序号\> ++ 后缀@
---   （pid 由 openTempFile 自己填，天然唯一，天然可识别）
 tmpTemplate :: String
 tmpTemplate = tmpPrefix ++ tmpSuffix
 
@@ -46,23 +40,3 @@ createTemp dir = do
     (path, h) <- openTempFile dir tmpTemplate
     hSetBinaryMode h True
     return (path, h)
-
--- | 是不是我们自己的临时文件（前缀 + 后缀，中间非空）
-isTempName :: FilePath -> Bool
-isTempName path =
-    let n = takeFileName path
-    in tmpPrefix `isPrefixOf` n
-       && tmpSuffix `isSuffixOf` n
-       && length n > length tmpPrefix + length tmpSuffix
-
--- | 丢掉临时文件（best-effort）：清理动作本身绝不能变成一个新的失败
-discardTemp :: FilePath -> Handle -> IO ()
-discardTemp tmp h = do
-    ignore (hClose h)
-    ignore (removeFile tmp)
-
-ignore :: IO () -> IO ()
-ignore action = action `catch` handler
-  where
-    handler :: IOException -> IO ()
-    handler _ = return ()
