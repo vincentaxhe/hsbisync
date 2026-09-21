@@ -1,6 +1,6 @@
 module Write where
 
-import Control.Exception (IOException, catch, try)
+import Control.Exception (IOException, catch, onException, try)
 import Data.Bits ((.&.))
 import System.Directory
     ( createDirectory, createDirectoryIfMissing, doesDirectoryExist, doesFileExist
@@ -9,7 +9,6 @@ import System.Directory
 import System.FilePath (takeDirectory, isAbsolute, normalise, (</>))
 import System.IO
     ( Handle, hClose, hFlush
-    , openTempFile
     )
 import System.Posix.Files
     ( FileStatus
@@ -29,6 +28,20 @@ import qualified Data.Text.Encoding as T (encodeUtf8, decodeUtf8With)
 import qualified Data.Text.Encoding.Error as TEE (lenientDecode)
 
 import qualified Msg
+import qualified Tmp
+
+-- ============================================================================
+-- 临时文件脚手架
+-- ============================================================================
+
+-- | 在临时文件上干活：**中途一旦抛异常（包括 Ctrl-C 的异步中断）立刻丢掉它**，
+--   绝不留半成品给下一次扫描（反流的根源）。
+--
+--   正常路径由 @act@ 自己决定：rename 到目标 = 提交；显式 removeFile = 丢弃。
+withTemp :: FilePath -> (FilePath -> Handle -> IO a) -> IO a
+withTemp dir act = do
+    (tmpPath, h) <- Tmp.createTemp dir
+    act tmpPath h `onException` Tmp.discardTemp tmpPath h
 
 -- ============================================================================
 -- Types
@@ -182,10 +195,10 @@ writeFileAtomic :: FilePath -> BS.ByteString -> IO ()
 writeFileAtomic path content = do
     let dir = takeDirectory path
     createDirectoryIfMissing True dir
-    (tmpPath, h) <- openTempFile dir ".tmp"
-    BS.hPut h content
-    hClose h
-    renameFile tmpPath path
+    withTemp dir $ \tmpPath h -> do
+        BS.hPut h content
+        hClose h
+        renameFile tmpPath path
 
 -- ============================================================================
 -- 目录创建：穿透悬空软链接（让"路径透明"在写文件时真正成立）
@@ -275,8 +288,7 @@ writeFileVerified root path content mode_ mtime_ expectedHash = do
             mk <- ensureDirChain dir
             case mk of
                 Left e -> return $ Left e
-                Right () -> do
-                    (tmpPath, h) <- openTempFile dir ".tmp"
+                Right () -> withTemp dir $ \tmpPath h -> do
                     BS.hPut h content
                     hClose h
                     -- 属性在 rename 前设好，保证新文件立即可用
@@ -444,8 +456,7 @@ writeLinkVerified root path targetBytes _mode mtime_ expectedHash = do
                     rm <- (try (removeEntryForcibly path) :: IO (Either IOException ()))
                     case rm of
                         Left e -> return $ Left ("cannot replace " ++ path ++ ": " ++ show e)
-                        Right () -> do
-                            (tmpPath, h) <- openTempFile dir ".tmp"
+                        Right () -> withTemp dir $ \tmpPath h -> do
                             hClose h
                             removeFile tmpPath        -- 释放占位名，改为同名符号链接
                             createSymbolicLink (linkTargetPath targetBytes) tmpPath
