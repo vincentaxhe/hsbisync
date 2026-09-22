@@ -10,7 +10,7 @@ module Connect where
 
 import Control.Concurrent.MVar (MVar, modifyMVar_, newMVar, readMVar)
 import Control.Exception (IOException, catch)
-import Control.Monad (forM, forM_)
+import Control.Monad (forM)
 import Data.List (nubBy)
 import Data.Map (Map)
 import Data.Maybe (fromMaybe)
