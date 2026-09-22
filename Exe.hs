@@ -163,7 +163,11 @@ runSync srcKind profile root1 root2 = do
                 putStrLn "\n[7/7] Sync and record files ..."
                 showSummary pairs1'' pairs2''
 
-                yes <- askYesNo "\nProceed? [y/N] "
+                -- 只剩冲突时没有任何要执行的东西（'execute' 对冲突本就是空操作）
+                -- → 不用确认，直接跑到底退出（用户 2026-09-23 定）。
+                yes <- if hasApplicableAction pairs1'' pairs2''
+                           then askYesNo "\nProceed? [y/N] "
+                           else return True
                 if not yes
                     then putStrLn "Aborted."
                     else do
@@ -386,14 +390,17 @@ syncLinkPhase profile mTag mHost1 path1 mHost2 path2 = do
     -- 链接结构本来就一致时这里一个字都不说。
     when hasWork $ do
         showSummary pairs1' pairs2'
-        yes <- askYesNo "\nApply symlink changes? [y/N] "
-        if not yes
-            then putStrLn "Aborted (symlink phase)."
-            else withHelpers mHost1 path1 mHost2 path2 profile $ \side1 side2 -> do
-                    execute SKLink mTag side1 side2 pairs1'
-                    discardLocal side1 mTag pairs1'
-                    execute SKLink mTag side2 side1 pairs2'
-                    discardLocal side2 mTag pairs2'
+        -- 只剩冲突（要跳过的那些）时没有要执行的动作：不必确认，也不用起 helper，
+        -- 列完清单直接结束（用户 2026-09-23 定，与文件阶段口径一致）。
+        when (hasApplicableAction pairs1' pairs2') $ do
+            yes <- askYesNo "\nApply symlink changes? [y/N] "
+            if not yes
+                then putStrLn "Aborted (symlink phase)."
+                else withHelpers mHost1 path1 mHost2 path2 profile $ \side1 side2 -> do
+                        execute SKLink mTag side1 side2 pairs1'
+                        discardLocal side1 mTag pairs1'
+                        execute SKLink mTag side2 side1 pairs2'
+                        discardLocal side2 mTag pairs2'
 
 -- | 链接阶段刚在某端建/改了一个链接：把该端这个链接**子树**下的文件基线条目作废。
 --
@@ -605,6 +612,19 @@ getHelperStates hh which kind = do
 -- | 记录类型：ADD / DELETE
 --
 data Rec = RecAdd | RecDelete
+
+-- | 这批动作里有没有**真正要执行**的东西。
+--
+--   'Unsolvable'（冲突）虽然也记在 @Just@ 里，但它是"发现了冲突、跳过"的标记，
+--   'execute' 对它什么都不做 —— 所以**只有冲突**时不需要用户确认，直接跑完退出
+--   （用户 2026-09-23 定）。与 'Nothing'（无动作）一起都算"没有可执行的"。
+hasApplicableAction
+    :: [(FileChange, Maybe SyncAction)] -> [(FileChange, Maybe SyncAction)] -> Bool
+hasApplicableAction pairs1 pairs2 = any applicable (pairs1 ++ pairs2)
+  where
+    applicable (_, Just Unsolvable) = False
+    applicable (_, Just _)          = True
+    applicable (_, Nothing)         = False
 
 -- | 执行一侧的所有操作（文件/链接阶段共用，动作按 kind 区分）。
 --
