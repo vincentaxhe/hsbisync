@@ -9,19 +9,43 @@ import State (FileState(..), FileChange(..), DiffState(..), sameFile, diffOneSid
 data SyncAction = Receive | Remove | Unsolvable | RecordAdd | RecordDelete
     deriving (Show, Eq)
 
+-- | 单侧 diff 的**初步统计**（给输出的第 6 步用）：每种状态各多少条。
+--
+--   'DiffState' 共 5 种，但 'None' 是"该侧从未有过"——它不是这一侧的
+--   **自身状态变化**（不在 'diffOneSide' 的输出里），所以这里只有 4 个计数。
+data SideStats = SideStats
+    { statNew       :: !Int
+    , statUpdated   :: !Int
+    , statUnchanged :: !Int
+    , statDeleted   :: !Int
+    }
+    deriving (Show, Eq)
+
+-- | 统计一份 diff（'diffOneSide' 的输出）里各状态条数
+--
+--   一次线性遍历（严格累加，避免大列表堆 thunk）。
+diffStats :: [(DiffState, FileState)] -> SideStats
+diffStats = foldl' step (SideStats 0 0 0 0)
+  where
+    step (SideStats n u k d) (st, _) = case st of
+        New       -> SideStats (n + 1) u k d
+        Updated   -> SideStats n (u + 1) k d
+        Unchanged -> SideStats n u (k + 1) d
+        Deleted   -> SideStats n u k (d + 1)
+        None      -> SideStats n u k d
+
 -- | 双向同步核心逻辑
 --
 --   先对两侧各自调用 'diffOneSide' 计算单侧差异（New / Updated / Unchanged / Deleted），
 --   再在 'classifyOne' 中组合两侧的差异，产生每侧的 FileChange。
 --   None 表示该侧从未有过此文件，仅出现在 classifyOne 的输出中。
 --
---   返回两侧的 @(FileChange, Maybe SyncAction)@ 列表
---   * @Nothing@ = 无需操作
---   * @Just Receive@ = 从对方接收
---   * @Just Deleted@ = 删除本地
---   * @Just Unsolvable@ = 冲突
+--   返回：两端各自的 @('SideStats', [(FileChange, Maybe SyncAction)])@ ——
+--   统计是**初步**的（diff 的直接结果，冲突消解与内容校验之前），
+--   @Just Receive@ = 从对方接收，@Just Remove@ = 删除本地，@Just Unsolvable@ = 冲突。
 sync :: ([FileState], [FileState]) -> ([FileState], [FileState])
-     -> ([(FileChange, Maybe SyncAction)], [(FileChange, Maybe SyncAction)])
+     -> ( SideStats, [(FileChange, Maybe SyncAction)]    -- ^ root1：初步统计 + 动作
+        , SideStats, [(FileChange, Maybe SyncAction)] )  -- ^ root2：初步统计 + 动作
 sync (last1, last2) (cur1, cur2) =
     let diff1 = diffOneSide last1 cur1
         diff2 = diffOneSide last2 cur2
@@ -32,8 +56,8 @@ sync (last1, last2) (cur1, cur2) =
         results = map (classifyOne (flip Map.lookup dm1) (flip Map.lookup dm2)) allFiles
         changes1 = [c1 | (c1, _) <- results]
         changes2 = [c2 | (_, c2) <- results]
-    in ( zip changes1 (map toAct changes1)
-       , zip changes2 (map toAct changes2) )
+    in ( diffStats diff1, zip changes1 (map toAct changes1)
+       , diffStats diff2, zip changes2 (map toAct changes2) )
 
 -- | 消解形式冲突 → 实质冲突
 --
@@ -85,12 +109,22 @@ resolveConflicts pairs1 pairs2 =
         keepInPairs2 (Conflict fs _ _, _) = not (Set.member (filename fs) resolvedNames)
         keepInPairs2 _                    = True
 
-        convert ((Conflict fs d1 d2), _)
+        -- pairs1：过期条目（本端删了、对端从未有过）→ 纯记录
+        --
+        --   这里**绝不能**变成 'Remove'：那个路径如今可能是指向别处的链接
+        --   （实测就是"指向目录的链接"），删下去会穿透链接动到真数据。
+        --   'RecordDelete' 只往 deleted 文件里写一行，下轮读状态时把该条目滤掉。
+        convert1 (Noop fs Deleted None, Nothing) = (Del fs Deleted None, Just RecordDelete)
+        convert1 (Conflict fs d1 d2, _)
             | Set.member (filename fs) delNames = (Del fs d1 d2, Just RecordDelete)
             | Set.member (filename fs) addNames = (Noop fs d1 d2, Just RecordAdd)
-        convert other = other
+        convert1 other = other
 
-    in (resolvedAdd, map convert pairs1, filter keepInPairs2 pairs2)
+        -- pairs2 同上（对称）
+        convert2 (Noop fs None Deleted, Nothing) = (Del fs None Deleted, Just RecordDelete)
+        convert2 other = other
+
+    in (resolvedAdd, map convert1 pairs1, map convert2 (filter keepInPairs2 pairs2))
 toAct :: FileChange -> Maybe SyncAction
 toAct (Noop _ _ _)  = Nothing
 toAct (Added     _ _ _)  = Just Receive
@@ -127,7 +161,15 @@ classifyOne dm1 dm2 name =
         (Just (New,    fs1), Nothing) -> (Noop fs1 New None,    Added     fs1 New None)
         (Just (Updated, fs1), Nothing) -> (Noop fs1 Updated None, Added     fs1 Updated None)
         (Just (Unchanged,   fs1), Nothing) -> (Noop fs1 Unchanged None,   Added     fs1 Unchanged New)
-        (Just (Deleted, _),    Nothing) -> (nop, nop)
+
+        -- side1 的基线里有、现在扫不到了，而 side2 **从未有过**这个条目：
+        -- 没有任何东西需要传播，但 side1 那条**过期的基线记录必须清掉**，否则每轮
+        -- 都会报一次 `deleted 1` 却没有任何动作（`Nothing to do.`）——永不自愈。
+        -- 实际碰到过：条目当初是"指向文件的链接"（按文件记录），后来改成"指向目录的
+        -- 链接"，文件阶段只把后者当目录（不记条目）→ 从此永远"删除"。
+        -- 编码成 @Noop fs1 Deleted None@，由 'resolveConflicts' 转成 RecordDelete
+        -- （纯记录：只改状态，**不动文件**）。
+        (Just (Deleted, fs1), Nothing) -> (Noop fs1 Deleted None, nop)
 
         ------------------------------------------------------------
         -- 仅 side2 有变化 → side1 需行动（对称）
@@ -135,7 +177,9 @@ classifyOne dm1 dm2 name =
         (Nothing, Just (New,    fs2)) -> (Added     fs2 None New,    Noop fs2 None New)
         (Nothing, Just (Updated, fs2)) -> (Added     fs2 None Updated, Noop fs2 None Updated)
         (Nothing, Just (Unchanged,   fs2)) -> (Added     fs2 New Unchanged,      Noop fs2 None Unchanged)
-        (Nothing, Just (Deleted, _))    -> (nop, nop)
+
+        -- 同上（对称）：side2 的过期条目，由 'resolveConflicts' 转成 RecordDelete
+        (Nothing, Just (Deleted, fs2))  -> (nop, Noop fs2 None Deleted)
 
         ------------------------------------------------------------
         -- 双方都有变化

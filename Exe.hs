@@ -27,7 +27,7 @@ import State
     , lastStateKind, appendAddedKind, appendDeletedKind, discardStateUnder, posixSecs
     , indexStates, dedup
     )
-import Sync (sync, SyncAction(..), resolveConflicts)
+import Sync (sync, SyncAction(..), resolveConflicts, SideStats(..))
 import Write
     ( HelperHandle(..), call, readMsg, hGetExactly, hPutFully
     , writeFileVerified, writeLinkVerified, readLinkContent
@@ -112,22 +112,23 @@ runSync srcKind profile root1 root2 = do
     -- 阶段 3：无条件先同步当前 profile 的 ignore 文件（较新一端覆盖较旧一端）。
     -- 两端 ignore 必须先一致，之后各自扫描文件集合才不会出现偏差。
     -- 此阶段之后 ignore 文件不再参与文件同步。
+    -- 输出：只在**真的复制了**才多一行；两端都没有 / 两边本来就一样 → 除了标题不说别的。
     putStrLn "\n[3/7] Syncing ignore rules ..."
     syncIgnoreFiles profile mHost1 path1 mHost2 path2
 
-    -- 阶段 4：同步软链接（先让两端的链接结构完全一致）
+    -- 阶段 4：同步软链接（先让两端的链接结构完全一致）。
+    -- 输出：只有真有动作（要用户确认）时才列清单 + 提问；结构调整一致时静默。
     syncLinkPhase profile mTag mHost1 path1 mHost2 path2
 
     -- 阶段 5：并行读取两端状态（各自按已统一的 ignore 过滤）
     --
     --   悬空链接不做特殊处理：扫描跟随链接时那里自然"什么都没有"，
     --   diff 该得到 Deleted 就得到 Deleted（删除动作本身有确认关卡）。
+    --   输出（用户 2026-09-22）：不统计条数 —— 想看变化看第 6 步的初步统计，
+    --   这一步只留阶段标题。
     putStrLn "\n[5/7] Reading states ..."
-    ((label1, (last1, cur1)), (label2, (last2, cur2))) <-
+    ((_label1, (last1, cur1)), (_label2, (last2, cur2))) <-
         concurrently (readSideK SKFile mTag mHost1 path1) (readSideK SKFile mTag mHost2 path2)
-
-    putStrLn $ "  root1 (" ++ label1 ++ "): " ++ show (length cur1) ++ " files (last: " ++ show (length last1) ++ ")"
-    putStrLn $ "  root2 (" ++ label2 ++ "): " ++ show (length cur2) ++ " files (last: " ++ show (length last2) ++ ")"
 
     -- 名字索引：名字 → 当前状态。后面（内容校验）只做 O(log n) 查询，
     -- 不再逐条线性重找（那是 O(n²)）。惰性：不会走到的路径就不会建索引。
@@ -138,8 +139,17 @@ runSync srcKind profile root1 root2 = do
     -- 只处理两端扫描出的普通文件；ignore 文件已在阶段 3、软链接已在阶段 4 处理。
     putStrLn "\n[6/7] Computing sync actions ..."
     -- 计算 + 消解形式冲突（同 size 同整数秒 mtime 的一对直接判作已同步）
-    let (pairs1, pairs2) = sync (last1, last2) (cur1, cur2)
+    let (stats1, pairs1, stats2, pairs2) = sync (last1, last2) (cur1, cur2)
         (_, pairs1', pairs2') = resolveConflicts pairs1 pairs2
+
+    -- 初步统计：两端各自相对自己基线的状态变化（冲突消解 / 内容校验之前），
+    -- 一端一行、四种都列（含 0；'None' = 该侧从未有过，不计）。
+    showStats "root1" stats1
+    showStats "root2" stats2
+
+    -- 初步结果：两端动作合并、按种类计数（同样是**内容校验之前**的口径）。
+    -- **恒定打印**（用户 2026-09-22）：就算五种全是 0，这一行也要在。
+    showActionResult pairs1' pairs2'
 
     let hasWork = any (isJust . snd) pairs1' || any (isJust . snd) pairs2'
     if not hasWork
@@ -356,35 +366,34 @@ askYesNo prompt = do
 --   * 自己一套 state 文件（@link_state@ / @link_added@ / @link_deleted@，行格式相同）。
 --
 --   先做这一步的目的是：之后文件阶段只按"路径"读写（对链接完全透明）。
+--
+--   输出（用户 2026-09-22 定）：**只说动作** —— 没有任何动作时除了阶段标题一个字不输出；
+--   有动作才由 'showSummary' 列出并问一次确认（不需要像文件阶段那样统计前后条数）。
 syncLinkPhase
     :: String -> Maybe String
     -> Maybe String -> FilePath -> Maybe String -> FilePath -> IO ()
 syncLinkPhase profile mTag mHost1 path1 mHost2 path2 = do
-    -- 阶段 3：同步软链接（先让两端的链接结构完全一致）
-    -- 阶段 4：同步软链接（先让两端的链接结构完全一致）
     putStrLn "\n[4/7] Syncing symlinks ..."
-    ((label1, (last1, cur1)), (label2, (last2, cur2))) <-
+    ((_label1, (last1, cur1)), (_label2, (last2, cur2))) <-
         concurrently (readSideK SKLink mTag mHost1 path1) (readSideK SKLink mTag mHost2 path2)
 
-    putStrLn $ "  root1 (" ++ label1 ++ "): " ++ show (length cur1) ++ " symlinks (last: " ++ show (length last1) ++ ")"
-    putStrLn $ "  root2 (" ++ label2 ++ "): " ++ show (length cur2) ++ " symlinks (last: " ++ show (length last2) ++ ")"
-
-    let (pairs1, pairs2) = sync (last1, last2) (cur1, cur2)
+    let (_, pairs1, _, pairs2) = sync (last1, last2) (cur1, cur2)
         (_, pairs1', pairs2') = resolveConflicts pairs1 pairs2
         hasWork = any (isJust . snd) pairs1' || any (isJust . snd) pairs2'
 
-    if not hasWork
-        then putStrLn "  (symlink structures already identical)"
-        else do
-            showSummary pairs1' pairs2'
-            yes <- askYesNo "\nApply symlink changes? [y/N] "
-            if not yes
-                then putStrLn "Aborted (symlink phase)."
-                else withHelpers mHost1 path1 mHost2 path2 profile $ \side1 side2 -> do
-                        execute SKLink mTag side1 side2 pairs1'
-                        discardLocal side1 mTag pairs1'
-                        execute SKLink mTag side2 side1 pairs2'
-                        discardLocal side2 mTag pairs2'
+    -- 输出约定（用户 2026-09-22）：**只有真的有动作（要确认）时才列出来并提问**。
+    -- 不统计两端软链接的前后条数（那是文件阶段的口径，链接阶段不需要），
+    -- 链接结构本来就一致时这里一个字都不说。
+    when hasWork $ do
+        showSummary pairs1' pairs2'
+        yes <- askYesNo "\nApply symlink changes? [y/N] "
+        if not yes
+            then putStrLn "Aborted (symlink phase)."
+            else withHelpers mHost1 path1 mHost2 path2 profile $ \side1 side2 -> do
+                    execute SKLink mTag side1 side2 pairs1'
+                    discardLocal side1 mTag pairs1'
+                    execute SKLink mTag side2 side1 pairs2'
+                    discardLocal side2 mTag pairs2'
 
 -- | 链接阶段刚在某端建/改了一个链接：把该端这个链接**子树**下的文件基线条目作废。
 --
@@ -461,25 +470,28 @@ syncIgnoreFiles profile mHost1 path1 mHost2 path2 =
         syncIgnore profile side1 side2
 
 -- | 两端 ignore 的合并决策：
---   * 都无 → 无事
+--   * 都无 → 无事（**静默**）
 --   * 仅一端有 → 复制到另一端
---   * 都有且内容相同 → 跳过
+--   * 都有且内容相同 → 跳过（**静默**）
 --   * 都有但内容不同 → 较新（mtime 大）的一端覆盖另一端；
 --     mtime 相同则告警并采用 root1
+--
+--   输出约定（用户 2026-09-22）：**只有真的做了动作才打印**（即复制那一行）。
+--   "两边都没有"和"两边一样"都不是动作，一个字都不说。
 syncIgnore :: String -> Side -> Side -> IO ()
 syncIgnore profile sideA sideB = do
     mA <- sideIgnoreMeta sideA profile
     mB <- sideIgnoreMeta sideB profile
     case (mA, mB) of
         (Nothing, Nothing) ->
-            putStrLn "  (no ignore file on root1 or root2)"
+            return ()
         (Just a, Nothing) ->
             copyIgnore profile sideA sideB "root2" a
         (Nothing, Just b) ->
             copyIgnore profile sideB sideA "root1" b
         (Just a, Just b)
             | hashOf a == hashOf b ->
-                putStrLn "  ignore identical on root1 and root2"
+                return ()
             | otherwise ->
                 case compare (mtOf a) (mtOf b) of
                     GT -> copyIgnore profile sideA sideB "root2" a
@@ -760,6 +772,43 @@ hashRemote kind hh relPath = do
 -- 其他
 -- ============================================================================
 
+-- | 第 6 步的初步统计：一端一行，四种状态都列（含 0）。
+--
+--   两端地址第 0 步已经列过（@root1 = …@ / @root2 = …@），这里不再重复，只写
+--   @root1@ / @root2@（用户 2026-09-22 要求）。
+--   统计内容是**每侧相对自己基线**的状态变化（'diffOneSide' 的直接结果），
+--   早于冲突消解与内容校验，所以叫"初步"。
+--   四种 = new / updated / unchanged / deleted；'None' 表示该侧从未有过该条目，
+--   不属于它的"自身状态变化"，故不列。
+showStats :: String -> SideStats -> IO ()
+showStats which s = putStrLn $
+    "  " ++ which ++ ": new "       ++ show (statNew s)
+        ++ ", updated "   ++ show (statUpdated s)
+        ++ ", unchanged " ++ show (statUnchanged s)
+        ++ ", deleted "   ++ show (statDeleted s)
+
+-- | 第 6 步的**初步结果**：把两端算出来的动作按种类计数（紧跟在两端状态统计之后）。
+--
+--   种类就是 'SyncAction' 的 5 个构造子（无动作的 'Nothing' 不是种类，不计）：
+--   receive（要接收）/ delete（要删除）/ conflict（冲突，跳过）/
+--   record-add（已同步，只记 added）/ record-delete（两端已删，只记 deleted）。
+--   两端**合并计数**、五种都列（含 0）。计数按**名字去重**：一个真冲突在 pairs1 /
+--   pairs2 里各有一条（同一个文件），它只算 1 个（与 'showSummary' 的 "N conflicts" 同口径）。
+--
+--   这是"初步"的：内容校验（接下来的 Extra content check）会把一部分
+--   receive / conflict 改成 record-add，所以这里的数字可能比第 7 步的摘要注意大。
+--   恒定打印（全 0 也打），位置在两端状态统计之后、`Nothing to do.` / 内容校验之前。
+showActionResult
+    :: [(FileChange, Maybe SyncAction)] -> [(FileChange, Maybe SyncAction)] -> IO ()
+showActionResult pairs1 pairs2 = do
+    let entries = [ (changeName fc, a) | (fc, Just a) <- pairs1 ++ pairs2 ]
+        n a = length (dedup [ f | (f, a') <- entries, a' == a ])
+    putStrLn $ "  result: " ++ show (n Receive)       ++ " receive"
+                 ++ ", "      ++ show (n Remove)         ++ " delete"
+                 ++ ", "      ++ show (n Unsolvable)    ++ " conflict"
+                 ++ ", "      ++ show (n RecordAdd)      ++ " record-add"
+                 ++ ", "      ++ show (n RecordDelete)   ++ " record-delete"
+
 showSummary :: [(FileChange, Maybe SyncAction)] -> [(FileChange, Maybe SyncAction)] -> IO ()
 showSummary pairs1 pairs2 = do
     let add1 = [ (f, d1, d2) | (Added    fs d1 d2, Just Receive) <- pairs1, let f = filename fs ]
@@ -791,7 +840,7 @@ showSummary pairs1 pairs2 = do
         forM_ recAdds $ \f ->
             putStrLn $ "  - " ++ f
     when (not (null recDels)) $ do
-        putStrLn "\nAlready deleted on both sides (will record as deleted):"
+        putStrLn "\nAlready deleted (will record as deleted):"
         forM_ recDels $ \f ->
             putStrLn $ "  - " ++ f
     when (not (null conf)) $ do
