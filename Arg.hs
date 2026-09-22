@@ -22,9 +22,10 @@ data Root
     | Remote !String !FilePath   -- host, path
     deriving (Show, Eq)
 
--- | 显示名称
+-- | 显示名称：就是用户写出来的地址形式 —— 本地就是路径本身，远程是 host:path。
+--   （没有 @local:/path@ 这种地址表示法，本地端不加任何前缀。）
 rootLabel :: Root -> String
-rootLabel (Local path)       = "local:" ++ path
+rootLabel (Local path)       = path
 rootLabel (Remote host path) = host ++ ":" ++ path
 
 -- | 从字符串解析 Root

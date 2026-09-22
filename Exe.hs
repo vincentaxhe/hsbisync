@@ -18,7 +18,7 @@ import System.Posix.User (getEffectiveUserName)
 
 import qualified Data.ByteString as BS
 
-import Connect (destroyHelper, prepareRemotes, spawnHelper)
+import Connect (destroyHelper, handshakeInfo, prepareRemotes, spawnHelper)
 import State
     ( FileState(..), FileChange(..), StateKind(..)
     , parseStateValue, statRel
@@ -52,29 +52,37 @@ runSync profile root1 root2 = do
         (mHost2, path2) = case root2 of Local p -> (Nothing, p); Remote h p -> (Just h, p)
         mTag = Just profile
 
-    -- 阶段 0：明确两端地址
+    -- 阶段 0：先明确两端地址（本地端就是一个路径，没有 local: 这种写法）
     putStrLn $ "\n  root1 = " ++ rootLabel root1
     putStrLn $ "  root2 = " ++ rootLabel root2
     putStrLn $ "  profile: " ++ profile
 
-    -- 准备工作：远端握手（hsbisync 在哪 + 它自报的真实路径/家目录）。
-    -- 入口（Main）在写 repo 之前已经握过一次，这里命中缓存不会重复 ssh/打印。
+    -- 阶段 1：与远端握手（hsbisync 在远端的位置 + 它自报的真实路径与家目录）。
+    -- 入口（Main）在写 repo 之前已经握过一次，这里命中缓存不会重复 ssh；
+    -- 结果显示放在这里（而不是准备工作里），是为了让上面的地址块先出现。
     prepareRemotes profile [root1, root2]
+    infos <- handshakeInfo [root1, root2]
+    let showHandshake :: (String, Maybe String, Maybe FilePath) -> IO ()
+        showHandshake (host, mHome, mExe) = do
+            putStrLn $ "\n[1/6] Handshake " ++ host ++ " ..."
+            putStrLn $ "  home     = " ++ fromMaybe "?" mHome
+            putStrLn $ "  hsbisync = " ++ fromMaybe "(not reported)" mExe
+    mapM_ showHandshake infos
 
-    -- 阶段 1：无条件先同步当前 profile 的 ignore 文件（较新一端覆盖较旧一端）。
+    -- 阶段 2：无条件先同步当前 profile 的 ignore 文件（较新一端覆盖较旧一端）。
     -- 两端 ignore 必须先一致，之后各自扫描文件集合才不会出现偏差。
     -- 此阶段之后 ignore 文件不再参与文件同步。
-    putStrLn "\n[1/5] Syncing ignore rules ..."
+    putStrLn "\n[2/6] Syncing ignore rules ..."
     syncIgnoreFiles profile mHost1 path1 mHost2 path2
 
-    -- 阶段 2：同步软链接（先让两端的链接结构完全一致）
+    -- 阶段 3：同步软链接（先让两端的链接结构完全一致）
     syncLinkPhase profile mTag mHost1 path1 mHost2 path2
 
-    -- 阶段 3：并行读取两端状态（各自按已统一的 ignore 过滤）
+    -- 阶段 4：并行读取两端状态（各自按已统一的 ignore 过滤）
     --
     --   悬空链接不做特殊处理：扫描跟随链接时那里自然"什么都没有"，
     --   diff 该得到 Deleted 就得到 Deleted（删除动作本身有确认关卡）。
-    putStrLn "\n[3/5] Reading states ..."
+    putStrLn "\n[4/6] Reading states ..."
     ((label1, (last1, cur1)), (label2, (last2, cur2))) <-
         concurrently (readSideK SKFile mTag mHost1 path1) (readSideK SKFile mTag mHost2 path2)
 
@@ -86,9 +94,9 @@ runSync profile root1 root2 = do
     let idx1 = indexStates cur1
         idx2 = indexStates cur2
 
-    -- 阶段 4：计算最终动作（diff + 形式冲突消解 + 额外内容校验）。
-    -- 只处理两端扫描出的普通文件；ignore 文件已在阶段 1、软链接已在阶段 2 处理。
-    putStrLn "\n[4/5] Computing sync actions ..."
+    -- 阶段 5：计算最终动作（diff + 形式冲突消解 + 额外内容校验）。
+    -- 只处理两端扫描出的普通文件；ignore 文件已在阶段 2、软链接已在阶段 3 处理。
+    putStrLn "\n[5/6] Computing sync actions ..."
     -- 计算 + 消解形式冲突（同 size 同整数秒 mtime 的一对直接判作已同步）
     let (pairs1, pairs2) = sync (last1, last2) (cur1, cur2)
         (_, pairs1', pairs2') = resolveConflicts pairs1 pairs2
@@ -101,8 +109,8 @@ runSync profile root1 root2 = do
                 -- 一致的“只更新属性并记录”，不一致的维持原判（见 'verifySameSizeCandidates'）。
                 (pairs1'', pairs2'') <- verifySameSizeCandidates idx1 idx2 side1 side2 pairs1' pairs2'
 
-                -- 阶段 5：列出最终动作、确认、执行（真正的传输与记录）
-                putStrLn "\n[5/5] Sync and record files ..."
+                -- 阶段 6：列出最终动作、确认、执行（真正的传输与记录）
+                putStrLn "\n[6/6] Sync and record files ..."
                 showSummary pairs1'' pairs2''
 
                 yes <- askYesNo "\nProceed? [y/N] "
@@ -312,7 +320,8 @@ syncLinkPhase
     :: String -> Maybe String
     -> Maybe String -> FilePath -> Maybe String -> FilePath -> IO ()
 syncLinkPhase profile mTag mHost1 path1 mHost2 path2 = do
-    putStrLn "\n[2/5] Syncing symlinks ..."
+    -- 阶段 3：同步软链接（先让两端的链接结构完全一致）
+    putStrLn "\n[3/6] Syncing symlinks ..."
     ((label1, (last1, cur1)), (label2, (last2, cur2))) <-
         concurrently (readSideK SKLink mTag mHost1 path1) (readSideK SKLink mTag mHost2 path2)
 

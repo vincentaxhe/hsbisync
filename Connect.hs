@@ -10,6 +10,7 @@ module Connect where
 
 import Control.Concurrent.MVar (MVar, modifyMVar_, newMVar, readMVar)
 import Control.Exception (IOException, catch)
+import Control.Monad (forM, forM_)
 import Data.List (nubBy)
 import Data.Map (Map)
 import Data.Maybe (fromMaybe)
@@ -111,15 +112,15 @@ cachedRemoteEnv host = Map.lookup host <$> readMVar remoteEnvs
 rememberRemoteEnv :: String -> RemoteEnv -> IO ()
 rememberRemoteEnv host re = modifyMVar_ remoteEnvs (return . Map.insert host re)
 
--- | 准备阶段：为每个远程端各做一次握手，并把结果打印出来；本地端跳过。
---   可重复调用：同一进程内只握手一次（之后不再 ssh、也不再打印）。
+-- | 准备阶段：为每个远程端各做一次握手（静默，结果进缓存）；本地端跳过。
+--   可重复调用：同一进程内只握手一次（之后不再 ssh）。显示用 'handshakeInfo'。
 prepareRemotes :: String -> [Root] -> IO ()
 prepareRemotes profile roots =
     mapM_ (uncurry (prepareRemote profile)) (nubBy sameHost [ (h, p) | Remote h p <- roots ])
   where
     sameHost (a, _) (b, _) = a == b
 
--- | 对单个远端握手一次并打印结果。
+-- | 对单个远端握手一次（静默：结果只进缓存，由调用方决定怎么显示）。
 --
 --   握手 = 让远端登录 shell 说出 hsbisync 在哪（'remoteExeLookup'），然后用这个
 --   绝对路径把它叫起来；它会自报自己的真实路径与家目录。
@@ -131,12 +132,21 @@ prepareRemote profile host rootPath = do
     case known of
         Just _   -> return ()          -- 同一进程内已经握过手
         Nothing  -> do
-            putStrLn $ "\n  handshake " ++ host ++ " ..."
             hh <- spawnHelper host rootPath profile
             destroyHelper hh
-            env' <- fromMaybe (RemoteEnv Nothing Nothing) <$> cachedRemoteEnv host
-            putStrLn $ "    home     = " ++ fromMaybe "?" (reHome env')
-            putStrLn $ "    hsbisync = " ++ fromMaybe "(not reported)" (reExe env')
+
+-- | 握手结果（阶段 1 的显示数据）：每个远程端一项 @(host, 家目录, hsbisync 路径)@。
+--
+--   只列远程端（本地端没有远端可握手，直接跳过），同一个 host 只出现一次。
+--   入口（Main）可能已经握过手（写 repo 需要），这里直接读缓存、不再 ssh；
+--   显示与握手分开，是为了保证"先显示两端地址、再显示第 1 步"的顺序稳定。
+handshakeInfo :: [Root] -> IO [(String, Maybe String, Maybe FilePath)]
+handshakeInfo roots =
+    forM (nubBy sameHost [ (h, p) | Remote h p <- roots ]) $ \(h, _) -> do
+        env' <- fromMaybe (RemoteEnv Nothing Nothing) <$> cachedRemoteEnv h
+        return (h, reHome env', reExe env')
+  where
+    sameHost (a, _) (b, _) = a == b
 
 -- | 用来启动远端 helper 的绝对路径：
 --   ① 缓存里有（之前查过 / helper 自报过）→ 直接用；
