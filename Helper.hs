@@ -4,7 +4,7 @@ import Control.Exception (ErrorCall, IOException, catch, displayException)
 import Control.Monad (unless, when)
 import Data.Bits ((.&.))
 import Data.Maybe (fromMaybe, listToMaybe)
-import System.Directory (createDirectoryIfMissing, doesFileExist)
+import System.Directory (doesFileExist)
 import System.Environment (getExecutablePath, lookupEnv)
 import System.FilePath ((</>))
 import System.IO
@@ -50,9 +50,18 @@ import qualified Msg
 --   hSetBinaryMode/hSetEncoding 来回切换的坑，也不受远端 locale 影响。
 runHelper :: FilePath -> Maybe String -> IO ()
 runHelper root mTag = do
-    let stateDir = root </> ".bisync" </> maybe "" id mTag
-    createDirectoryIfMissing True stateDir
-
+    -- 注意：**这里绝不创建任何目录**。
+    --
+    --   以前这里有一句 createDirectoryIfMissing True <root>/.bisync/<profile>，
+    --   而它是**递归**创建 —— 等于：只要跟远端握一次手，同步根（连同其父目录、
+    --   连同 .bisync）就被建出来了。后果有两层：
+    --   * 第 2 步"检查/创建同步目录"永远查不出"目录不存在"，"created root" 再也
+    --     不会出现（用户看到的顺序是：握手 → 说好的创建 → 结果什么都没做）；
+    --   * 更糟的是它绕过了"只建一层"的规则（见 'Arg.ensureRoot'），路径写错时
+    --     会凭空造出一整棵树。
+    --   状态目录该由真正要写它的地方按需创建：'State.writeEntries' /
+    --   'State.appendAddedKind' / 'State.appendDeletedKind' / 'writeRepoFile' 都自带
+    --   createDirectoryIfMissing，只读路径（当前扫描、读 last、GETIGNORE）不需要它。
     hSetBinaryMode stdout True
     hSetBinaryMode stdin  True
     hSetBuffering stdout LineBuffering
@@ -301,7 +310,8 @@ cmdGetIgnore root mTag = do
 --   因此 host 部分由本端补上，主控端只提供用户名与路径。
 --   取不到（非 ssh 场景，如本地测试用的假 ssh）就不写。
 --
---   响应：{"addr":…}（写入成功）或 {"noclient":true}（取不到登录方地址，只提示）
+--   响应：{"addr":…} 或 {"addr":…,"unchanged":true}（已经是这个地址，主控端就不打印）
+--         或 {"noclient":true}（取不到登录方地址，只提示）
 cmdPutRepo :: FilePath -> Maybe String -> Msg.Value -> IO ()
 cmdPutRepo root mTag req =
     case (Msg.fieldStr "user" req, Msg.fieldStr "path" req) of
@@ -312,9 +322,22 @@ cmdPutRepo root mTag req =
                 Just ip -> do
                     let repoFile = root </> ".bisync" </> fromMaybe "" mTag </> "repo"
                         addr     = user ++ "@" ++ ip ++ ":" ++ path
-                    writeRepoFile repoFile addr
-                    replyOk [("addr", Msg.str addr)]
+                    same <- repoAlready repoFile addr
+                    if same
+                        then -- 内容没变：不写、也不让主控端打印（第 2 步只报有变化的动作）
+                            replyOk [("addr", Msg.str addr), ("unchanged", Msg.JBool True)]
+                        else do
+                            writeRepoFile repoFile addr
+                            replyOk [("addr", Msg.str addr)]
         _ -> replyErr "putrepo: missing user/path"
+
+-- | 现有 repo 文件是否已经是这个地址（比字节，忽略首尾空白/换行）
+repoAlready :: FilePath -> String -> IO Bool
+repoAlready fp addr = do
+    e <- doesFileExist fp
+    if not e
+        then return False
+        else (== B8.pack addr) . B8.strip <$> BS.readFile fp
 
 -- | 登录方（主控端）地址，取自 sshd 设置的环境变量。
 --   SSH_CONNECTION 是现代 sshd 的标准变量；SSH_CLIENT 是旧变量，

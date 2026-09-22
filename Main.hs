@@ -2,7 +2,7 @@ module Main where
 
 import Control.Monad (forM_, unless)
 import System.Directory
-    ( canonicalizePath, doesDirectoryExist, doesFileExist
+    ( doesDirectoryExist, doesFileExist
     , getCurrentDirectory, listDirectory
     )
 import System.Environment (getArgs)
@@ -15,16 +15,14 @@ import qualified Data.Text as T (unpack)
 
 import GHC.IO.Encoding (setFileSystemEncoding, setLocaleEncoding, utf8)
 
-import Arg (Root(..), parseRoot, parseSyncThree, requireRoot)
-import Connect (prepareRemotes)
-import Exe (recordRemoteRepo, runSync)
+import Arg (Root(..), parseRoot, parseSyncThree)
+import Exe (RootSource(..), printBanner, runSync)
 import Helper (runHelper)
 import State
     ( FileState(..), DiffState(..)
     , readLastState, currentState, diffOneSide
     , readEntries, bsLines
     )
-import Write (writeRepoFile)
 
 -- ============================================================================
 -- 入口
@@ -107,59 +105,22 @@ dropPrefix prefix s
 syncCmd :: [String] -> IO ()
 syncCmd [profile] = syncFromRepo profile
 syncCmd args@[_, _, _] = do
+    -- 标题总是最前面（任何检查/握手/建目录之前）
+    printBanner
     (profile, root1, root2) <- parseSyncThree args
-    -- 准备工作：先与远程端握手（问出 hsbisync 在远端的位置，让它自报真实路径），
-    -- 远端没有/起不来时在这里就报错，不会跑到中途才失败。
-    prepareRemotes profile [root1, root2]
-    persistRepo profile root1 root2   -- 记录对端地址，供以后 hsbisync sync <profile>
-    runSync profile root1 root2
+    -- 后面全交给 runSync 的 7 步：握手 → 建目录+写 repo → ignore → 链接 → 状态 → 计算 → 执行
+    runSync RootsGiven profile root1 root2
 syncCmd _ = die "Usage: hsbisync sync <profile> [<root1> <root2>]"
-
--- ============================================================================
--- repo 持久化：显式双端 sync 时把对端地址写入本地仓库的 repo 文件
--- ============================================================================
-
--- | 显式双端同步时，把对端地址强制写进双方的 .bisync/<profile>/repo，
---   这样之后在任一端直接 hsbisync sync <profile> 都能免参同步。
---   既然命令里已给出完整路径，它就是权威输入：直接覆盖，不与旧内容比较。
---   * 两端都是本地 → 两端互写对方的绝对路径（本机 Local 路径不经 shell，
---     不能用相对路径）
---   * 一端本地一端远程 → 本地端写 host:<远端路径>（沿用你输入的原样路径）；
---     远程端写 <本机用户>@<本机IP>:<本机路径>——IP 由远端 helper 从 sshd 的
---     SSH_CONNECTION 里取，路径按家目录简写（见 'recordRemoteRepo'）
---   * 两端都远程 → 都跳过（互相的地址在对方看来未必可用）
-persistRepo :: String -> Root -> Root -> IO ()
-persistRepo profile r1 r2 =
-    case (r1, r2) of
-        (Local p1, Local p2) -> do
-            a1 <- canonicalizePath p1
-            a2 <- canonicalizePath p2
-            writeRepo profile p1 a2
-            writeRepo profile p2 a1
-        (Local p1, Remote h2 p2) -> do
-            writeRepo profile p1 (remoteAddr r2)
-            recordRemoteRepo h2 p2 profile p1
-        (Remote h1 p1, Local p2) -> do
-            writeRepo profile p2 (remoteAddr r1)
-            recordRemoteRepo h1 p1 profile p2
-        (Remote _ _, Remote _ _) -> return ()
-  where
-    -- 仅在 r1/r2 为 Remote 时调用
-    remoteAddr (Remote h p) = h ++ ":" ++ p
-    remoteAddr (Local _)    = ""
-
--- | 把对端地址覆盖写入某个本地仓库
-writeRepo :: String -> FilePath -> String -> IO ()
-writeRepo profile localPath addr = do
-    writeRepoFile (localPath </> ".bisync" </> profile </> "repo") addr
-    putStrLn $ "  " ++ localPath ++ ": repo = " ++ addr ++ "  [OK]"
 
 -- ============================================================================
 -- sync (profile only) — 读 .bisync/<profile>/repo，与记录的对端同步
 -- ============================================================================
 
+-- | 只给 profile：对端地址从本仓库的 @.bisync/\<profile\>/repo@ 读。
+--   这种模式下目录**不创建、repo 也不重写**：第 2 步只检查两端目录存在。
 syncFromRepo :: String -> IO ()
 syncFromRepo profile = do
+    printBanner                                 -- 标题最快，连读 repo 之前就出
     cwd <- getCurrentDirectory
     let repoFile = cwd </> ".bisync" </> profile </> "repo"
     exists <- doesFileExist repoFile
@@ -171,10 +132,7 @@ syncFromRepo profile = do
     peer <- filter (not . (`elem` "\n\r")) <$> readFile repoFile
     let root1 = Local cwd          -- 当前目录，必然存在
         root2 = parseRoot peer
-    -- profile 免参同步：对端地址必须已存在，不自动创建目录
-    requireRoot root2
-    prepareRemotes profile [root1, root2]   -- 准备工作：与远端握手（hsbisync 在哪）
-    runSync profile root1 root2
+    runSync RootsFromRepo profile root1 root2
 
 -- ============================================================================
 -- log 子命令

@@ -7,7 +7,7 @@ import Data.Char (toLower)
 import Data.Maybe (fromMaybe, isJust)
 import qualified Data.Map as Map
 import qualified Data.Set as Set
-import System.Directory (doesFileExist)
+import System.Directory (canonicalizePath, doesFileExist)
 import System.FilePath ((</>))
 import System.IO
     ( hFlush, stdout, stdin
@@ -17,6 +17,7 @@ import System.IO
 import System.Posix.User (getEffectiveUserName)
 
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Char8 as B8
 
 import Connect (destroyHelper, handshakeInfo, prepareRemotes, spawnHelper)
 import State
@@ -31,23 +32,48 @@ import Write
     ( HelperHandle(..), call, readMsg, hGetExactly, hPutFully
     , writeFileVerified, writeLinkVerified, readLinkContent
     , hashBytes, removeFileSafe, removeLinkSafe, getIgnoreRemote, setMtimeOnly
+    , writeRepoFile
     )
 import qualified Msg
 import Arg
     ( Root(..)
-    , formatOwnPath, rootLabel
+    , ensureRoot, formatOwnPath, requireRoot, rootLabel
     )
 
 -- ============================================================================
 -- 统一入口
 -- ============================================================================
 
-runSync :: String -> Root -> Root -> IO ()
-runSync profile root1 root2 = do
+-- | 两个同步地址从哪来 —— 决定第 2 步做什么
+--
+--   * 'RootsGiven'   —— 命令行写明了两个地址（hsbisync sync <profile> <r1> <r2>）：
+--     缺目录就创建，并把对端地址写进双方的 repo，供以后免参同步；
+--   * 'RootsFromRepo' —— 只给了 profile（地址来自本仓库的 repo 文件）：
+--     不建、不写，只要求两端目录都真实存在。
+data RootSource = RootsGiven | RootsFromRepo
+    deriving (Eq, Show)
+
+-- | 程序标题：总是最先打印（在任何检查、握手、建目录之前）
+printBanner :: IO ()
+printBanner = do
     putStrLn "==================================="
     putStrLn "  hsbisync - Bidirectional Sync"
     putStrLn "==================================="
 
+-- | 同步主流程：标题之后一共 **7 步**
+--
+--   0. （不编号）先明确两端地址与 profile
+--   1. 握手：问出远端 hsbisync 在哪、让它自报真实路径与家目录
+--   2. 同步目录与 repo：写明地址 → 建目录 + 写 repo；只给 profile → 只检查存在
+--   3. 同步 ignore 规则（无条件先对齐，之后 ignore 不再参与文件同步）
+--   4. 同步软链接结构
+--   5. 读两端状态
+--   6. 计算同步动作（diff + 冲突消解 + 额外内容校验）
+--   7. 列动作、确认、执行（真正的传输与记录）
+--
+--   走到第 3 步时保证：两个同步目录一定存在（第 2 步要么建了、要么查了）。
+runSync :: RootSource -> String -> Root -> Root -> IO ()
+runSync srcKind profile root1 root2 = do
     let (mHost1, path1) = case root1 of Local p -> (Nothing, p); Remote h p -> (Just h, p)
         (mHost2, path2) = case root2 of Local p -> (Nothing, p); Remote h p -> (Just h, p)
         mTag = Just profile
@@ -58,31 +84,45 @@ runSync profile root1 root2 = do
     putStrLn $ "  profile: " ++ profile
 
     -- 阶段 1：与远端握手（hsbisync 在远端的位置 + 它自报的真实路径与家目录）。
-    -- 入口（Main）在写 repo 之前已经握过一次，这里命中缓存不会重复 ssh；
-    -- 结果显示放在这里（而不是准备工作里），是为了让上面的地址块先出现。
+    -- 总在最前面：第 2 步写远端 repo 要用到它自报的绝对路径。命中缓存时不重复 ssh。
     prepareRemotes profile [root1, root2]
     infos <- handshakeInfo [root1, root2]
     let showHandshake :: (String, Maybe String, Maybe FilePath) -> IO ()
         showHandshake (host, mHome, mExe) = do
-            putStrLn $ "\n[1/6] Handshake " ++ host ++ " ..."
+            putStrLn $ "\n[1/7] Handshake " ++ host ++ " ..."
             putStrLn $ "  home     = " ++ fromMaybe "?" mHome
             putStrLn $ "  hsbisync = " ++ fromMaybe "(not reported)" mExe
     mapM_ showHandshake infos
 
-    -- 阶段 2：无条件先同步当前 profile 的 ignore 文件（较新一端覆盖较旧一端）。
+    -- 阶段 2：确保同步需要的东西就绪（同步目录 / .bisync/<profile> / repo）
+    --
+    --   写明地址 → 缺目录就建（只建一层，见 'ensureRoot'）+ 写 repo；
+    --   只给 profile → 只查两端目录存在，不建不写。
+    --   **只打印有实际变化的动作**：检查无误就静默（.bisync/<profile> 由写 repo 顺手建）。
+    putStrLn "\n[2/7] Ensure sync needs ..."
+    case srcKind of
+        RootsGiven -> do
+            ensureRoot root1
+            ensureRoot root2
+            persistRepo profile root1 root2
+        RootsFromRepo -> do
+            requireRoot root1
+            requireRoot root2
+
+    -- 阶段 3：无条件先同步当前 profile 的 ignore 文件（较新一端覆盖较旧一端）。
     -- 两端 ignore 必须先一致，之后各自扫描文件集合才不会出现偏差。
     -- 此阶段之后 ignore 文件不再参与文件同步。
-    putStrLn "\n[2/6] Syncing ignore rules ..."
+    putStrLn "\n[3/7] Syncing ignore rules ..."
     syncIgnoreFiles profile mHost1 path1 mHost2 path2
 
-    -- 阶段 3：同步软链接（先让两端的链接结构完全一致）
+    -- 阶段 4：同步软链接（先让两端的链接结构完全一致）
     syncLinkPhase profile mTag mHost1 path1 mHost2 path2
 
-    -- 阶段 4：并行读取两端状态（各自按已统一的 ignore 过滤）
+    -- 阶段 5：并行读取两端状态（各自按已统一的 ignore 过滤）
     --
     --   悬空链接不做特殊处理：扫描跟随链接时那里自然"什么都没有"，
     --   diff 该得到 Deleted 就得到 Deleted（删除动作本身有确认关卡）。
-    putStrLn "\n[4/6] Reading states ..."
+    putStrLn "\n[5/7] Reading states ..."
     ((label1, (last1, cur1)), (label2, (last2, cur2))) <-
         concurrently (readSideK SKFile mTag mHost1 path1) (readSideK SKFile mTag mHost2 path2)
 
@@ -94,9 +134,9 @@ runSync profile root1 root2 = do
     let idx1 = indexStates cur1
         idx2 = indexStates cur2
 
-    -- 阶段 5：计算最终动作（diff + 形式冲突消解 + 额外内容校验）。
-    -- 只处理两端扫描出的普通文件；ignore 文件已在阶段 2、软链接已在阶段 3 处理。
-    putStrLn "\n[5/6] Computing sync actions ..."
+    -- 阶段 6：计算最终动作（diff + 形式冲突消解 + 额外内容校验）。
+    -- 只处理两端扫描出的普通文件；ignore 文件已在阶段 3、软链接已在阶段 4 处理。
+    putStrLn "\n[6/7] Computing sync actions ..."
     -- 计算 + 消解形式冲突（同 size 同整数秒 mtime 的一对直接判作已同步）
     let (pairs1, pairs2) = sync (last1, last2) (cur1, cur2)
         (_, pairs1', pairs2') = resolveConflicts pairs1 pairs2
@@ -109,8 +149,8 @@ runSync profile root1 root2 = do
                 -- 一致的“只更新属性并记录”，不一致的维持原判（见 'verifySameSizeCandidates'）。
                 (pairs1'', pairs2'') <- verifySameSizeCandidates idx1 idx2 side1 side2 pairs1' pairs2'
 
-                -- 阶段 6：列出最终动作、确认、执行（真正的传输与记录）
-                putStrLn "\n[6/6] Sync and record files ..."
+                -- 阶段 7：列出最终动作、确认、执行（真正的传输与记录）
+                putStrLn "\n[7/7] Sync and record files ..."
                 showSummary pairs1'' pairs2''
 
                 yes <- askYesNo "\nProceed? [y/N] "
@@ -321,7 +361,8 @@ syncLinkPhase
     -> Maybe String -> FilePath -> Maybe String -> FilePath -> IO ()
 syncLinkPhase profile mTag mHost1 path1 mHost2 path2 = do
     -- 阶段 3：同步软链接（先让两端的链接结构完全一致）
-    putStrLn "\n[3/6] Syncing symlinks ..."
+    -- 阶段 4：同步软链接（先让两端的链接结构完全一致）
+    putStrLn "\n[4/7] Syncing symlinks ..."
     ((label1, (last1, cur1)), (label2, (last2, cur2))) <-
         concurrently (readSideK SKLink mTag mHost1 path1) (readSideK SKLink mTag mHost2 path2)
 
@@ -761,6 +802,58 @@ showSummary pairs1 pairs2 = do
     putStrLn $ "\nTotal: " ++ show total ++ " operations, " ++ show (length conf) ++ " conflicts"
 
 -- ============================================================================
+-- repo：显式双端同步时把对端地址写下来（供以后 hsbisync sync <profile> 免参同步）
+-- ============================================================================
+
+-- | 把对端地址强制写进双方的 @.bisync/\<profile\>/repo@。
+--
+--   既然命令里已给出完整路径，它就是权威输入：直接覆盖，不与旧内容比较。
+--   * 两端都是本地 → 两端互写对方的绝对路径（本机 Local 路径不经 shell，
+--     不能用相对路径）
+--   * 一端本地一端远程 → 本地端写 @host:远端路径@（沿用输入的原样路径）；
+--     远程端写 @本机用户@本机IP:本机路径@ —— IP 由远端 helper 从 sshd 的
+--     SSH_CONNECTION 里取，路径按家目录简写（见 'recordRemoteRepo'）
+--   * 两端都远程 → 都跳过（互相的地址在对方看来未必可用）
+persistRepo :: String -> Root -> Root -> IO ()
+persistRepo profile r1 r2 =
+    case (r1, r2) of
+        (Local p1, Local p2) -> do
+            a1 <- canonicalizePath p1
+            a2 <- canonicalizePath p2
+            writeRepo profile p1 a2
+            writeRepo profile p2 a1
+        (Local p1, Remote h2 p2) -> do
+            writeRepo profile p1 (remoteAddr r2)
+            recordRemoteRepo h2 p2 profile p1
+        (Remote h1 p1, Local p2) -> do
+            writeRepo profile p2 (remoteAddr r1)
+            recordRemoteRepo h1 p1 profile p2
+        (Remote _ _, Remote _ _) -> return ()
+  where
+    -- 仅在 r1/r2 为 Remote 时调用
+    remoteAddr (Remote h p) = h ++ ":" ++ p
+    remoteAddr (Local _)    = ""
+
+-- | 把对端地址写进某个本地仓库：**只在内容真会变时**才写 + 打印。
+--
+--   第 2 步的约定（用户 2026-09-22）：只打印有实际变化的动作，检查无误就静默 ——
+--   所以先看一眼现有 repo，已经是这个地址就什么都不做。
+writeRepo :: String -> FilePath -> String -> IO ()
+writeRepo profile localPath addr = do
+    let fp = localPath </> ".bisync" </> profile </> "repo"
+        want = B8.pack addr
+    same <- do
+        e <- doesFileExist fp
+        if not e
+            then return False
+            else (== want) . B8.strip <$> BS.readFile fp
+    if same
+        then return ()
+        else do
+            writeRepoFile fp addr
+            putStrLn $ "  " ++ localPath ++ ": repo = " ++ addr ++ "  [OK]"
+
+-- ============================================================================
 -- repo 记录：让远端也写下"本机（登录方）地址"
 -- ============================================================================
 
@@ -791,10 +884,17 @@ recordRemoteRepo host remotePath profile ownPath = do
             | Just True <- Msg.asBool =<< Msg.field "noclient" v ->
                 note "not written: cannot tell which address the peer sees us as (SSH_CONNECTION unset)"
             | Just addr <- Msg.fieldStr "addr" v ->
-                putStrLn $ "  " ++ host ++ ":" ++ remotePath ++ ": repo = " ++ addr ++ "  [OK]"
+                -- 远端 repo 内容没变时 helper 会回 unchanged：静默（第 2 步只报有变化的动作）
+                if isUnchanged v
+                    then return ()
+                    else putStrLn $ "  " ++ host ++ ":" ++ remotePath ++ ": repo = " ++ addr ++ "  [OK]"
             | otherwise -> note "not written: unexpected response"
   where
     note msg = putStrLn $ "  NOTE: " ++ host ++ ":" ++ remotePath ++ ": repo " ++ msg
+
+    isUnchanged v = case Msg.asBool =<< Msg.field "unchanged" v of
+        Just True -> True
+        _         -> False
 
 -- | 只捕获"我们自己的"失败（IO 异常 + 我们 error 出来的 ErrorCall），
 --   不吞 Ctrl-C 之类的异步异常。Left 是可读的失败原因。

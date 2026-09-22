@@ -157,17 +157,15 @@ validateProfile name
     | name == "." || name == ".." = die "Profile name cannot be '.' or '..'"
     | otherwise                 = return ()
 
--- | 从字符串列表解析 profile + 两个 Root，并确保两个同步根目录都存在。
+-- | 从字符串列表解析 profile + 两个 Root。
 --   [profile, r1, r2] → (profile, root1, root2)
---   目录不存在时自动创建空目录（创建成功才继续）。
+--
+--   只解析，**不碰磁盘**：目录的创建/检查是同步流程的第 2 步
+--   （见 'Exe.prepareRoots'），这样它才会出现在标题、握手之后。
 parseSyncThree :: [String] -> IO (String, Root, Root)
 parseSyncThree [profile, r1, r2] = do
     validateProfile profile
-    let root1 = parseRoot r1
-        root2 = parseRoot r2
-    ensureRoot root1
-    ensureRoot root2
-    return (profile, root1, root2)
+    return (profile, parseRoot r1, parseRoot r2)
 parseSyncThree _ = die "Usage: hsbisync sync <profile> <root1> <root2>"
 
 -- | 打印错误并退出
