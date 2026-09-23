@@ -1,6 +1,7 @@
 module Main where
 
-import Control.Monad (forM_, unless)
+import Control.Exception (IOException, try)
+import Control.Monad (forM_, unless, when)
 import System.Directory
     ( doesDirectoryExist, doesFileExist
     , getCurrentDirectory, listDirectory
@@ -8,10 +9,13 @@ import System.Directory
 import System.Environment (getArgs)
 import System.Exit (exitFailure)
 import System.FilePath ((</>))
+import System.Posix.Files (readSymbolicLink)
 
-import qualified Data.ByteString as BS
-import qualified Data.Text.Encoding as T
-import qualified Data.Text as T (unpack)
+import qualified Data.Map as Map
+
+import Data.Time (UTCTime, TimeZone)
+import Data.Time.Format (defaultTimeLocale, formatTime)
+import Data.Time.LocalTime (getCurrentTimeZone, utcToLocalTime)
 
 import GHC.IO.Encoding (setFileSystemEncoding, setLocaleEncoding, utf8)
 
@@ -19,9 +23,9 @@ import Arg (Root(..), parseRoot, parseSyncThree)
 import Exe (RootSource(..), printBanner, runSync)
 import Helper (runHelper)
 import State
-    ( FileState(..), DiffState(..)
-    , readLastState, currentState, diffOneSide
-    , readEntries, bsLines
+    ( FileState(..), DiffState(..), StateKind(..)
+    , currentState, currentLinkState, diffOneSide
+    , readLastStateKind, indexStates, posixSecs
     )
 
 -- ============================================================================
@@ -42,8 +46,7 @@ main = do
     case args of
         "--helper" : rest  -> helperMain rest
         ["--help"]         -> showHelp
-        ["log", profile]   -> cmdLog profile
-        ["state", profile] -> cmdState profile
+        ["diff", profile]  -> cmdDiff profile
         "profile" : rest   -> cmdProfile rest
         "sync" : rest      -> syncCmd rest
         _                  -> showHelp
@@ -57,8 +60,8 @@ showHelp = putStrLn $ unlines
     , "    With 1 arg:  read peer from .bisync/<profile>/repo and sync"
     , "    With 3 args: sync two roots and record the peer into repo file(s)"
     , "                 (both ends are recorded when the peer is reached via ssh)"
-    , "  hsbisync log <profile>             Show pending changes"
-    , "  hsbisync state <profile>           Preview changes (read-only)"
+    , "  hsbisync diff <profile>            Preview local changes (read-only)"
+    , "                                      files + symlinks, with size/mtime delta"
     , "  hsbisync profile                   List all profiles"
     , "  hsbisync profile <name>            Show profile details"
     , "  hsbisync --help                    Show this help"
@@ -135,58 +138,156 @@ syncFromRepo profile = do
     runSync RootsFromRepo profile root1 root2
 
 -- ============================================================================
--- log 子命令
+-- diff 子命令（只读预览）
 -- ============================================================================
 
-cmdLog :: String -> IO ()
-cmdLog profile = do
+-- | @hsbisync diff <profile>@ — 只读预览：**本地**基线与当前目录的差异。
+--
+--   两棵树都看，各自与各自的基线对比（互不干扰），顺序为**先链接树后文件树**：
+--   * 软链接树 — 基线 @link_state@/link_added/... vs 'currentLinkState'（不跟随）
+--   * 文件树   — 基线 @state@/added/deleted       vs 'currentState'（跟随软链接）
+--
+--   为什么两棵都要：链接的“内容”是**指向字符串**、且链接自身的 mtime 也是被同步的
+--   属性，只报文件树时“链接被指向”这类变化完全不可见。
+--
+--   除状态与路径外，每条变更还会**缩进几行标出真正变化的维度**
+--   （长度 / mtime 的旧值 → 新值）。目的就是让「一百多条全报 Updated，
+--   可我根本没批量改过这些文件」这类怀疑一眼能查：
+--   * 只差 mtime 的那批，看新值是不是**集中/相同**的时刻 ——
+--     是，则说明整棵树被 @cp -r@ / @git checkout@ / 重装之类的操作覆盖过；
+--   * 只差长度（文件 = size，链接 = 指向字符串长度）的，才是内容真的变了。
+--
+--   时间按**本地时区**打印（与 @ls -l@ / @stat@ 一致，方便直接对照）。
+--   全程只读：不写 state，也不删 added/deleted（用的是 'readLastStateKind'）。
+cmdDiff :: String -> IO ()
+cmdDiff profile = do
     cwd <- getCurrentDirectory
-    let dir = cwd </> ".bisync" </> profile
-    added   <- readEntries (dir </> "added")
-    deleted <- readDeleted  (dir </> "deleted")
+    tz  <- getCurrentTimeZone
+    -- 顺序：先软链接树（结构层，条数少），再文件树（内容层，条数多）
+    diffOneTree tz cwd profile LinkKind
+    diffOneTree tz cwd profile FileKind
 
-    if null added && null deleted
-        then putStrLn "No pending changes."
-        else do
-            let total = length added + length deleted
-            putStrLn $ "Last sync recorded (" ++ show total ++ " entries):"
-            unless (null added) $ do
-                putStrLn $ "\n  Added " ++ show (length added) ++ " files:"
-                forM_ added $ \fs -> putStrLn $ "    " ++ filename fs
-            unless (null deleted) $ do
-                putStrLn $ "\n  Deleted " ++ show (length deleted) ++ " files:"
-                forM_ deleted $ \f -> putStrLn $ "    " ++ f
+-- | 打印一棵树的差异（文件树 / 软链接树）
+--
+--   基线取 @.bisync/\<profile\>@ 下对应的一对三个文件（只读）；
+--   当前状态现场扫描（文件跟随软链接，链接 lstat 不跟随）。
+diffOneTree :: TimeZone -> FilePath -> String -> StateKind -> IO ()
+diffOneTree tz cwd tag kind = do
+    prev <- readLastStateKind kind cwd (Just tag)
+    cur  <- case kind of
+        FileKind -> currentState     cwd (Just tag)
+        LinkKind -> currentLinkState cwd (Just tag)
 
-readDeleted :: FilePath -> IO [FilePath]
-readDeleted fp = do
-    exists <- doesFileExist fp
-    if not exists then return []
-    else do
-        raw <- BS.readFile fp
-        return $ filter (not . null) $ map (T.unpack . T.decodeUtf8) $ bsLines raw
+    let prevM = indexStates prev
+        -- (DiffState, 条目, 基线)：
+        --   New     → 条目 = 当前，基线 = Nothing
+        --   Updated → 条目 = 当前，基线 = 上一版
+        --   Deleted → 条目本身就是基线那条（diffOneSide 的约定），基线 = 同一条
+        changed = [ (ds, fs, Map.lookup (filename fs) prevM)
+                  | (ds, fs) <- diffOneSide prev cur
+                  , ds /= Unchanged
+                  ]
 
--- ============================================================================
--- state 子命令（只读预览）
--- ============================================================================
-
-cmdState :: String -> IO ()
-cmdState profile = do
-    cwd <- getCurrentDirectory
-    prev <- readLastState cwd (Just profile)
-    cur  <- currentState cwd (Just profile)
-
-    let diffs = diffOneSide prev cur
-        changed = [ (ds, fs) | (ds, fs) <- diffs, ds /= Unchanged ]
-
-    putStrLn $ "Last merged state: " ++ show (length prev) ++ " files"
-    putStrLn $ "Current directory:  " ++ show (length cur)  ++ " files"
+    putStrLn ""
+    putStrLn $ "== " ++ treeLabel kind ++ " =="
+    putStrLn $ "Last merged state: " ++ show (length prev) ++ " " ++ noun kind
+    putStrLn $ "Current tree:      " ++ show (length cur)  ++ " " ++ noun kind
 
     if null changed
         then putStrLn "No changes."
         else do
-            putStrLn $ "\nChanges (" ++ show (length changed) ++ " entries):\n"
-            forM_ changed $ \(ds, fs) ->
+            putStrLn $ "\nChanges (" ++ show (length changed) ++ " entries):"
+            case updatedBreakdown kind changed of
+                Nothing -> return ()
+                Just s  -> putStrLn $ "  Updated: " ++ s
+            putStrLn ""
+            forM_ changed $ \(ds, fs, mPrev) -> do
                 putStrLn $ "  " ++ pad 8 (show ds) ++ "  " ++ filename fs
+                forM_ (detailLines tz kind ds fs mPrev) $ \l ->
+                    putStrLn $ detailPad ++ l
+                when (kind == LinkKind) $ do
+                    -- 链接当前指向哪里：只有链接**还在**（New/Updated）才读得到；
+                    -- 已删除的读不到——基线只存长度+mtime，不存目标字符串。
+                    mTgt <- linkTarget (cwd </> filename fs)
+                    forM_ mTgt $ \t -> putStrLn $ detailPad ++ pad 8 "target" ++ "-> " ++ t
+
+-- | 该棵树的标题
+treeLabel :: StateKind -> String
+treeLabel FileKind = "Files Tree"
+treeLabel LinkKind = "Symlinks Tree"
+
+-- | 计数单位
+noun :: StateKind -> String
+noun FileKind = "files"
+noun LinkKind = "links"
+
+-- | 长度维度在两类条目里的名字：
+--   * 文件 — @size@ = st_size = 字节数
+--   * 链接 — @len@  = st_size = **指向字符串长度**（状态文件里存的就是它）
+--   分开叫是为了避免看到 “size 12 → 20” 以为链接本身有多少字节内容。
+sizeWord :: StateKind -> String
+sizeWord FileKind = "size"
+sizeWord LinkKind = "len"
+
+-- | 读软链接指向（不跟随；路径不存在/不是链接 → Nothing）
+linkTarget :: FilePath -> IO (Maybe FilePath)
+linkTarget fp = do
+    r <- try (readSymbolicLink fp) :: IO (Either IOException FilePath)
+    return $ either (const Nothing) Just r
+
+-- | 明细行的缩进宽度：与上面 @"  " ++ pad 8 …"  ++ "  " ++ 路径@ 的路径列对齐
+--   （2 + 8 + 2 = 12），明细自己也用同一个 8 栏写标签。
+detailIndent :: Int
+detailIndent = 12
+
+detailPad :: String
+detailPad = replicate detailIndent ' '
+
+-- | 明细行：只列**真正不同**的维度，没变的维度不打（上百条时逐条打全就是噪声）。
+--   * 'New'     → 该条目现在的 长度 / mtime
+--   * 'Deleted' → 它当时（基线里）的长度 / mtime
+--   * 'Updated' → 长度 / mtime 各一行，**只打变了的那些**
+detailLines :: TimeZone -> StateKind -> DiffState -> FileState -> Maybe FileState -> [String]
+detailLines tz kind ds fs mPrev = case (ds, mPrev) of
+    (New, _)          -> attrs fs
+    (Deleted, Just p) -> attrs p
+    (Updated, Just p) -> sizeLine p fs ++ mtimeLine p fs
+    _                 -> []
+  where
+    -- New / Deleted 没有“旧→新”可比，就把当前（或当时）两个维度写在同一行
+    attrs x = [ pad 8 (sizeWord kind) ++ show (size x)
+                ++ ", mtime " ++ fmtTime tz (mtime x) ]
+    sizeLine p x
+        | size p == size x = []
+        | otherwise        = [ pad 8 (sizeWord kind) ++ show (size p) ++ " → " ++ show (size x) ]
+    mtimeLine p x
+        | posixSecs (mtime p) == posixSecs (mtime x) = []
+        | otherwise = [ pad 8 "mtime" ++ fmtTime tz (mtime p)
+                        ++ " → " ++ fmtTime tz (mtime x) ]
+
+-- | UTCTime → 本地时区的 @YYYY-MM-DD HH:MM:SS@
+fmtTime :: TimeZone -> UTCTime -> String
+fmtTime tz = formatTime defaultTimeLocale "%Y-%m-%d %H:%M:%S" . utcToLocalTime tz
+
+-- | 'Updated' 条目的细分统计：只差 mtime / 只差长度 / 两者都差。
+--
+--   没有 Updated 条目时返回 'Nothing'（不打印这一行）。
+--   由 'sameFile' 的定义，三者之和必然等于 Updated 条数。
+updatedBreakdown :: StateKind -> [(DiffState, FileState, Maybe FileState)] -> Maybe String
+updatedBreakdown kind changed =
+    case [ (p, fs) | (Updated, fs, Just p) <- changed ] of
+        []  -> Nothing
+        ups ->
+            let w         = sizeWord kind
+                mtimeOnly = length [ () | (p, fs) <- ups, size p == size fs ]
+                sizeOnly  = length [ () | (p, fs) <- ups
+                                       , size p /= size fs
+                                       , posixSecs (mtime p) == posixSecs (mtime fs) ]
+                both      = length ups - mtimeOnly - sizeOnly
+            in Just $ show (length ups) ++ " total, "
+                    ++ show mtimeOnly ++ " mtime-only, "
+                    ++ show sizeOnly  ++ " " ++ w ++ "-only, "
+                    ++ show both      ++ " " ++ w ++ "+mtime"
 
 -- ============================================================================
 -- profile 子命令（只读：列出 / 显示某个 profile 的 repo 与 ignore）
