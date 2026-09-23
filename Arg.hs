@@ -84,11 +84,15 @@ checkRoot (Remote host path) = do
 --
 --   本地用 createDirectoryIfMissing False（父目录缺失即失败）；
 --   远程用 ssh mkdir（不加 -p）。
-ensureRoot :: Root -> IO ()
+--
+--   返回**是否真的建了**（True = 新建；本来就在 = False）：建目录是第 1 步里
+--   "有实际动作"的一件事，但怎么展示（@at root1 side:@ + 路径 + @[create OK]@）
+--   由同步流程决定，所以这里只回报、不打印（用户 2026-09-23 定）。
+ensureRoot :: Root -> IO Bool
 ensureRoot (Local path) = do
     isDir <- doesDirectoryExist path
     if isDir
-        then return ()
+        then return False
         else do
             isFile <- doesFileExist path
             when isFile $
@@ -98,19 +102,19 @@ ensureRoot (Local path) = do
             case r of
                 Left _ -> die $ path ++ ": cannot create target root\n"
                     ++ "  (only one level is created: the parent directory must already exist)"
-                Right () -> putStrLn $ "  created root: " ++ path
+                Right () -> return True
 ensureRoot (Remote host path) = do
     let label = host ++ ":" ++ path
     (code, _, _) <- readProcessWithExitCode "ssh" [host, "test", "-d", path] ""
     if code == ExitSuccess
-        then return ()
+        then return False
         else do
             -- 不加 -p：只创建目标地址这一层
             (code', _, err) <- readProcessWithExitCode "ssh" [host, "mkdir", path] ""
             when (code' /= ExitSuccess) $
                 die $ label ++ ": cannot create remote directory: " ++ err
                    ++ "  (only one level is created: the parent directory must exist)"
-            putStrLn $ "  created root: " ++ label
+            return True
 
 -- | 严格要求 Root 已存在且为目录（不自动创建）。
 --
@@ -160,7 +164,7 @@ validateProfile name
 -- | 从字符串列表解析 profile + 两个 Root。
 --   [profile, r1, r2] → (profile, root1, root2)
 --
---   只解析，**不碰磁盘**：目录的创建/检查是同步流程的第 2 步
+--   只解析，**不碰磁盘**：目录的创建/检查是同步流程的第 1 步（sync prepare）
 --   （见 'Exe.prepareRoots'），这样它才会出现在标题、握手之后。
 parseSyncThree :: [String] -> IO (String, Root, Root)
 parseSyncThree [profile, r1, r2] = do

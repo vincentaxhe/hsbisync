@@ -9,7 +9,7 @@ import State (FileState(..), FileChange(..), DiffState(..), sameFile, diffOneSid
 data SyncAction = Receive | Remove | Unsolvable | RecordAdd | RecordDelete
     deriving (Show, Eq)
 
--- | 单侧 diff 的**初步统计**（给输出的第 6 步用）：每种状态各多少条。
+-- | 单侧 diff 的**初步统计**（给输出的第 5 步用）：每种状态各多少条。
 --
 --   'DiffState' 共 5 种，但 'None' 是"该侧从未有过"——它不是这一侧的
 --   **自身状态变化**（不在 'diffOneSide' 的输出里），所以这里只有 4 个计数。

@@ -55,7 +55,7 @@ runHelper root mTag = do
     --   以前这里有一句 createDirectoryIfMissing True <root>/.bisync/<profile>，
     --   而它是**递归**创建 —— 等于：只要跟远端握一次手，同步根（连同其父目录、
     --   连同 .bisync）就被建出来了。后果有两层：
-    --   * 第 2 步"检查/创建同步目录"永远查不出"目录不存在"，"created root" 再也
+    --   * 第 1 步（sync prepare）"检查/创建同步目录"永远查不出"目录不存在"，"created root" 再也
     --     不会出现（用户看到的顺序是：握手 → 说好的创建 → 结果什么都没做）；
     --   * 更糟的是它绕过了"只建一层"的规则（见 'Arg.ensureRoot'），路径写错时
     --     会凭空造出一整棵树。
@@ -324,7 +324,7 @@ cmdPutRepo root mTag req =
                         addr     = user ++ "@" ++ ip ++ ":" ++ path
                     same <- repoAlready repoFile addr
                     if same
-                        then -- 内容没变：不写、也不让主控端打印（第 2 步只报有变化的动作）
+                        then -- 内容没变：不写、也不让主控端打印（第 1 步只报有变化的动作）
                             replyOk [("addr", Msg.str addr), ("unchanged", Msg.JBool True)]
                         else do
                             writeRepoFile repoFile addr

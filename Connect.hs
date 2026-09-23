@@ -114,6 +114,7 @@ rememberRemoteEnv host re = modifyMVar_ remoteEnvs (return . Map.insert host re)
 
 -- | 准备阶段：为每个远程端各做一次握手（静默，结果进缓存）；本地端跳过。
 --   可重复调用：同一进程内只握手一次（之后不再 ssh）。显示用 'handshakeInfo'。
+--   调用点是 'Exe.runSync' 的第 1 步（sync prepare）。
 prepareRemotes :: String -> [Root] -> IO ()
 prepareRemotes profile roots =
     mapM_ (uncurry (prepareRemote profile)) (nubBy sameHost [ (h, p) | Remote h p <- roots ])
@@ -135,11 +136,12 @@ prepareRemote profile host rootPath = do
             hh <- spawnHelper host rootPath profile
             destroyHelper hh
 
--- | 握手结果（阶段 1 的显示数据）：每个远程端一项 @(host, 家目录, hsbisync 路径)@。
+-- | 握手结果（第 1 步 sync prepare 的显示数据）：每个远程端一项
+--   @(host, 家目录, helper 路径)@。
 --
 --   只列远程端（本地端没有远端可握手，直接跳过），同一个 host 只出现一次。
 --   入口（Main）可能已经握过手（写 repo 需要），这里直接读缓存、不再 ssh；
---   显示与握手分开，是为了保证"先显示两端地址、再显示第 1 步"的顺序稳定。
+--   显示与握手分开，是为了保证"先列两端地址、再列第 1 步里真做了的事"的顺序稳定。
 handshakeInfo :: [Root] -> IO [(String, Maybe String, Maybe FilePath)]
 handshakeInfo roots =
     forM (nubBy sameHost [ (h, p) | Remote h p <- roots ]) $ \(h, _) -> do

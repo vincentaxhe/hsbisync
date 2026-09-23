@@ -11,6 +11,8 @@ import System.Exit (exitFailure)
 import System.FilePath ((</>))
 import System.Posix.Files (readSymbolicLink)
 
+import Data.List (sort)
+
 import qualified Data.Map as Map
 
 import Data.Time (UTCTime, TimeZone)
@@ -111,7 +113,8 @@ syncCmd args@[_, _, _] = do
     -- 标题总是最前面（任何检查/握手/建目录之前）
     printBanner
     (profile, root1, root2) <- parseSyncThree args
-    -- 后面全交给 runSync 的 7 步：握手 → 建目录+写 repo → ignore → 链接 → 状态 → 计算 → 执行
+    -- 后面全交给 runSync 的 6 步：
+    -- sync prepare（目录 + 握手 + repo）→ ignore → 链接 → 状态 → 计算 → 执行
     runSync RootsGiven profile root1 root2
 syncCmd _ = die "Usage: hsbisync sync <profile> [<root1> <root2>]"
 
@@ -120,12 +123,27 @@ syncCmd _ = die "Usage: hsbisync sync <profile> [<root1> <root2>]"
 -- ============================================================================
 
 -- | 只给 profile：对端地址从本仓库的 @.bisync/\<profile\>/repo@ 读。
---   这种模式下目录**不创建、repo 也不重写**：第 2 步只检查两端目录存在。
+--   这种模式下目录**不创建、repo 也不重写**：第 1 步（sync prepare）只检查两端目录存在。
+--
+--   缺东西分两级报（用户 2026-09-23 定）：
+--   * @.bisync/\<profile\>@ 目录**本身不存在** → 这是 profile 名写错了，不是
+--     "忘了建 repo"：直接把这里**真实存在**的 profile 列出来；
+--   * 目录在、@repo@ 不在 → 这时才提示手工写一行对端地址。
 syncFromRepo :: String -> IO ()
 syncFromRepo profile = do
     printBanner                                 -- 标题最快，连读 repo 之前就出
     cwd <- getCurrentDirectory
-    let repoFile = cwd </> ".bisync" </> profile </> "repo"
+    let profDir  = cwd </> ".bisync" </> profile
+        repoFile = profDir </> "repo"
+
+    hasDir <- doesDirectoryExist profDir
+    unless hasDir $ do
+        names <- existingProfiles (cwd </> ".bisync")
+        die $ "Profile '" ++ profile ++ "' not found in " ++ cwd ++ "\n"
+           ++ case names of
+                  [] -> "No profiles found."
+                  _  -> "Profiles:\n" ++ unlines [ "  " ++ n | n <- names ]
+
     exists <- doesFileExist repoFile
     unless exists $
         die $ "No .bisync/" ++ profile ++ "/repo found in " ++ cwd
@@ -136,6 +154,14 @@ syncFromRepo profile = do
     let root1 = Local cwd          -- 当前目录，必然存在
         root2 = parseRoot peer
     runSync RootsFromRepo profile root1 root2
+
+-- | @.bisync/@ 下现有的 profile 名（按名字排序；目录不存在就是空）
+existingProfiles :: FilePath -> IO [String]
+existingProfiles bisyncDir = do
+    hasDir <- doesDirectoryExist bisyncDir
+    if not hasDir
+        then return []
+        else sort . filter (not . isHidden) <$> listDirectory bisyncDir
 
 -- ============================================================================
 -- diff 子命令（只读预览）
@@ -309,17 +335,16 @@ cmdProfileList :: IO ()
 cmdProfileList = do
     cwd <- getCurrentDirectory
     let bisyncDir = cwd </> ".bisync"
-    exists <- doesDirectoryExist bisyncDir
-    if not exists
+    hasDir <- doesDirectoryExist bisyncDir
+    if not hasDir
         then putStrLn "No .bisync directory found."
         else do
-            entries <- listDirectory bisyncDir
-            let profiles = filter (not . isHidden) entries
-            if null profiles
+            names <- existingProfiles bisyncDir
+            if null names
                 then putStrLn "No profiles found."
                 else do
                     putStrLn "Profiles:"
-                    forM_ profiles $ \name ->
+                    forM_ names $ \name ->
                         showProfile bisyncDir name
 
 -- | 显示单个 profile 详情（从 CWD）
