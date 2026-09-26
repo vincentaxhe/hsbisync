@@ -27,7 +27,7 @@ import State
     , lastStateKind, appendAddedKind, appendDeletedKind, discardStateUnder, posixSecs
     , indexStates, dedup
     )
-import Sync (sync, SyncAction(..), resolveConflicts, SideStats(..))
+import Sync (sync, SyncAction(..), resolveConflicts, SideStats(..), sideStateLabel)
 import Write
     ( HelperHandle(..), call, readMsg, hGetExactly, hPutFully
     , writeFileVerified, writeLinkVerified, readLinkContent
@@ -901,19 +901,19 @@ showSummary pairs1 pairs2 = do
     when (not (null del1)) $ do
         putStrLn "\nroot1 will delete:"
         forM_ del1 $ \(f, d1, d2) ->
-            putStrLn $ "  - " ++ f ++ "  [r1:" ++ show d1 ++ " r2:" ++ show d2 ++ "]"
+            putStrLn $ "  - " ++ f ++ "  [r1:" ++ sideStateLabel d1 ++ " r2:" ++ sideStateLabel d2 ++ "]"
     when (not (null add1)) $ do
         putStrLn "\nroot1 will receive (root2 -> root1):"
         forM_ add1 $ \(f, d1, d2) ->
-            putStrLn $ "  - " ++ f ++ "  [r1:" ++ show d1 ++ " r2:" ++ show d2 ++ "]"
+            putStrLn $ "  - " ++ f ++ "  [r1:" ++ sideStateLabel d1 ++ " r2:" ++ sideStateLabel d2 ++ "]"
     when (not (null del2)) $ do
         putStrLn "\nroot2 will delete:"
         forM_ del2 $ \(f, d1, d2) ->
-            putStrLn $ "  - " ++ f ++ "  [r1:" ++ show d1 ++ " r2:" ++ show d2 ++ "]"
+            putStrLn $ "  - " ++ f ++ "  [r1:" ++ sideStateLabel d1 ++ " r2:" ++ sideStateLabel d2 ++ "]"
     when (not (null add2)) $ do
         putStrLn "\nroot2 will receive (root1 -> root2):"
         forM_ add2 $ \(f, d1, d2) ->
-            putStrLn $ "  - " ++ f ++ "  [r1:" ++ show d1 ++ " r2:" ++ show d2 ++ "]"
+            putStrLn $ "  - " ++ f ++ "  [r1:" ++ sideStateLabel d1 ++ " r2:" ++ sideStateLabel d2 ++ "]"
     when (not (null recAdds)) $ do
         putStrLn "\nAlready in sync (will record as added):"
         forM_ recAdds $ \f ->
@@ -925,7 +925,7 @@ showSummary pairs1 pairs2 = do
     when (not (null conf)) $ do
         putStrLn "\nConflicts (will skip):"
         forM_ conf $ \(f, d1, d2) ->
-            putStrLn $ "  - " ++ f ++ "  [r1:" ++ show d1 ++ " r2:" ++ show d2 ++ "]"
+            putStrLn $ "  - " ++ f ++ "  [r1:" ++ sideStateLabel d1 ++ " r2:" ++ sideStateLabel d2 ++ "]"
     let total = length add1 + length del1 + length add2 + length del2 + length recAdds + length recDels
     putStrLn $ "\nTotal: " ++ show total ++ " operations, " ++ show (length conf) ++ " conflicts"
 

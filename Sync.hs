@@ -152,6 +152,15 @@ toAct (Added     _ _ _)  = Just Receive
 toAct (Del   _ _ _)  = Just Remove
 toAct (Conflict  _ _ _)  = Just Unsolvable
 
+-- | SideState → 摘要用的状态标签（避免把 FileState 的完整 record 打出来）
+sideStateLabel :: SideState -> String
+sideStateLabel ss = case ss of
+    Absent _      -> "absent"
+    SNew _        -> "new"
+    SUpdated _    -> "updated"
+    SUnchanged _  -> "unchanged"
+    SDeleted _    -> "deleted"
+
 -- | 从 SideState 提取文件名
 sideStateName :: SideState -> FilePath
 sideStateName ss = case ss of
@@ -181,9 +190,9 @@ classifyOne s1 s2 = case (s1, s2) of
     ------------------------------------------------------------
     -- 仅 side1 有变化 → side2 需行动
     ------------------------------------------------------------
-    (SNew fs1,      Absent fs2) -> (Noop fs1 s1 s2,    Added fs2 s1 s2)
-    (SUpdated fs1,  Absent fs2) -> (Noop fs1 s1 s2,    Added fs2 s1 s2)
-    (SUnchanged fs1,Absent fs2) -> (Noop fs1 s1 s2,    Added fs2 s1 s2)
+    (SNew fs1,      Absent _) -> (Noop fs1 s1 s2,    Added fs1 s1 s2)
+    (SUpdated fs1,  Absent _) -> (Noop fs1 s1 s2,    Added fs1 s1 s2)
+    (SUnchanged fs1,Absent _) -> (Noop fs1 s1 s2,    Added fs1 s1 s2)
 
     -- side1 的基线里有、现在扫不到了，而 side2 **从未有过**这个条目：
     -- 没有任何东西需要传播，但 side1 那条**过期的基线记录必须清掉**，否则每轮
@@ -197,9 +206,9 @@ classifyOne s1 s2 = case (s1, s2) of
     ------------------------------------------------------------
     -- 仅 side2 有变化 → side1 需行动（对称）
     ------------------------------------------------------------
-    (Absent fs1, SNew fs2)      -> (Added fs1 s1 s2, Noop fs2 s1 s2)
-    (Absent fs1, SUpdated fs2)  -> (Added fs1 s1 s2, Noop fs2 s1 s2)
-    (Absent fs1, SUnchanged fs2)-> (Added fs1 s1 s2, Noop fs2 s1 s2)
+    (Absent _, SNew fs2)      -> (Added fs2 s1 s2, Noop fs2 s1 s2)
+    (Absent _, SUpdated fs2)  -> (Added fs2 s1 s2, Noop fs2 s1 s2)
+    (Absent _, SUnchanged fs2)-> (Added fs2 s1 s2, Noop fs2 s1 s2)
 
     -- 同上（对称）：side2 的过期条目，由 'resolveConflicts' 转成 RecordDelete
     (Absent fs1, SDeleted fs2)  -> (Noop fs1 s1 s2, Noop fs2 s1 s2)
@@ -214,7 +223,7 @@ classifyOne s1 s2 = case (s1, s2) of
 
     (SUpdated fs1,  SNew fs2)       -> (Conflict fs1 s1 s2, Conflict fs2 s1 s2)
     (SUpdated fs1,  SUpdated fs2)   -> (Conflict fs1 s1 s2, Conflict fs2 s1 s2)
-    (SUpdated fs1,  SUnchanged fs2) -> (Noop fs1 s1 s2,     Added fs2 s1 s2)
+    (SUpdated fs1,  SUnchanged _) -> (Noop fs1 s1 s2,     Added fs1 s1 s2)
     (SUpdated fs1,  SDeleted fs2)   -> (Conflict fs1 s1 s2, Conflict fs2 s1 s2)
 
     (SUnchanged fs1, SNew fs2)       -> (Conflict fs1 s1 s2, Conflict fs2 s1 s2)
