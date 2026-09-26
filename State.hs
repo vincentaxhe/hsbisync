@@ -50,29 +50,44 @@ data FileState = FileState
     , mtime    :: !UTCTime
     , mode     :: !Int
     , filename :: !FilePath
-    } deriving (Show, Eq)
+    } deriving (Show, Eq, Ord)
 
--- | 单侧文件差异（5 种）
+-- | 单侧文件差异（4 种）
 --
---   * 'None'  — 该侧从未有过此文件
---   * 'Unchanged'    — 文件存在且未变
---   * 'New'     — 新增
---   * 'Updated'  — 修改
---   * 'Deleted'  — 删除
-data DiffState = None | Unchanged | New | Updated | Deleted
+--   * 'Unchanged'  — 文件存在且未变
+--   * 'New'        — 新增
+--   * 'Updated'    — 修改
+--   * 'Deleted'    — 删除
+data DiffState = Unchanged | New | Updated | Deleted
+    deriving (Show, Eq)
+
+-- | 单侧文件在比较中的状态（精确 5 种，无冗余）
+--
+--   自身 4 种差异 + "该侧从未有过此文件"（Absent），
+--   两者组合恰好覆盖 classifyOne 的全部输入域，
+--   5×5 = 25 种双侧组合全部合法可达，无需 catch-all。
+--
+--   所有构造子都携带 'FileState'：即使是 'Absent'（该侧从未有过），
+--   元信息（size=0, mtime=epoch）仍可用于 FileChange 输出与显示。
+data SideState
+    = Absent      !FileState      -- ^ 该侧从未有过此文件
+    | SNew        !FileState      -- ^ 新增
+    | SUpdated    !FileState      -- ^ 修改
+    | SUnchanged  !FileState      -- ^ 未变
+    | SDeleted    !FileState      -- ^ 删除
     deriving (Show, Eq, Ord)
 
--- | 文件变更决策，携带双方各自的 DiffState
+-- | 文件变更决策，携带双方各自的 SideState
 --
 --   * 'Added'     — 本方应接收。root1Diff/root2Diff 说明两侧变化
 --   * 'Del'   — 本方应删除
 --   * 'Conflict'  — 双方冲突
 --   * 'Noop' — 无变化
 data FileChange
-    = Noop FileState DiffState DiffState
-    | Added     FileState DiffState DiffState
-    | Del   FileState DiffState DiffState
-    | Conflict  FileState DiffState DiffState
+    = Noop FileState SideState SideState
+    | Added     FileState SideState SideState
+    | Del   FileState SideState SideState
+    | Conflict  FileState SideState SideState
     deriving (Show, Eq)
 
 -- ============================================================================
@@ -591,24 +606,24 @@ sameFile a b =
 posixSecs :: UTCTime -> Integer
 posixSecs = floor . utcTimeToPOSIXSeconds
 
--- | 计算单侧差异：last vs cur → [(DiffState, FileState)]
+-- | 计算单侧差异：last vs cur → [SideState]
 --
 --   索引化：一侧 O(n log n)，不再逐条线性查 prev / 线性 notElem 扫 cur
 --   （n 大时那是 O(n²)，每次运行都要跑）。
-diffOneSide :: [FileState] -> [FileState] -> [(DiffState, FileState)]
+diffOneSide :: [FileState] -> [FileState] -> [SideState]
 diffOneSide prev cur =
     let prevM  = indexStates prev
         curSet = nameSet cur
 
         curDiffs = map (\fs ->
             case Map.lookup (filename fs) prevM of
-                Nothing     -> (New,    fs)
+                Nothing     -> SNew fs
                 Just prevFs -> if sameFile fs prevFs
-                    then (Unchanged, fs)
-                    else (Updated,   fs)
+                    then SUnchanged fs
+                    else SUpdated fs
             ) cur
 
-        delDiffs = [ (Deleted, fs)
+        delDiffs = [ SDeleted fs
                    | fs <- prev
                    , not (Set.member (filename fs) curSet)
                    ]

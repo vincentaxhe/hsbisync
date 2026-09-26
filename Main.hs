@@ -25,7 +25,7 @@ import Arg (Root(..), parseRoot, parseSyncThree)
 import Exe (RootSource(..), printBanner, runSync)
 import Helper (runHelper)
 import State
-    ( FileState(..), DiffState(..), StateKind(..)
+    ( FileState(..), DiffState(..), SideState(..), StateKind(..)
     , currentState, currentLinkState, diffOneSide
     , readLastStateKind, indexStates, posixSecs
     )
@@ -209,9 +209,9 @@ diffOneTree tz cwd tag kind = do
         --   New     → 条目 = 当前，基线 = Nothing
         --   Updated → 条目 = 当前，基线 = 上一版
         --   Deleted → 条目本身就是基线那条（diffOneSide 的约定），基线 = 同一条
-        changed = [ (ds, fs, Map.lookup (filename fs) prevM)
-                  | (ds, fs) <- diffOneSide prev cur
-                  , ds /= Unchanged
+        changed = [ (toDiffState ss, ssFS ss, Map.lookup (filename (ssFS ss)) prevM)
+                  | ss <- diffOneSide prev cur
+                  , toDiffState ss /= Unchanged
                   ]
 
     putStrLn ""
@@ -388,6 +388,22 @@ showProfile bisyncDir name = do
 isHidden :: FilePath -> Bool
 isHidden ('.':_) = True
 isHidden _       = False
+
+-- | SideState → DiffState（仅用于 diff 显示，Absent 映射为 New）
+toDiffState :: SideState -> DiffState
+toDiffState (SNew _)      = New
+toDiffState (SUpdated _)  = Updated
+toDiffState (SUnchanged _) = Unchanged
+toDiffState (SDeleted _)  = Deleted
+toDiffState (Absent _)    = New
+
+-- | SideState → FileState
+ssFS :: SideState -> FileState
+ssFS (SNew fs)      = fs
+ssFS (SUpdated fs)  = fs
+ssFS (SUnchanged fs) = fs
+ssFS (SDeleted fs)  = fs
+ssFS (Absent fs)    = fs
 
 pad :: Int -> String -> String
 pad n s = s ++ replicate (max 0 (n - length s)) ' '
