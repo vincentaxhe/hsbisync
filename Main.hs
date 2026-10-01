@@ -110,9 +110,11 @@ dropPrefix prefix s
 syncCmd :: [String] -> IO ()
 syncCmd [profile] = syncFromRepo profile
 syncCmd args@[_, _, _] = do
-    -- 标题总是最前面（任何检查/握手/建目录之前）
-    printBanner
+    -- 先把命令行解析并验完（profile 名可能非法），确认无误才打横幅：
+    -- 横幅 = "同步流程已经开始" 的标志，前提都没过就看见三行 ===== 很误导
+    -- （用户 2026-10-01 定）。
     (profile, root1, root2) <- parseSyncThree args
+    printBanner
     -- 后面全交给 runSync 的 6 步：
     -- sync prepare（目录 + 握手 + repo）→ ignore → 链接 → 状态 → 计算 → 执行
     runSync RootsGiven profile root1 root2
@@ -129,31 +131,46 @@ syncCmd _ = die "Usage: hsbisync sync <profile> [<root1> <root2>]"
 --   * @.bisync/\<profile\>@ 目录**本身不存在** → 这是 profile 名写错了，不是
 --     "忘了建 repo"：直接把这里**真实存在**的 profile 列出来；
 --   * 目录在、@repo@ 不在 → 这时才提示手工写一行对端地址。
+--
+--   **两个前提都在横幅之前查**（用户 2026-10-01 定）：横幅是"同步流程已开始"的标志，
+--   要等 profile 与 repo 都确认无误才打 —— 名字写错却先看到三行 ===== 很误导。
 syncFromRepo :: String -> IO ()
 syncFromRepo profile = do
-    printBanner                                 -- 标题最快，连读 repo 之前就出
     cwd <- getCurrentDirectory
-    let profDir  = cwd </> ".bisync" </> profile
-        repoFile = profDir </> "repo"
+    profDir <- requireProfileDir cwd profile           -- 前提 1：profile 存在
+    let repoFile = profDir </> "repo"
 
-    hasDir <- doesDirectoryExist profDir
-    unless hasDir $ do
-        names <- existingProfiles (cwd </> ".bisync")
-        die $ "Profile '" ++ profile ++ "' not found in " ++ cwd ++ "\n"
-           ++ case names of
-                  [] -> "No profiles found."
-                  _  -> "Profiles:\n" ++ unlines [ "  " ++ n | n <- names ]
-
-    exists <- doesFileExist repoFile
+    exists <- doesFileExist repoFile                   -- 前提 2：repo 存在
     unless exists $
-        die $ "No .bisync/" ++ profile ++ "/repo found in " ++ cwd
-           ++ "\nCreate it manually with the peer address, e.g.:"
-           ++ "\n  echo 'user@host:/path' > " ++ repoFile
+        die $ ".bisync/" ++ profile ++ "/repo does not exist\n"
+           ++ "Create it manually with the peer address, e.g.:"
+           ++ "\n  echo 'user@host:/path' > .bisync/" ++ profile ++ "/repo"
 
+    printBanner                                        -- 前提全过 → 进入同步流程
     peer <- filter (not . (`elem` "\n\r")) <$> readFile repoFile
     let root1 = Local cwd          -- 当前目录，必然存在
         root2 = parseRoot peer
     runSync RootsFromRepo profile root1 root2
+
+-- | 检查 @.bisync/\<profile\>@ 目录存在，返回该目录；不存在就报错退出。
+--
+--   **sync 与 diff 共用**：profile 名写错（目录本身不存在）不该被当成"什么都还没同步"，
+--   所以两者都用同一套警示，并列出这里**真实存在**的 profile。
+--   "目录在、repo 不在"是另一回事（只有 sync 需要 repo），在那个函数里单独报。
+--
+--   提示只说 @.bisync/\<profile\>@ 这个**相对路径**（用户 2026-10-01 定）：
+--   命令本来就只认当前目录，报绝对路径既长又没有任何额外信息。
+requireProfileDir :: FilePath -> String -> IO FilePath
+requireProfileDir cwd profile = do
+    let profDir = cwd </> ".bisync" </> profile
+    hasDir <- doesDirectoryExist profDir
+    unless hasDir $ do
+        names <- existingProfiles (cwd </> ".bisync")
+        die $ ".bisync/" ++ profile ++ " does not exist\n"
+           ++ case names of
+                  [] -> "No profiles found."
+                  _  -> "Profiles:\n" ++ unlines [ "  " ++ n | n <- names ]
+    return profDir
 
 -- | @.bisync/@ 下现有的 profile 名（按名字排序；目录不存在就是空）
 existingProfiles :: FilePath -> IO [String]
@@ -185,9 +202,15 @@ existingProfiles bisyncDir = do
 --
 --   时间按**本地时区**打印（与 @ls -l@ / @stat@ 一致，方便直接对照）。
 --   全程只读：不写 state，也不删 added/deleted（用的是 'readLastStateKind'）。
+--
+--   profile 目录不存在直接报错（'requireProfileDir'，与 @sync \<profile\>@ 同一套警示）：
+--   否则"名字写错"会被伪装成"基线为空 → 整棵树都是 New"。
 cmdDiff :: String -> IO ()
 cmdDiff profile = do
     cwd <- getCurrentDirectory
+    -- 与 sync 一样先查 profile 目录：不存在就是名字写错（而不是"基线为空"），
+    -- 否则这里会把整棵树当成 New 全列一遍，看着像正常输出。
+    _   <- requireProfileDir cwd profile
     tz  <- getCurrentTimeZone
     -- 顺序：先软链接树（结构层，条数少），再文件树（内容层，条数多）
     diffOneTree tz cwd profile LinkKind
