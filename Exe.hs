@@ -2,7 +2,7 @@ module Exe where
 
 import Control.Concurrent.Async (concurrently)
 import Control.Exception (ErrorCall, IOException, bracket, catch, displayException)
-import Control.Monad (filterM, forM_, unless, when)
+import Control.Monad (filterM, forM, forM_, unless, when)
 import Data.Char (toLower)
 import Data.Maybe (fromMaybe, isJust)
 import qualified Data.Map as Map
@@ -65,7 +65,7 @@ printBanner = do
 --   0. （不编号）先明确两端地址与 profile
 --   1. sync prepare：确保同步需要的东西 + 与远端握手 + 写 repo（合成一步，见下）
 --   2. 同步 ignore 规则（无条件先对齐，之后 ignore 不再参与文件同步）
---   3. 同步软链接结构
+--   3. 同步软链接结构（**闸门**：这一步没达成一致，4~6 步整体跳过）
 --   4. 读两端状态
 --   5. 计算同步动作（diff + 冲突消解 + 额外内容校验）
 --   6. 列动作、确认、执行（真正的传输与记录）
@@ -125,8 +125,27 @@ runSync srcKind profile root1 root2 = do
 
     -- 阶段 3：同步软链接（先让两端的链接结构完全一致）。
     -- 输出：只有真有动作（要用户确认）时才列清单 + 提问；结构调整一致时静默。
-    syncLinkPhase profile mTag mHost1 path1 mHost2 path2
+    --
+    -- 返回 False = 链接结构**没**谈成（还有未消解的冲突、有动作没落地，或用户在确认处拒绝）
+    -- → **不进文件阶段**。理由：文件阶段的比较键只有"相对路径 + (size,mtime)"，
+    -- 它默认两端同一路径指同一个对象；链接没对齐时这个前提不成立 —— 跟随链接扫出来
+    -- 的两份内容会被当成"同一个逻辑路径的差异"互相纠正，而落地是穿透末端链接写到
+    -- 目标上（可能是同步根之外、且是用户还没决定的那一边），等于替用户做了决定。
+    linksAgreed <- syncLinkPhase profile mTag mHost1 path1 mHost2 path2
+    if linksAgreed
+        then do
+            syncFilePhases profile mTag mHost1 path1 mHost2 path2
+            putStrLn "\nSync complete."
+        else
+            putStrLn "\nSymlinks not in sync; stopping before the file phase."
 
+-- | 第 4~6 步：读状态 → 计算动作 → 执行。
+--
+--   **前提：两端链接结构已一致**（由 'syncLinkPhase' 把关）。链接没对齐时这里的
+--   一切比较都失去依据 —— 见 'runSync' 阶段 3 的注释。
+syncFilePhases
+    :: String -> Maybe String -> Maybe String -> FilePath -> Maybe String -> FilePath -> IO ()
+syncFilePhases profile mTag mHost1 path1 mHost2 path2 = do
     -- 阶段 4：并行读取两端状态（各自按已统一的 ignore 过滤）
     --
     --   悬空链接不做特殊处理：扫描跟随链接时那里自然"什么都没有"，
@@ -178,10 +197,10 @@ runSync srcKind profile root1 root2 = do
                 if not yes
                     then putStrLn "Aborted."
                     else do
-                        execute SKFile mTag side1 side2 pairs1''
-                        execute SKFile mTag side2 side1 pairs2''
-
-    putStrLn "\nSync complete."
+                        -- 文件阶段不设闸门（它就是最后一步）：执行失败会在上面自己报出来。
+                        _ <- execute SKFile mTag side1 side2 pairs1''
+                        _ <- execute SKFile mTag side2 side1 pairs2''
+                        return ()
 
 -- | 第 1 步（sync prepare）的输出：**按 root1 / root2 side 分组**，
 --   每组只列真的发生了的动作：
@@ -432,9 +451,18 @@ askYesNo prompt = do
 --
 --   输出（用户 2026-09-22 定）：**只说动作** —— 没有任何动作时除了阶段标题一个字不输出；
 --   有动作才由 'showSummary' 列出并问一次确认（不需要像文件阶段那样统计前后条数）。
+--
+--   返回值 = **链接结构是否已达成一致**（决定 'runSync' 要不要继续文件阶段）：
+--   * 本来就一致（没有任何动作）→ 'True'
+--   * 只剩冲突（没有能执行的动作）→ 'False'（不提问、不起 helper，列完清单就结束）
+--   * 用户拒绝执行 → 'False'
+--   * 有动作没落地（删除失败 / 链接没建上）→ 'False'
+--   * 执行完仍有未消解冲突 → 'False'
+--
+--   即"真正一致" = 该做的都做成了 **且** 一条冲突都不剩。
 syncLinkPhase
     :: String -> Maybe String
-    -> Maybe String -> FilePath -> Maybe String -> FilePath -> IO ()
+    -> Maybe String -> FilePath -> Maybe String -> FilePath -> IO Bool
 syncLinkPhase profile mTag mHost1 path1 mHost2 path2 = do
     putStrLn "\n[3/6] Syncing symlinks ..."
     ((_label1, (last1, cur1)), (_label2, (last2, cur2))) <-
@@ -447,19 +475,32 @@ syncLinkPhase profile mTag mHost1 path1 mHost2 path2 = do
     -- 输出约定（用户 2026-09-22）：**只有真的有动作（要确认）时才列出来并提问**。
     -- 不统计两端软链接的前后条数（那是文件阶段的口径，链接阶段不需要），
     -- 链接结构本来就一致时这里一个字都不说。
-    when hasWork $ do
-        showSummary pairs1' pairs2'
-        -- 只剩冲突（要跳过的那些）时没有要执行的动作：不必确认，也不用起 helper，
-        -- 列完清单直接结束（用户 2026-09-23 定，与文件阶段口径一致）。
-        when (hasApplicableAction pairs1' pairs2') $ do
-            yes <- askYesNo "\nApply symlink changes? [y/N] "
-            if not yes
-                then putStrLn "Aborted (symlink phase)."
-                else withHelpers mHost1 path1 mHost2 path2 profile $ \side1 side2 -> do
-                        execute SKLink mTag side1 side2 pairs1'
-                        discardLocal side1 mTag pairs1'
-                        execute SKLink mTag side2 side1 pairs2'
-                        discardLocal side2 mTag pairs2'
+    if not hasWork
+        then return True
+        else do
+            showSummary pairs1' pairs2'
+            -- 只剩冲突（要跳过的那些）时没有要执行的动作：不必确认，也不用起 helper，
+            -- 列完清单直接结束（用户 2026-09-23 定，与文件阶段口径一致）——但结构没谈成，
+            -- 返回 False，文件阶段不做。
+            if not (hasApplicableAction pairs1' pairs2')
+                then return False
+                else do
+                    yes <- askYesNo "\nApply symlink changes? [y/N] "
+                    if not yes
+                        then do
+                            putStrLn "Aborted (symlink phase)."
+                            return False
+                        else do
+                            applied <- withHelpers mHost1 path1 mHost2 path2 profile $ \side1 side2 -> do
+                                ok1 <- execute SKLink mTag side1 side2 pairs1'
+                                discardLocal side1 mTag pairs1'
+                                ok2 <- execute SKLink mTag side2 side1 pairs2'
+                                discardLocal side2 mTag pairs2'
+                                return (ok1 && ok2)
+                            unless applied $
+                                putStrLn "  WARNING: symlink changes not fully applied."
+                            -- 真正一致 = 该做的都落地了 **且** 没留下未消解冲突
+                            return (applied && not (hasUnresolved pairs1' pairs2'))
 
 -- | 链接阶段刚在某端建/改了一个链接：把该端这个链接**子树**下的文件基线条目作废。
 --
@@ -478,7 +519,7 @@ discardLocal (Rmt _) _ _ = return ()
 -- | 按需为两端派生 helper，在其生命周期内执行动作（文件/链接阶段共用）
 withHelpers
     :: Maybe String -> FilePath -> Maybe String -> FilePath -> String
-    -> (Side -> Side -> IO ()) -> IO ()
+    -> (Side -> Side -> IO a) -> IO a
 withHelpers mHost1 path1 mHost2 path2 profile k =
     bracket (maybe (return Nothing) (\h -> Just <$> spawnHelper h path1 profile) mHost1)
             (maybe (return ()) (\hh -> destroyHelper hh))
@@ -685,12 +726,30 @@ hasApplicableAction pairs1 pairs2 = any applicable (pairs1 ++ pairs2)
     applicable (_, Just _)          = True
     applicable (_, Nothing)         = False
 
+-- | 这批动作里**还有没有未消解的冲突**（@Conflict … Just Unsolvable@）。
+--
+--   链接阶段用它判断"结构到底有没有谈成"：冲突在 pairs1 / pairs2 里各有一条，
+--   只要还剩一条，两端链接结构就仍有分歧 → 'syncLinkPhase' 返回 'False'，
+--   文件阶段整体不做（见 'runSync' 阶段 3）。
+hasUnresolved
+    :: [(FileChange, Maybe SyncAction)] -> [(FileChange, Maybe SyncAction)] -> Bool
+hasUnresolved pairs1 pairs2 = any unresolved (pairs1 ++ pairs2)
+  where
+    unresolved (Conflict _ _ _, Just Unsolvable) = True
+    unresolved _                                 = False
+
 -- | 执行一侧的所有操作（文件/链接阶段共用，动作按 kind 区分）。
 --
 --   顺序固定为：**先"纯纪录"的动作**（只写状态、不动文件内容），**再删除，最后传输**
 --   —— 纯纪录是双方内容已经一致、只补状态的事，先落地它，确认环节里出现过的东西
 --   就不会因为后面的动作而变卦。
-execute :: SyncKind -> Maybe String -> Side -> Side -> [(FileChange, Maybe SyncAction)] -> IO ()
+--
+--   返回值 = **每个动作都真的落地了**（删除真删了、链接真建上了）。
+--   链接阶段用它当闸门的一部分：只要有一个动作没落地，两端链接结构就仍不一致
+--   → 文件阶段不做（见 'syncLinkPhase' / 'runSync' 阶段 3）。
+--   没落地的动作**不写记录**：记录等于断言"这件事发生了"，写了会让基线撒谎、
+--   把分歧在下一轮隐掉；留原样才能下一轮重新发现它。
+execute :: SyncKind -> Maybe String -> Side -> Side -> [(FileChange, Maybe SyncAction)] -> IO Bool
 execute kind mTag self other pairs = do
     let receives   = [ (filename fs, mode fs, posixSecs (mtime fs))
                      | (Added     fs _ _, Just Receive)       <- pairs ]
@@ -712,41 +771,59 @@ execute kind mTag self other pairs = do
             putStrLn $ "  del " ++ relPath
             appendEnd kind self  mTag RecDelete relPath
             appendEnd kind other mTag RecDelete relPath
-    unless (null removes) $ do
-        putStrLn "\nDeleting then record..."
-        forM_ removes $ \(relPath, _, _) -> do
-            putStrLn $ "  " ++ kindDeleteVerb kind ++ " " ++ relPath
-            delEnd kind self relPath
-            appendEnd kind self  mTag RecDelete relPath
-            appendEnd kind other mTag RecDelete relPath
-    unless (null receives) $ do
-        putStrLn "\nReceiving then record..."
-        forM_ receives $ \(relPath, srcMode, srcMtime) -> do
-            putStrLn $ "  " ++ kindVerb kind ++ " " ++ relPath
-            copyEndToEnd kind other self mTag relPath srcMode srcMtime
+    okRemoves <- if null removes
+        then return True
+        else do
+            putStrLn "\nDeleting then record..."
+            and <$> forM removes (\(relPath, _, _) -> do
+                putStrLn $ "  " ++ kindDeleteVerb kind ++ " " ++ relPath
+                ok <- delEnd kind self relPath
+                if ok
+                    then do
+                        appendEnd kind self  mTag RecDelete relPath
+                        appendEnd kind other mTag RecDelete relPath
+                    -- 没删成 → **不写记录**：留原样，下一轮才会重新发现这个分歧
+                    else return ()
+                return ok)
+    okReceives <- if null receives
+        then return True
+        else do
+            putStrLn "\nReceiving then record..."
+            and <$> forM receives (\(relPath, srcMode, srcMtime) -> do
+                putStrLn $ "  " ++ kindVerb kind ++ " " ++ relPath
+                copyEndToEnd kind other self mTag relPath srcMode srcMtime)
+    return (okRemoves && okReceives)
 
 -- ============================================================================
 -- End 操作
 -- ============================================================================
 
-delEnd :: SyncKind -> Side -> FilePath -> IO ()
-delEnd SKFile (Lcl root) relPath = removeFileSafe (root </> relPath)
+-- | 删除一侧的条目。返回值 = **真的删了**（对文件来说：删动作没抛异常就算成功）。
+--
+--   链接阶段：只删链接本身（unlink），不跟随到目标；占位不是链接则**不算成功**
+--   （扫描→执行之间本地被改成了真实文件/目录）——不能当成"已对齐"放行。
+delEnd :: SyncKind -> Side -> FilePath -> IO Bool
+delEnd SKFile (Lcl root) relPath = do
+    removeFileSafe (root </> relPath)
+    return True
 delEnd SKFile (Rmt hh)  relPath = do
     res <- call hh (Msg.cmd "unlink" [("kind", kindName FileKind), ("path", Msg.str relPath)])
     case res of
         Left err -> error $ "FATAL: remote unlink failed: " ++ err
-        Right _  -> return ()
--- 链接阶段：只删链接本身（unlink），不跟随到目标；占位不是链接则不动
+        Right _  -> return True
 delEnd SKLink (Lcl root) relPath = do
     ok <- removeLinkSafe (root </> relPath)
     unless ok $ putStrLn $ "  WARNING: not a symlink, left untouched: " ++ relPath
+    return ok
 delEnd SKLink (Rmt hh) relPath = do
     res <- call hh (Msg.cmd "unlink" [("kind", kindName LinkKind), ("path", Msg.str relPath)])
     case res of
         Left err -> error $ "FATAL: remote unlink (link) failed: " ++ err
         Right v  -> case Msg.asBool =<< Msg.field "notLink" v of
-            Just True -> putStrLn $ "  WARNING: not a symlink, left untouched: " ++ relPath
-            _         -> return ()
+            Just True -> do
+                putStrLn $ "  WARNING: not a symlink, left untouched: " ++ relPath
+                return False
+            _         -> return True
 
 appendEnd :: SyncKind -> Side -> Maybe String -> Rec -> FilePath -> IO ()
 appendEnd kind (Lcl root) mTag rec relPath =
@@ -763,15 +840,19 @@ appendEnd kind (Rmt hh) _mTag rec relPath = do
 
 -- | 跨端复制文件：传输 + 校验（rename 之前） + 记录。
 --   校验在目标端 rename 之前完成——不通过则目标文件完全不受影响。
-copyEndToEnd :: SyncKind -> Side -> Side -> Maybe String -> FilePath -> Int -> Integer -> IO ()
+--   返回值 = 是否真的落地（没落地就不写记录，见 'execute'）。
+copyEndToEnd :: SyncKind -> Side -> Side -> Maybe String -> FilePath -> Int -> Integer -> IO Bool
 copyEndToEnd kind src dst mTag relPath srcMode srcMtime = do
     result <- transferContent kind src dst relPath srcMode srcMtime
     case result of
-        Left err -> putStrLn $ "  " ++ err
+        Left err -> do
+            putStrLn $ "  " ++ err
+            return False
         Right () -> do
             putStrLn "    verified OK"
             appendEnd kind dst mTag RecAdd relPath
             appendEnd kind src mTag RecAdd relPath
+            return True
 
 -- | 执行内容传输。本地目标使用 'writeFileVerified' / 'writeLinkVerified'
 --   （校验通过才 rename），远程目标使用扩展的 RECV/LINKRECV 协议
