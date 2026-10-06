@@ -21,7 +21,7 @@ module Msg
     , encode, encodeLine, decode, decodeStrict
     , int, str, bytes, arr, obj, cmd, raw
     , intBuilder, strBuilder
-    , field, fieldInt, fieldStr, asInt, asStr, asArr, asBool
+    , field, fieldInt, fieldStr, fieldBools, asInt, asStr, asArr, asBool
     ) where
 
 import Data.Bits ((.&.), shiftR)
@@ -70,9 +70,13 @@ bytes = JStr
 arr :: [Value] -> Value
 arr = JArr
 
--- | 对象；键顺序即输出顺序（规范输出的一部分）
+-- | 对象；键顺序即输出顺序（规范输出的一部分）。
+--
+--   键按 **UTF-8** 编码。以前这里是 `B8.pack`（Char8，会把非 ASCII 截断），
+--   现有调用方全是 @"cmd"@ 这种 ASCII 字面量所以看不出问题；但键还可能来自**数据**
+--   （例如 state 响应的 @rmdir@ 用文件名做键），那必须编成真正的 UTF-8。
 obj :: [(String, Value)] -> Value
-obj = JObj . map (\(k, v) -> (B8.pack k, v))
+obj = JObj . map (\(k, v) -> (T.encodeUtf8 (T.pack k), v))
 
 -- | 请求：@{"cmd":<name>, 其它字段…}@
 cmd :: String -> [(String, Value)] -> Value
@@ -104,6 +108,20 @@ fieldInt k v = field k v >>= asInt
 -- | 字符串字段（UTF-8 宽容解码；用于 cmd/kind/error/路径这类小字符串）
 fieldStr :: String -> Value -> Maybe String
 fieldStr k v = field k v >>= asStr >>= Just . T.unpack . T.decodeUtf8With TEE.lenientDecode
+
+-- | 「路径 → 布尔」的**有序**列表字段：@[{"相对路径":true}, …]@
+--   （例如 state 响应里的 @rmdir@）。
+--
+--   为什么不是一个大对象：**JSON 对象在语义上是无序的**，而这里的顺序有意义
+--   （深 → 浅）。数组元素有序，所以用「单个键值对」组成的数组。
+--   缺失 / 形状不对 → 空列表；不是「恰好一个键、值是布尔」的元素**跳过**，
+--   不让一项毁掉整批。
+fieldBools :: String -> Value -> [(String, Bool)]
+fieldBools k v = case field k v of
+    Just (JArr xs) -> [ (T.unpack (T.decodeUtf8With TEE.lenientDecode kb), ok)
+                      | JObj [(kb, ov)] <- xs
+                      , Just ok         <- [asBool ov] ]
+    _              -> []
 
 asInt :: Value -> Maybe Integer
 asInt (JInt n) = Just n

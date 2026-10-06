@@ -25,7 +25,7 @@ import qualified Data.ByteString.Lazy as BL
 import State
     ( FileState(..), StateKind(..)
     , appendAddedKind, appendDeletedKind
-    , currentState, currentLinkState, lastStateKind
+    , currentStateWith, currentLinkState, lastStateKind
     , stateBuilder, discardStateUnder
     )
 import Write
@@ -153,19 +153,35 @@ isEOF = catch (hLookAhead stdin >> return False) handler
 -- 状态（state = 本次扫描，last = 上次基线）
 -- ============================================================================
 
--- | @{"cmd":"state"|"last","kind":…}@ → @{"entries":[[size,mtime,mode,name],…]}@
+-- | @{"cmd":"state","kind":…}@ → @{"entries":[…]}@（文件扫描还可能带 @rmdir@，见下）
+--
+--   文件扫描（'FileKind'）会**顺带清理空目录**（见 'State.currentStateWith'），
+--   所以响应会多带一个 @rmdir@：本次**发起过的每一次 rmdir**，形如
+--   @[{"相对路径":true}, …]@ —— 数组保证顺序（深 → 浅），元素是单个键值对
+--   （键 = 路径，值 = 是否真的删掉）。不只是成功的 —— 失败意味着
+--   "判定为空之后必然成功"被打破，那正是主控端要看见的信号。
+--
+--   一个路径在一次扫描里最多只会发起一次 rmdir，所以键不会重复。
+--   **一次都没发起就整个字段都不出现**：老主控端会忽略这个未知键，
+--   新主控端把字段缺失当空列表，两个方向都兼容。
+--   远端 helper 的 stdout 就是协议，不能自己打印，只能回报给主控端统一展示。
 cmdState :: FilePath -> Maybe String -> StateKind -> IO ()
-cmdState root mTag kind = replyOk . entries =<< currentKind kind root mTag
+cmdState root mTag kind = do
+    (sts, rmdirs) <- currentKind kind root mTag
+    replyOk $ [ ("entries", Msg.raw (stateBuilder sts)) ]
+           ++ [ ("rmdir", Msg.arr [ Msg.obj [(p, Msg.JBool ok)] | (p, ok) <- rmdirs ])
+              | not (null rmdirs) ]
 
+-- | @{"cmd":"last","kind":…}@ → @{"entries":[…]}@（读基线：不扫描、不清理）
 cmdLast :: FilePath -> Maybe String -> StateKind -> IO ()
 cmdLast root mTag kind = replyOk . entries =<< lastStateKind kind root mTag
 
 entries :: [FileState] -> [(String, Msg.Value)]
 entries st = [("entries", Msg.raw (stateBuilder st))]
 
-currentKind :: StateKind -> FilePath -> Maybe String -> IO [FileState]
-currentKind FileKind root mTag = currentState root mTag
-currentKind LinkKind root mTag = currentLinkState root mTag
+currentKind :: StateKind -> FilePath -> Maybe String -> IO ([FileState], [(FilePath, Bool)])
+currentKind FileKind root mTag = currentStateWith True root mTag
+currentKind LinkKind root mTag = (\s -> (s, [])) <$> currentLinkState root mTag
 
 -- ============================================================================
 -- ADD / DELETE / UNLINK

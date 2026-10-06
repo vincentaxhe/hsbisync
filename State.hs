@@ -9,7 +9,7 @@ import Data.Time.Clock.POSIX (posixSecondsToUTCTime, utcTimeToPOSIXSeconds)
 
 import System.Directory
     ( createDirectoryIfMissing, doesFileExist
-    , listDirectory, removeFile, renameFile
+    , listDirectory, removeDirectory, removeFile, renameFile
     )
 import System.FilePath (takeFileName, (</>), takeDirectory, dropTrailingPathSeparator)
 import System.IO (hPutStrLn, stderr)
@@ -113,20 +113,41 @@ readProfileIgnore root mTag = do
 scanFiles :: FilePath -> Maybe String -> IO [FilePath]
 scanFiles root mTag = do
     ign <- readProfileIgnore root mTag
-    scanRelFrom [] root root ign
+    srFiles <$> scanRelFrom False [] root root ign
 
 -- | 扫描 root 目录，返回所有文件的 FileState 列表（相对路径）
 --
 --   等同于 @scanFiles + statRel@。
 --   起始时用同步根自身的 (dev,ino) 播种环检测，这样 @link -> .@ 这类
 --   指回根目录的链接在第 1 层就会被切断。
+--
+--   **只读**：不会改动文件树（@hsbisync diff@ 用的就是它）。
 currentState :: FilePath -> Maybe String -> IO [FileState]
-currentState root mTag = do
+currentState root mTag = fst <$> currentStateWith False root mTag
+
+-- | 扫描 root 目录：返回（文件的 FileState 列表, 本次**每一次 rmdir 尝试**）。
+--
+--   @cleanup = True@ 时，**在扫描过程中**把空目录 rmdir 掉 —— 扫描本来就要
+--   进入/查看/离开每一个目录，空判定是顺带得出的，不必再走一趟文件树。
+--
+--   判空用的是"扫描时看到的全部条目"，不只看被跟踪的文件：被 ignore 的条目与
+--   悬空链接都**留在盘上**（见 'staying'），只要还剩一条，这个目录就不算空。
+--   所以每个 rmdir 都是判定之后的提交，**应该总是成功**；只回报不抛异常
+--   （见 'tryRemoveDirectory'）。
+--
+--   第二项记录**发起过的每一次 rmdir**（不只是成功的）：Bool = 是否真的删掉了。
+--   正常情况下它恒为 True，所以出现 False 就是一个**值得看的信号**
+--   （竞态 / 挂载点 EBUSY / 权限 / 只读文件系统），由主控端上报，不在这里吞掉。
+--
+--   同步流程用 @cleanup = True@；只读预览（diff）用 'currentState'。
+currentStateWith :: Bool -> FilePath -> Maybe String -> IO ([FileState], [(FilePath, Bool)])
+currentStateWith cleanup root mTag = do
     ign <- readProfileIgnore root mTag
     mRootId <- dirIdent root
     let seed = maybe [] (:[]) mRootId
-    files <- scanRelFrom seed root root ign
-    mapM (statRel root) files
+    res <- scanRelFrom cleanup seed root root ign
+    sts <- mapM (statRel root) (srFiles res)
+    return (sts, srRmdir res)
 
 -- | 内部递归扫描（兼容旧接口，不使用任何忽略规则）
 scanRel :: FilePath -> FilePath -> IO [FilePath]
@@ -138,7 +159,7 @@ scanRel root dir = scanRel' root dir emptyIgnore
 --   工具状态目录 @.bisync@；其余一律交给 ignore 规则 —— 包括工具自己的临时文件：
 --   扫描只看文件树的真相，要排除什么就写进 ignore（见 'Tmp'）。
 scanRel' :: FilePath -> FilePath -> Ignore -> IO [FilePath]
-scanRel' root dir ignoreRules = scanRelFrom [] root dir ignoreRules
+scanRel' root dir ignoreRules = srFiles <$> scanRelFrom False [] root dir ignoreRules
 
 -- ============================================================================
 -- 扫描：文件阶段（跟随软链接，内容透明）
@@ -167,6 +188,34 @@ classifyEntry path = do
                 Left _   -> return SkipEntry
                 Right tg -> return (if isDirectory tg then DirEntry else FileEntry)
 
+-- | 一次目录递归扫描的产物
+--
+--   清理空目录需要在**离开目录时**知道它现在空不空，所以递归要把三件事带回来：
+--   子树里的文件、子树里**发起过的每一次 rmdir**（路径 + 是否真的删掉）、
+--   以及**本目录自身是否刚被删掉**（父目录据此判断自己是否也空了）。
+--
+--   @srRmdir@ 里出现 @False@ 意味着"预期必然成功"没有成立 —— 那是一个信号，
+--   原样上报给主控端告警，不在这里抹掉。
+data ScanResult = ScanResult
+    { srFiles   :: [FilePath]             -- ^ 本目录及其子树里的文件（相对 root）
+    , srRmdir   :: [(FilePath, Bool)]     -- ^ 发起过的 rmdir：相对路径 + 是否真的删掉（深 → 浅）
+    , srRemoved :: Bool                   -- ^ 本目录**自身**是否刚被删掉
+    }
+
+-- | 空结果：软链接环 / 扫描期间消失 —— 没有文件，也没发起过 rmdir，自身不视为已删
+--   （那些条目还留在盘上，所以上层目录不该被判空）
+emptyScan :: ScanResult
+emptyScan = ScanResult [] [] False
+
+-- | rmdir 一个**已判定为空**的目录；返回是否真的删掉了。
+--
+--   只用 rmdir（'removeDirectory'）—— **绝不做递归删除**；失败不抛异常，
+--   由调用方把这次尝试（含失败）报上去（挂载点 EBUSY / 权限 / 竞态）。
+tryRemoveDirectory :: FilePath -> IO Bool
+tryRemoveDirectory d = do
+    r <- (try (removeDirectory d) :: IO (Either IOException ()))
+    return (either (const False) (const True) r)
+
 -- | 目录解析后的身份 (dev, ino)，跟随软链接；不存在返回 Nothing
 --   用于切断软链接环（例如 @link -> .@ 这类指回祖先目录的链接）
 dirIdent :: FilePath -> IO (Maybe (DeviceID, FileID))
@@ -176,14 +225,27 @@ dirIdent path = do
         Right st -> Just (deviceID st, fileID st)
         Left _   -> Nothing
 
--- | 递归扫描（文件阶段）：返回文件相对路径
+-- | 递归扫描（文件阶段）：返回文件相对路径 + 本次顺带删掉的空目录
 --
---   软链接在这里就是普通路径（stat 跟随、写入穿透到目标）；
+--   软链接在这里就是普通路径（stat 跟随、读写删都穿透中间链接）；
 --   悬空链接扫不到东西，diff 自然得到 Deleted / None，不做特殊处理。
+--   环（@link -> .@ 这类）由 'descend' 里的祖先链 `dirIdent` 拦住。
+--
+--   清理（@cleanup = True@）：离开一个目录时，如果它**现在**已经空无一物，就 rmdir。
+--   "空"的判据是扫描时看到的全部条目 —— 除了被跟踪的文件，被 ignore 的条目和
+--   悬空链接也都算占位（'staying'），所以不会误删。
+--
+--   清理**不特判软链接的子树**：文件阶段本就穿透中间链接（读、写、删都是），
+--   清理走同一条路径才一致；否则"经链接才够得着"的空目录永远清理不到。
+--
+--   但**最后一段是链接时不尝试 rmdir**：那一条目录项是**链接阶段的对象**，
+--   清理本来就不该去删它（内核也会用 ENOTDIR 拒绝）。先判掉是为了不让
+--   "明知会失败还发一次" 污染下面的失败上报。
 scanRelFrom
-    :: [(DeviceID, FileID)]   -- ^ 当前路径上各级目录（解析后）的身份，用于环检测
-    -> FilePath -> FilePath -> Ignore -> IO [FilePath]
-scanRelFrom visited root dir ignoreRules = do
+    :: Bool                      -- ^ 是否顺带清理空目录（False = 纯只读扫描）
+    -> [(DeviceID, FileID)]       -- ^ 当前路径上各级目录（解析后）的身份，用于环检测
+    -> FilePath -> FilePath -> Ignore -> IO ScanResult
+scanRelFrom cleanup visited root dir ignoreRules = do
     entries <- listDirectory dir
     let atRoot  = dir == root
         visible = [ e | e <- entries
@@ -197,26 +259,52 @@ scanRelFrom visited root dir ignoreRules = do
     osPaths  <- mapM encodeFS relPaths
     let isDirFlag k = case k of DirEntry -> True; _ -> False
         ignored  = zipWith (ignores ignoreRules) osPaths (map isDirFlag kinds)
-        kept     = [ (fp, k)
-                   | (fp, k, ign) <- zip3 fullPaths kinds ignored
-                   , k /= SkipEntry, not ign ]
+        -- 留在盘上的条目：被 ignore 的条目、悬空链接（'SkipEntry'）。
+        -- 只要还剩一条，本目录就永远不空 —— 这也是"不误删"的根据。
+        staying  = [ fp | (fp, k, ign) <- zip3 fullPaths kinds ignored
+                        , k == SkipEntry || ign ]
+        kept     = [ (fp, k) | (fp, k, ign) <- zip3 fullPaths kinds ignored
+                             , k /= SkipEntry, not ign ]
 
     let dirs  = [ d | (d, DirEntry)  <- kept ]
         files = [ f | (f, FileEntry) <- kept ]
 
-    subs <- mapM (descend visited root ignoreRules) dirs
-    let relFiles = map (makeRelative root) files
-    return (concat subs ++ relFiles)
+    subs <- mapM descend dirs
+    let relFiles  = map (makeRelative root) files
+        rmdirSub  = concatMap srRmdir subs
+        -- 本目录现在空不空：没有留在盘上的条目、没有文件、且每个子目录都被删掉了
+        emptyNow  = null staying && null files && all srRemoved subs
+        rel       = makeRelative root dir
+
+    (removed, rmdirSelf) <-
+        if cleanup && not atRoot && emptyNow
+            then do
+                -- 最后一段是链接 → 那是链接阶段的对象，不尝试（不是失败，就没有记录）
+                lst <- (try (getSymbolicLinkStatus dir)
+                        :: IO (Either IOException FileStatus))
+                case lst of
+                    Right st | isSymbolicLink st -> return (False, [])
+                    _ -> do
+                        ok <- tryRemoveDirectory dir
+                        -- 尝试过就记下来：成功/失败都报给主控端
+                        return (ok, [(rel, ok)])
+            else return (False, [])
+
+    return ScanResult
+        { srFiles   = concatMap srFiles subs ++ relFiles
+        , srRmdir   = rmdirSub ++ rmdirSelf      -- 深 → 浅：子目录先删，父目录才可能空
+        , srRemoved = removed
+        }
   where
-    descend vs rt ign d = do
+    descend d = do
         mIdent <- dirIdent d
         case mIdent of
             Just ident
-                | ident `elem` vs -> do
+                | ident `elem` visited -> do
                     hPutStrLn stderr $ "WARNING: symlink loop skipped: " ++ d
-                    return []
-                | otherwise -> scanRelFrom (ident : vs) rt d ign
-            Nothing -> return []   -- 竞态：扫描期间消失
+                    return emptyScan
+                | otherwise -> scanRelFrom cleanup (ident : visited) root d ignoreRules
+            Nothing -> return emptyScan   -- 竞态：扫描期间消失
 
 -- | 获取单个文件的 FileState（跟随软链接：size/mtime 取自目标）
 statRel :: FilePath -> FilePath -> IO FileState

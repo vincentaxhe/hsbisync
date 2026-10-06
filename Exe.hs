@@ -23,7 +23,7 @@ import Connect (destroyHelper, handshakeInfo, prepareRemotes, spawnHelper)
 import State
     ( FileState(..), FileChange(..), StateKind(..)
     , parseStateValue, statRel
-    , currentState, currentLinkState
+    , currentStateWith, currentLinkState
     , lastStateKind, appendAddedKind, appendDeletedKind, discardStateUnder, posixSecs
     , indexStates, dedup
     )
@@ -153,8 +153,14 @@ syncFilePhases profile mTag mHost1 path1 mHost2 path2 = do
     --   输出（用户 2026-09-22）：不统计条数 —— 想看变化看第 5 步的初步统计，
     --   这一步只留阶段标题。
     putStrLn "\n[4/6] Reading states ..."
-    ((_label1, (last1, cur1)), (_label2, (last2, cur2))) <-
+    ((_label1, (last1, cur1), rmdir1), (_label2, (last2, cur2), rmdir2)) <-
         concurrently (readSideK SKFile mTag mHost1 path1) (readSideK SKFile mTag mHost2 path2)
+
+    -- 第 4 步的收尾：扫描本来就要进入/查看/离开每一个目录，空判定是顺带得出的，
+    -- 所以"清理空目录"就发生在这里（只用 rmdir，绝不递归删）。
+    -- 两端各清各的：空不空只有本端盘上的真相说了算。
+    showRmdirResults "root1" rmdir1
+    showRmdirResults "root2" rmdir2
 
     -- 名字索引：名字 → 当前状态。后面（内容校验）只做 O(log n) 查询，
     -- 不再逐条线性重找（那是 O(n²)）。惰性：不会走到的路径就不会建索引。
@@ -465,7 +471,7 @@ syncLinkPhase
     -> Maybe String -> FilePath -> Maybe String -> FilePath -> IO Bool
 syncLinkPhase profile mTag mHost1 path1 mHost2 path2 = do
     putStrLn "\n[3/6] Syncing symlinks ..."
-    ((_label1, (last1, cur1)), (_label2, (last2, cur2))) <-
+    ((_label1, (last1, cur1), _), (_label2, (last2, cur2), _)) <-
         concurrently (readSideK SKLink mTag mHost1 path1) (readSideK SKLink mTag mHost2 path2)
 
     let (_, pairs1, _, pairs2) = sync (last1, last2) (cur1, cur2)
@@ -668,35 +674,40 @@ kindWriteLocal
 kindWriteLocal SKFile = writeFileVerified
 kindWriteLocal SKLink = writeLinkVerified
 
--- | 读取一端的状态：(label, (上次状态, 当前状态))
+-- | 读取一端的状态：(label, (上次状态, 当前状态), 本次扫描发起过的每一次 rmdir)
 --
 --   悬空链接没有特殊处理：扫描只是扫不到那里的东西。
+--   第三项只对**文件**扫描有意义：链接扫描不清理（见 'State.currentStateWith'）。
 readSideK
     :: SyncKind -> Maybe String -> Maybe String -> FilePath
-    -> IO (String, ([FileState], [FileState]))
+    -> IO (String, ([FileState], [FileState]), [(FilePath, Bool)])
 readSideK kind mTag mHost path =
     case mHost of
         Nothing -> do
             l <- lastStateKind (kindState kind) path mTag
-            c <- case kind of
-                SKFile -> currentState path mTag
-                SKLink -> currentLinkState path mTag
-            return ("local", (l, c))
+            (c, rmdirs) <- case kind of
+                SKFile -> currentStateWith True path mTag
+                SKLink -> (\s -> (s, [])) <$> currentLinkState path mTag
+            return ("local", (l, c), rmdirs)
         Just host -> do
             hh <- spawnHelper host path (fromMaybe "" mTag)
-            l <- getHelperStates hh "last"  (kindState kind)
-            c <- getHelperStates hh "state" (kindState kind)
+            (l, _)       <- getHelperStates hh "last"  (kindState kind)
+            (c, rmdirs)  <- getHelperStates hh "state" (kindState kind)
             destroyHelper hh
-            return ("ssh " ++ host, (l, c))
+            return ("ssh " ++ host, (l, c), rmdirs)
 
 -- | 读对端状态：which = "state"（本次扫描）或 "last"（上次基线）
-getHelperStates :: HelperHandle -> String -> StateKind -> IO [FileState]
+--
+--   "state" 的响应里还可能带 @rmdir@：本次**发起过的每一次 rmdir**，形如
+--   @[{"相对路径": 是否成功}, …]@（**数组**保序，深 → 浅）；
+--   "last" 只读基线，不带这个字段 → 空列表。
+getHelperStates :: HelperHandle -> String -> StateKind -> IO ([FileState], [(FilePath, Bool)])
 getHelperStates hh which kind = do
     r <- call hh (Msg.cmd which [("kind", kindName kind)])
     case r of
         Left err -> error $ which ++ " failed: " ++ err
         Right v  -> case Msg.field "entries" v of
-            Just e  -> return (parseStateValue e)
+            Just e  -> return (parseStateValue e, Msg.fieldBools "rmdir" v)
             Nothing -> error $ which ++ ": response has no \"entries\""
 
 -- ============================================================================
@@ -931,6 +942,25 @@ hashRemote kind hh relPath = do
 -- ============================================================================
 -- 其他
 -- ============================================================================
+
+-- | 第 4 步的收尾：本次扫描期间**发起过的每一次 rmdir**，按 root 分别列出。
+--
+--   * 成功的 → 列在 "removed empty directories" 下面（正常情况就是全部）；
+--   * **失败的单独告警**：判定为空之后 rmdir 本该必然成功，出现失败说明
+--     "判定"与"事实"不一致（竞态：判定与 rmdir 之间进了新条目），或文件系统拒绝
+--     （挂载点 EBUSY / 权限不足 / 只读文件系统）—— 这是值得看一眼的信号，不静默吞掉。
+--
+--   顺序是深 → 浅（子目录先被删掉，父目录才可能变空）。什么都没发起就一个字不说。
+showRmdirResults :: String -> [(FilePath, Bool)] -> IO ()
+showRmdirResults which rs = do
+    let ok  = [ p | (p, True)  <- rs ]
+        bad = [ p | (p, False) <- rs ]
+    unless (null ok) $ do
+        putStrLn $ "\n" ++ which ++ " removed empty directories:"
+        forM_ ok $ \d -> putStrLn $ "  - " ++ d
+    unless (null bad) $ do
+        putStrLn $ "\nWARNING: " ++ which ++ " could not remove empty directories:"
+        forM_ bad $ \d -> putStrLn $ "  - " ++ d
 
 -- | 第 5 步的初步统计：一端一行，四种状态都列（含 0）。
 --
