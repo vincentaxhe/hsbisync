@@ -45,10 +45,14 @@ main = do
     setFileSystemEncoding utf8
     setLocaleEncoding utf8
     args <- getArgs
+    -- 每个子命令**先按参数个数**校验：数量不对就直接给出该子命令的正确用法，
+    -- 多余参数也算错误（不静默忽略）。只有数量正确时才谈得上"实质性的误用"。
     case args of
         "--helper" : rest  -> helperMain rest
-        ["--help"]         -> showHelp
-        ["diff", profile]  -> cmdDiff profile
+        "--help" : rest
+            | null rest    -> showHelp
+            | otherwise    -> die "Usage: hsbisync --help"
+        "diff" : rest      -> cmdDiff rest
         "profile" : rest   -> cmdProfile rest
         "sync" : rest      -> syncCmd rest
         _                  -> showHelp
@@ -64,8 +68,7 @@ showHelp = putStrLn $ unlines
     , "                 (both ends are recorded when the peer is reached via ssh)"
     , "  hsbisync diff <profile>            Preview local changes (read-only)"
     , "                                      files + symlinks, with size/mtime delta"
-    , "  hsbisync profile                   List all profiles"
-    , "  hsbisync profile <name>            Show profile details"
+    , "  hsbisync profile                   List all profiles (with details)"
     , "  hsbisync --help                    Show this help"
     , ""
     , "Root formats:"
@@ -205,8 +208,13 @@ existingProfiles bisyncDir = do
 --
 --   profile 目录不存在直接报错（'requireProfileDir'，与 @sync \<profile\>@ 同一套警示）：
 --   否则"名字写错"会被伪装成"基线为空 → 整棵树都是 New"。
-cmdDiff :: String -> IO ()
-cmdDiff profile = do
+cmdDiff :: [String] -> IO ()
+cmdDiff [profile] = diffProfile profile
+cmdDiff _         = die "Usage: hsbisync diff <profile>"
+
+-- | 实际执行 diff（参数个数已由 'cmdDiff' 校验）
+diffProfile :: String -> IO ()
+diffProfile profile = do
     cwd <- getCurrentDirectory
     -- 与 sync 一样先查 profile 目录：不存在就是名字写错（而不是"基线为空"），
     -- 否则这里会把整棵树当成 New 全列一遍，看着像正常输出。
@@ -342,16 +350,15 @@ updatedBreakdown kind changed =
 -- profile 子命令（只读：列出 / 显示某个 profile 的 repo 与 ignore）
 -- ============================================================================
 
--- | hsbisync profile            — 列出所有 profile
---   hsbisync profile <name>     — 显示指定 profile
+-- | hsbisync profile — 列出所有 profile（每个都带 repo 与 ignore 详情）。
 --
---   注：repo/ignore 不再由 profile 命令直接写入。
---   repo 改为在 hsbisync sync <profile> <root1> <root2> 时自动记录；
---   ignore 则靠每次 sync 前的 ignore 预同步在两端对齐。
+--   没有"只显示某一个"的模式：列表输出本身就包含全部信息，没必要多一个入口。
+--   注：repo/ignore 不再由 profile 命令直接写入 ——
+--   repo 在 hsbisync sync <profile> <root1> <root2> 时自动记录；
+--   ignore 靠每次 sync 前的 ignore 预同步在两端对齐。
 cmdProfile :: [String] -> IO ()
-cmdProfile []     = cmdProfileList
-cmdProfile [name] = cmdProfileShow name
-cmdProfile _      = die "Usage: hsbisync profile [<name>]"
+cmdProfile [] = cmdProfileList
+cmdProfile _  = die "Usage: hsbisync profile"
 
 -- | 列出 .bisync/ 下所有 profile
 cmdProfileList :: IO ()
@@ -369,16 +376,6 @@ cmdProfileList = do
                     putStrLn "Profiles:"
                     forM_ names $ \name ->
                         showProfile bisyncDir name
-
--- | 显示单个 profile 详情（从 CWD）
-cmdProfileShow :: String -> IO ()
-cmdProfileShow name = do
-    cwd <- getCurrentDirectory
-    let bisyncDir = cwd </> ".bisync"
-    exists <- doesDirectoryExist (bisyncDir </> name)
-    if not exists
-        then putStrLn $ "Profile '" ++ name ++ "' not found."
-        else showProfile bisyncDir name
 
 -- | 显示单个 profile 的 repo 和 ignore 内容
 showProfile :: FilePath -> String -> IO ()
