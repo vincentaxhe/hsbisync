@@ -23,6 +23,7 @@ import GHC.IO.Encoding (setFileSystemEncoding, setLocaleEncoding, utf8)
 
 import Arg (Root(..), parseRoot, parseSyncThree)
 import Exe (RootSource(..), printBanner, runSync)
+import Help (showHelp)
 import Helper (runHelper)
 import State
     ( FileState(..), DiffState(..), SideState(..), StateKind(..)
@@ -49,6 +50,9 @@ main = do
     -- 多余参数也算错误（不静默忽略）。只有数量正确时才谈得上"实质性的误用"。
     case args of
         "--helper" : rest  -> helperMain rest
+        "help" : rest
+            | null rest    -> showHelp
+            | otherwise    -> die "Usage: hsbisync help"
         "--help" : rest
             | null rest    -> showHelp
             | otherwise    -> die "Usage: hsbisync --help"
@@ -57,24 +61,7 @@ main = do
         "sync" : rest      -> syncCmd rest
         _                  -> showHelp
 
-showHelp :: IO ()
-showHelp = putStrLn $ unlines
-    [ "hsbisync - Bidirectional File Synchronization"
-    , ""
-    , "Usage:"
-    , "  hsbisync sync <profile> [<root1> <root2>]"
-    , "    With 1 arg:  read peer from .bisync/<profile>/repo and sync"
-    , "    With 3 args: sync two roots and record the peer into repo file(s)"
-    , "                 (both ends are recorded when the peer is reached via ssh)"
-    , "  hsbisync diff <profile>            Preview local changes (read-only)"
-    , "                                      files + symlinks, with size/mtime delta"
-    , "  hsbisync profile                   List all profiles (with details)"
-    , "  hsbisync --help                    Show this help"
-    , ""
-    , "Root formats:"
-    , "  /local/path"
-    , "  [user@]host:/remote/path"
-    ]
+-- | 完整说明文在 Help.hs（单一维护点）；此处只负责分发。
 
 -- ============================================================================
 -- Helper 模式
