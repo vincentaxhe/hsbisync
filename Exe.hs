@@ -1,7 +1,7 @@
 module Exe where
 
 import Control.Concurrent.Async (concurrently)
-import Control.Exception (ErrorCall, IOException, bracket, catch, displayException)
+import Control.Exception (ErrorCall, IOException, bracket, catch, displayException, try)
 import Control.Monad (filterM, forM, forM_, unless, when)
 import Data.Char (toLower)
 import Data.Maybe (fromMaybe, isJust)
@@ -10,7 +10,7 @@ import qualified Data.Set as Set
 import System.Directory (canonicalizePath, doesFileExist)
 import System.FilePath ((</>))
 import System.IO
-    ( hFlush, stdout, stdin
+    ( IOMode(ReadMode), hClose, hFileSize, hFlush, openBinaryFile, stdout, stdin
     , hSetEcho, hSetBuffering, BufferMode(..)
     , hReady
     )
@@ -29,10 +29,12 @@ import State
     )
 import Sync (sync, SyncAction(..), resolveConflicts, SideStats(..), sideStateLabel)
 import Write
-    ( HelperHandle(..), call, readMsg, hGetExactly, hPutFully
-    , writeFileVerified, writeLinkVerified, readLinkContent
-    , hashBytes, removeFileSafe, removeLinkSafe, getIgnoreRemote, setMtimeOnly
+    ( HelperHandle(..), call, readMsg, sendMsg, hGetExactly
+    , writeLinkVerified, readLinkContent
+    , hashBytes, hashFile, removeFileSafe, removeLinkSafe, getIgnoreRemote, setMtimeOnly
     , writeRepoFile
+    , copyFileStream, copyExactly, copyExactlyHash, discardExactly, padZeros
+    , openTargetTemp, commitReceived, removeQuietly
     )
 import qualified Msg
 import Arg
@@ -378,10 +380,12 @@ markRecordAdd names (Added fs d1 d2, _)
     | Set.member (filename fs) names = (Noop fs d1 d2, Just RecordAdd)
 markRecordAdd _ other = other
 
--- | 取某一端文件内容的 SHA512（本地读字节，远端用 hash 命令）；读不到返回 Nothing
+-- | 取某一端文件内容的 SHA512（本地流式哈希，远端用 hash 命令）；读不到返回 Nothing
+--
+--   本地旧实现是 @BS.readFile@ 后再算（大文件整块进内存），现在走 'hashFile' 分块。
 hashSideContent :: Side -> FilePath -> IO (Maybe String)
 hashSideContent (Lcl root) relPath =
-    fmap Just (hashBytes <$> BS.readFile (root </> relPath)) `catch` ioFail
+    fmap Just (hashFile (root </> relPath)) `catch` ioFail
   where
     ioFail :: IOException -> IO (Maybe String)
     ioFail _ = return Nothing
@@ -662,17 +666,6 @@ kindDeleteVerb SKLink = "unlink"
 kindName :: StateKind -> Msg.Value
 kindName FileKind = Msg.str "file"
 kindName LinkKind = Msg.str "link"
--- | 本地读取"内容"：文件读字节，链接读指向字符串
-kindReadLocal :: SyncKind -> FilePath -> IO BS.ByteString
-kindReadLocal SKFile = BS.readFile
-kindReadLocal SKLink = readLinkContent
-
--- | 本地落地"内容"：写文件 / 建链接（都是先校验后 rename）
-kindWriteLocal
-    :: SyncKind -> FilePath -> FilePath -> BS.ByteString -> Int -> Integer -> String
-    -> IO (Either String ())
-kindWriteLocal SKFile = writeFileVerified
-kindWriteLocal SKLink = writeLinkVerified
 
 -- | 读取一端的状态：(label, (上次状态, 当前状态), 本次扫描发起过的每一次 rmdir)
 --
@@ -865,79 +858,201 @@ copyEndToEnd kind src dst mTag relPath srcMode srcMtime = do
             appendEnd kind src mTag RecAdd relPath
             return True
 
--- | 执行内容传输。本地目标使用 'writeFileVerified' / 'writeLinkVerified'
---   （校验通过才 rename），远程目标使用扩展的 RECV/LINKRECV 协议
---   （helper 端做同样的事）。文件与链接只有"读哪来的内容/怎么落地"不同。
+-- | 执行内容传输。**文件一律流式**（一块 64 KiB，内存 O(1)，与是不是 ssh 无关）：
+--
+--     * 本地 → 本地：读源文件、直接写目标临时文件（不进内存），rename 提交；
+--     * 本地 → 远端：发 recv（size/mode/mtime）→ 流式灌载荷 → 补哈希尾行 → 读结果；
+--     * 远端 → 本地：send 拿 size → 流式收进目标临时文件（边收边算哈希）→
+--       读发送端的哈希尾行比对 → 通过才 rename；
+--     * 远端 → 远端：本端只搬运、不落盘，把发送端算的哈希尾行转给接收端。
+--
+--   载荷格式（文件与链接相同）：请求 → @{"ok":true,…}@ → size 字节裸数据 →
+--   一条 @{"ok":true,"hash":…}@ 尾行 → 结果。哈希由**发送端边读边算**、接收端边收边算，
+--   收完才比对 —— 所以不需要先单独读一遍文件拿哈希（旧实现为此多了一次整文件读取）。
 transferContent :: SyncKind -> Side -> Side -> FilePath -> Int -> Integer -> IO (Either String ())
-transferContent kind (Lcl srcRoot) (Lcl dstRoot) relPath srcMode srcMtime = do
-    let s = srcRoot </> relPath
-        d = dstRoot </> relPath
-    content <- kindReadLocal kind s
-    let expectedHash = hashBytes content
-    kindWriteLocal kind dstRoot d content srcMode srcMtime expectedHash
+transferContent SKFile = transferFile
+transferContent SKLink = transferLink
 
-transferContent kind (Rmt hhSrc) (Lcl dstRoot) relPath srcMode srcMtime = do
-    let d = dstRoot </> relPath
-    expectedHash <- hashRemote kind hhSrc relPath         -- 先拿到期望哈希
-    content <- recvRemoteContent kind hhSrc relPath
-    kindWriteLocal kind dstRoot d content srcMode srcMtime expectedHash
+-- ============================================================================
+-- 文件：流式
+-- ============================================================================
 
-transferContent kind (Lcl srcRoot) (Rmt hhDst) relPath srcMode srcMtime = do
-    let s = srcRoot </> relPath
-    content <- kindReadLocal kind s
-    let expectedHash = hashBytes content
-    recvVerified kind hhDst (BS.length content) relPath srcMode srcMtime expectedHash content
+transferFile :: Side -> Side -> FilePath -> Int -> Integer -> IO (Either String ())
+transferFile (Lcl srcRoot) (Lcl dstRoot) relPath srcMode srcMtime =
+    copyFileStream (srcRoot </> relPath) dstRoot (dstRoot </> relPath) srcMode srcMtime
 
-transferContent kind (Rmt hhSrc) (Rmt hhDst) relPath srcMode srcMtime = do
-    expectedHash <- hashRemote kind hhSrc relPath
-    content <- recvRemoteContent kind hhSrc relPath
-    recvVerified kind hhDst (BS.length content) relPath srcMode srcMtime expectedHash content
+transferFile (Lcl srcRoot) (Rmt hhDst) relPath srcMode srcMtime = do
+    r <- try (openBinaryFile (srcRoot </> relPath) ReadMode)
+    case r of
+        Left e -> return $ Left ("cannot read source: " ++ show (e :: IOException))
+        Right srcH -> do
+            sz <- hFileSize srcH
+            res <- remoteRecvFrom hhDst relPath sz srcMode srcMtime
+                       (copyExactlyHash srcH (Just (hhIn hhDst)) sz)
+            hClose srcH
+            return res
 
--- | 向远端 helper 发 recv（带 size/mode/mtime/hash），传输数据后等它完成
---   写临时文件 → 设属性 → 校验 → rename，并返回结果。
---   链接阶段 mode 不适用（helper 端忽略）。
-recvVerified
-    :: SyncKind -> HelperHandle -> Int -> FilePath -> Int -> Integer -> String
-    -> BS.ByteString -> IO (Either String ())
-recvVerified kind hh sz relPath mode_ mtime_ expectedHash content = do
+transferFile (Rmt hhSrc) (Lcl dstRoot) relPath srcMode srcMtime = do
+    es <- remoteSend hhSrc SKFile relPath
+    case es of
+        Left e -> return (Left e)
+        Right sz -> do
+            prep <- openTargetTemp dstRoot (dstRoot </> relPath)
+            case prep of
+                Left e -> do
+                    -- 源端已经答应了 sz 字节：必须吃掉，否则它的 stdout 被写满会卡住
+                    drainRemoteSend hhSrc sz
+                    return (Left e)
+                Right (target, tmpPath, h) -> do
+                    (actual, n) <- copyExactlyHash (hhOut hhSrc) (Just h) sz
+                    hFlush h
+                    hClose h
+                    if n < sz
+                        then do
+                            removeQuietly tmpPath
+                            return $ Left "connection closed before payload completed; target untouched"
+                        else do
+                            eh <- remoteHashTrailer hhSrc
+                            case eh of
+                                Left e -> removeQuietly tmpPath >> return (Left e)
+                                Right expected ->
+                                    commitReceived target tmpPath srcMode srcMtime actual expected
+
+transferFile (Rmt hhSrc) (Rmt hhDst) relPath srcMode srcMtime = do
+    es <- remoteSend hhSrc SKFile relPath
+    case es of
+        Left e -> return (Left e)
+        Right sz -> do
+            eb <- remoteRecvBegin hhDst SKFile relPath sz srcMode srcMtime
+            case eb of
+                Left e -> drainRemoteSend hhSrc sz >> return (Left e)
+                Right () -> do
+                    n <- copyExactly (hhOut hhSrc) (hhIn hhDst) sz
+                    eh <- remoteHashTrailer hhSrc
+                    finishRemoteRecv hhDst sz n (either (const "") id eh)
+
+-- ============================================================================
+-- 链接：内容是"指向字符串"（几十字节），整块传输；载荷格式与文件一致
+-- ============================================================================
+
+transferLink :: Side -> Side -> FilePath -> Int -> Integer -> IO (Either String ())
+transferLink (Lcl srcRoot) (Lcl dstRoot) relPath srcMode srcMtime = do
+    content <- readLinkContent (srcRoot </> relPath)
+    writeLinkVerified dstRoot (dstRoot </> relPath) content srcMode srcMtime
+        (hashBytes content)
+
+transferLink (Lcl srcRoot) (Rmt hhDst) relPath srcMode srcMtime = do
+    content <- readLinkContent (srcRoot </> relPath)
+    let hsh = hashBytes content
+        sz  = toInteger (BS.length content)
+    eb <- remoteRecvBegin hhDst SKLink relPath sz srcMode srcMtime
+    case eb of
+        Left e -> return (Left e)
+        Right () -> do
+            BS.hPut (hhIn hhDst) content
+            hFlush (hhIn hhDst)
+            finishRemoteRecv hhDst sz sz hsh
+
+transferLink (Rmt hhSrc) (Lcl dstRoot) relPath srcMode srcMtime = do
+    es <- remoteSend hhSrc SKLink relPath
+    case es of
+        Left e -> return (Left e)
+        Right sz -> do
+            content <- hGetExactly (hhOut hhSrc) (fromIntegral sz)
+            eh <- remoteHashTrailer hhSrc
+            case eh of
+                Left e -> return (Left e)
+                Right expected ->
+                    writeLinkVerified dstRoot (dstRoot </> relPath) content srcMode srcMtime expected
+
+transferLink (Rmt hhSrc) (Rmt hhDst) relPath srcMode srcMtime = do
+    es <- remoteSend hhSrc SKLink relPath
+    case es of
+        Left e -> return (Left e)
+        Right sz -> do
+            eb <- remoteRecvBegin hhDst SKLink relPath sz srcMode srcMtime
+            case eb of
+                Left e -> drainRemoteSend hhSrc sz >> return (Left e)
+                Right () -> do
+                    content <- hGetExactly (hhOut hhSrc) (fromIntegral sz)
+                    eh <- remoteHashTrailer hhSrc
+                    let hsh = either (const "") id eh
+                    BS.hPut (hhIn hhDst) content
+                    hFlush (hhIn hhDst)
+                    finishRemoteRecv hhDst sz sz hsh
+
+-- ============================================================================
+-- 传输协议：recv / send
+--
+--   请求与响应仍是一行规范 JSON；载荷是紧跟响应之后的裸字节，长度由 "size" 决定。
+--   载荷之后**再补一条** @{"ok":true,"hash":…}@ —— 哈希要边读边算，没法在请求里先给。
+-- ============================================================================
+
+-- | recv 第一阶段：发请求，等接收端说"准备好"。
+--   失败时一个字节都还没发（接收端也是先准备临时文件再回 OK），协议不会错位。
+remoteRecvBegin
+    :: HelperHandle -> SyncKind -> FilePath -> Integer -> Int -> Integer
+    -> IO (Either String ())
+remoteRecvBegin hh kind relPath sz mode_ mtime_ = do
     r <- call hh (Msg.cmd "recv" [ ("kind",  kindName (kindState kind))
-                                  , ("path",  Msg.str relPath)
-                                  , ("size",  Msg.int (fromIntegral sz))
-                                  , ("mode",  Msg.int (fromIntegral mode_))
-                                  , ("mtime", Msg.int mtime_)
-                                  , ("hash",  Msg.str expectedHash) ])
-    case r of
-        Left err -> return $ Left ("recv: " ++ err)
-        Right _  -> do
-            hPutFully (hhIn hh) content     -- 载荷：size 字节裸数据
+                                 , ("path",  Msg.str relPath)
+                                 , ("size",  Msg.int sz)
+                                 , ("mode",  Msg.int (fromIntegral mode_))
+                                 , ("mtime", Msg.int mtime_) ])
+    return $ case r of
+        Left e  -> Left ("recv: " ++ e)
+        Right _ -> Right ()
+
+-- | recv 第二阶段：载荷已写完（不足 sz 时这里补零，保持帧对齐）→ 哈希尾行 → 读结果
+finishRemoteRecv :: HelperHandle -> Integer -> Integer -> String -> IO (Either String ())
+finishRemoteRecv hh sz n hsh = do
+    er <- try (do
+            when (n < sz) $ padZeros (hhIn hh) (sz - n)
             hFlush (hhIn hh)
-            r2 <- readMsg hh                -- 第二步：校验 + rename 结果
-            return $ either (Left . ("verify: " ++)) (const (Right ())) r2
+            sendMsg hh (Msg.obj [("ok", Msg.JBool True), ("hash", Msg.str hsh)])
+            r <- readMsg hh
+            return $ either (Left . ("verify: " ++)) (const (Right ())) r)
+    return $ either (\e -> Left ("transport: " ++ show (e :: IOException))) id er
 
--- ============================================================================
--- Helper 协议辅助
--- ============================================================================
+-- | 本地内容 → 远端：发 recv 请求，再跑 @payload@（往 hhIn 写正好 sz 字节），然后收尾
+remoteRecvFrom
+    :: HelperHandle -> FilePath -> Integer -> Int -> Integer
+    -> IO (String, Integer)          -- ^ 载荷动作：(本端算出的哈希, 实发字节数)
+    -> IO (Either String ())
+remoteRecvFrom hh relPath sz mode_ mtime_ payload = do
+    eb <- remoteRecvBegin hh SKFile relPath sz mode_ mtime_
+    case eb of
+        Left e -> return (Left e)
+        Right () -> do
+            (hsh, n) <- payload
+            finishRemoteRecv hh sz n hsh
 
--- | 让远端发来某条目内容：send 的响应带 size，紧跟其后的就是裸数据
-recvRemoteContent :: SyncKind -> HelperHandle -> FilePath -> IO BS.ByteString
-recvRemoteContent kind hh relPath = do
+-- | 让远端发送内容：响应里的 size 决定紧随其后的载荷长度
+remoteSend :: HelperHandle -> SyncKind -> FilePath -> IO (Either String Integer)
+remoteSend hh kind relPath = do
     r <- call hh (Msg.cmd "send" [ ("kind", kindName (kindState kind))
-                                  , ("path", Msg.str relPath) ])
-    case r of
-        Left err -> error $ "send failed: " ++ err
-        Right v  -> case Msg.fieldInt "size" v of
-            Just sz -> hGetExactly (hhOut hh) (fromIntegral sz)
-            Nothing -> error "send: response has no \"size\""
+                                 , ("path", Msg.str relPath) ])
+    return $ case r of
+        Left e -> Left ("send: " ++ e)
+        Right v -> case Msg.fieldInt "size" v of
+            Just sz -> Right sz
+            Nothing -> Left "send: response has no \"size\""
 
-hashRemote :: SyncKind -> HelperHandle -> FilePath -> IO String
-hashRemote kind hh relPath = do
-    r <- call hh (Msg.cmd "hash" [ ("kind", kindName (kindState kind))
-                                  , ("path", Msg.str relPath) ])
-    case r of
-        Left err -> error $ "hash failed: " ++ err
-        Right v  -> case Msg.fieldStr "hash" v of
-            Just h  -> return h
-            Nothing -> error "hash: response has no \"hash\""
+-- | 读发送端载荷之后那条哈希尾行
+remoteHashTrailer :: HelperHandle -> IO (Either String String)
+remoteHashTrailer hh = do
+    r <- readMsg hh
+    return $ case r of
+        Left e  -> Left ("send: " ++ e)
+        Right v -> maybe (Left "send: trailer has no \"hash\"") Right (Msg.fieldStr "hash" v)
+
+-- | 不吃掉源端的载荷就必须排空：它已经答应了 sz 字节，不读走会把管道写满而卡死，
+--   之后所有命令都会错位。
+drainRemoteSend :: HelperHandle -> Integer -> IO ()
+drainRemoteSend hh sz = do
+    discardExactly (hhOut hh) sz
+    _ <- readMsg hh
+    return ()
 
 -- ============================================================================
 -- 其他

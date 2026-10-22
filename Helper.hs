@@ -1,6 +1,6 @@
 module Helper where
 
-import Control.Exception (ErrorCall, IOException, catch, displayException)
+import Control.Exception (ErrorCall, IOException, catch, displayException, try)
 import Control.Monad (unless, when)
 import Data.Bits ((.&.))
 import Data.Maybe (fromMaybe, listToMaybe)
@@ -8,8 +8,8 @@ import System.Directory (doesFileExist)
 import System.Environment (getExecutablePath, lookupEnv)
 import System.FilePath ((</>))
 import System.IO
-    ( BufferMode(..), hFlush, hLookAhead
-    , hSetBinaryMode, hSetBuffering, stdin, stdout
+    ( BufferMode(..), IOMode(ReadMode), hClose, hFileSize, hFlush, hLookAhead
+    , hSetBinaryMode, hSetBuffering, openBinaryFile, stdin, stdout
     )
 
 import System.Posix.Files
@@ -17,7 +17,6 @@ import System.Posix.Files
     , setFileTimes, setFileMode
     )
 
-import Crypto.Hash (hash, SHA512, Digest)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as B8
 import qualified Data.ByteString.Lazy as BL
@@ -29,9 +28,10 @@ import State
     , stateBuilder, discardStateUnder
     )
 import Write
-    ( writeFileVerified, writeLinkVerified, readLinkContent
+    ( writeLinkVerified, readLinkContent
     , removeLinkSafe, removeFileSafe, writeRepoFile, setMtimeOnly
-    , hGetExactly
+    , hGetExactly, hashBytes, hashFile
+    , copyExactlyHash, padZeros, openTargetTemp, commitReceived, removeQuietly
     )
 import qualified Msg
 
@@ -210,53 +210,115 @@ cmdUnlink root kind path = case kind of
 -- HASH
 -- ============================================================================
 
-cmdHash :: FilePath -> StateKind -> FilePath -> IO ()
-cmdHash root kind path = do
-    content <- kindContent kind root path
-    replyOk [("hash", Msg.str (show (hash content :: Digest SHA512)))]
-
--- | 条目的"内容"：文件 = 文件字节；链接 = 指向字符串
-kindContent :: StateKind -> FilePath -> FilePath -> IO BS.ByteString
-kindContent FileKind root path = BS.readFile (root </> path)
-kindContent LinkKind root path = readLinkContent (root </> path)
-
--- ============================================================================
--- SEND：{"ok":true,"size":N} + N 字节裸数据
--- ============================================================================
-
-cmdSend :: FilePath -> StateKind -> FilePath -> IO ()
-cmdSend root kind path = do
-    content <- kindContent kind root path
-    replyOk [("size", Msg.int (fromIntegral (BS.length content)))]
-    BS.hPut stdout content
-    hFlush stdout
-
--- ============================================================================
--- RECV：两步 —— 先 {"ok":true} 表示准备好，收完载荷再回一条结果
--- ============================================================================
-
--- | @{"cmd":"recv","path":…,"size":…,"mode":…,"mtime":…,"hash":…}@
+-- | @{"cmd":"hash",…}@ → @{"hash":"…"}@
 --
---   先回 OK 再收数据：失败时目标文件不受影响、协议也不会错位
---   （父进程从第二步的响应里拿到 error）。链接忽略 mode（Linux 上不可设）。
+--   文件走**流式**哈希（内存 O(1)）；链接的内容就是指向字符串，很短。
+cmdHash :: FilePath -> StateKind -> FilePath -> IO ()
+cmdHash root kind path = case kind of
+    LinkKind -> do
+        content <- readLinkContent (root </> path)
+        replyOk [("hash", Msg.str (hashBytes content))]
+    FileKind -> do
+        r <- try (hashFile (root </> path))
+        case r of
+            Left e -> replyErr ("hash: " ++ show (e :: IOException))
+            Right h -> replyOk [("hash", Msg.str h)]
+
+-- ============================================================================
+-- SEND：{"ok":true,"size":N} + N 字节裸数据 + {"ok":true,"hash":…}
+-- ============================================================================
+
+-- | 发送内容：先报 size，再**流式**发载荷（边读边算哈希），最后补一条哈希尾行。
+--
+--   读源出错 / 提前 EOF 时用 'padZeros' 把帧补齐 —— 接收端长度仍对齐，而哈希
+--   必然对不上，于是它自己删临时文件、回错误（比截短载荷安全得多）。
+cmdSend :: FilePath -> StateKind -> FilePath -> IO ()
+cmdSend root kind path = case kind of
+    LinkKind -> do
+        content <- readLinkContent (root </> path)
+        replyOk [("size", Msg.int (fromIntegral (BS.length content)))]
+        BS.hPut stdout content
+        hFlush stdout
+        replyOk [("hash", Msg.str (hashBytes content))]
+    FileKind -> do
+        r <- try (openBinaryFile (root </> path) ReadMode)
+        case r of
+            Left e -> replyErr ("send: " ++ show (e :: IOException))
+            Right h -> do
+                sz <- hFileSize h
+                replyOk [("size", Msg.int sz)]
+                (hsh, n) <- copyExactlyHash h (Just stdout) sz
+                hClose h
+                when (n < sz) $ padZeros stdout (sz - n)
+                hFlush stdout
+                replyOk [("hash", Msg.str hsh)]
+
+-- ============================================================================
+-- RECV：先 {"ok":true} 表示准备好，收完载荷 + 哈希尾行再回结果
+-- ============================================================================
+
+-- | @{"cmd":"recv","path":…,"size":…,"mode":…,"mtime":…}@
+--
+--   **先准备好临时文件再回 OK**：准备失败（目录建不出来 / 根不存在）就直接回错，
+--   此时主控端还一个字节都没发 → 协议不会错位，也不需要额外排空。
+--   收载荷时边收边写盘边哈希；收完读发送端算的哈希尾行，一致才 rename。
 cmdRecv :: FilePath -> Maybe String -> StateKind -> Msg.Value -> FilePath -> IO ()
 cmdRecv root mTag kind req path =
     case ( Msg.fieldInt "size" req, Msg.fieldInt "mode" req
-         , Msg.fieldInt "mtime" req, Msg.fieldStr "hash" req ) of
-        (Just sz, Just md, Just mt, Just h) -> do
-            replyOk []                                   -- 准备好接收
-            content <- hGetExactly stdin (fromIntegral sz)
-            let write = case kind of
-                    FileKind -> writeFileVerified
-                    LinkKind -> writeLinkVerified
-            result <- write root (root </> path) content (fromIntegral md) mt h
-            case result of
-                Right () -> do
-                    -- 链接刚建/改：本端该链接子树下的文件基线条目已过期，就地作废
-                    when (kind == LinkKind) $ discardStateUnder root mTag path
-                    replyOk []
-                Left err -> replyErr err
-        _ -> replyErr "recv: missing size/mode/mtime/hash"
+         , Msg.fieldInt "mtime" req ) of
+        (Just sz, Just md, Just mt) -> case kind of
+            FileKind -> recvFile sz (fromIntegral md) mt
+            LinkKind -> recvLink sz (fromIntegral md) mt
+        _ -> replyErr "recv: missing size/mode/mtime"
+  where
+    full = root </> path
+
+    -- 文件：边收边写边哈希，内存 O(1)
+    recvFile sz md mt = do
+        prep <- openTargetTemp root full
+        case prep of
+            Left e -> replyErr e
+            Right (target, tmpPath, h) -> do
+                replyOk []                              -- 准备好接收
+                (actual, n) <- copyExactlyHash stdin (Just h) sz
+                hFlush h
+                hClose h
+                if n < sz
+                    then do
+                        removeQuietly tmpPath
+                        replyErr "recv: connection closed before payload completed"
+                    else do
+                        mh <- readHashTrailer
+                        case mh of
+                            Nothing -> do
+                                removeQuietly tmpPath
+                                replyErr "recv: missing hash trailer"
+                            Just expected -> do
+                                r <- commitReceived target tmpPath md mt actual expected
+                                either replyErr (const (replyOk [])) r
+
+    -- 链接：内容很短（指向字符串），照旧整块；落地流程不变
+    recvLink sz md mt = do
+        content <- hGetExactly stdin (fromIntegral sz)
+        mh <- readHashTrailer
+        case mh of
+            Nothing -> replyErr "recv: missing hash trailer"
+            Just expected -> do
+                r <- writeLinkVerified root full content md mt expected
+                case r of
+                    Right () -> do
+                        -- 链接刚建/改：本端该链接子树下的文件基线条目已过期，就地作废
+                        discardStateUnder root mTag path
+                        replyOk []
+                    Left err -> replyErr err
+
+-- | 载荷之后那条哈希尾行：@{"ok":true,"hash":"…"}@
+readHashTrailer :: IO (Maybe String)
+readHashTrailer = do
+    line <- B8.hGetLine stdin
+    return $ case Msg.decodeStrict line of
+        Right v -> Msg.fieldStr "hash" v
+        Left _  -> Nothing
 
 -- ============================================================================
 -- GETSTAT / SETSTAT / SETTIME
@@ -306,7 +368,7 @@ cmdGetIgnore root mTag = do
             replyOk [ ("exists", Msg.JBool True)
                     , ("mtime",  Msg.int (floor (realToFrac (modificationTime fs) :: Double)))
                     , ("mode",   Msg.int (fromIntegral (fileMode fs .&. 0o7777)))
-                    , ("hash",   Msg.str (show (hash content :: Digest SHA512))) ]
+                    , ("hash",   Msg.str (hashBytes content)) ]
 
 -- ============================================================================
 -- PUTREPO — 远端把自己的 .bisync/<profile>/repo 写成"登录方（主控端）地址"

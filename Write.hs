@@ -1,6 +1,6 @@
 module Write where
 
-import Control.Exception (IOException, catch, try)
+import Control.Exception (IOException, bracket, catch, try)
 import Data.Bits ((.&.))
 import System.Directory
     ( createDirectory, createDirectoryIfMissing, doesDirectoryExist, doesFileExist
@@ -8,7 +8,7 @@ import System.Directory
     )
 import System.FilePath (takeDirectory, isAbsolute, normalise, (</>))
 import System.IO
-    ( Handle, hClose, hFlush
+    ( Handle, IOMode(ReadMode), hClose, hFileSize, hFlush, openBinaryFile
     )
 import System.Posix.Files
     ( FileStatus
@@ -19,7 +19,8 @@ import System.Posix.Files
     , setSymbolicLinkTimesHiRes
     )
 
-import Crypto.Hash (hash, SHA512, Digest)
+import Crypto.Hash
+    ( hash, hashInit, hashUpdate, hashFinalize, Context, SHA512(..), Digest )
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as B8
 import qualified Data.ByteString.Lazy as BL
@@ -55,12 +56,104 @@ data HelperHandle = HelperHandle
     }
 
 -- ============================================================================
--- 底层 I/O：确保完整读写
+-- 底层 I/O：流式（内存 O(1)）
+--
+--   文件内容**从不整块进内存**：发送端边读边发、接收端边收边写盘，两边各自
+--   用增量 SHA512 推进。峰值内存 = 一块 buffer，与文件大小无关。
 -- ============================================================================
+
+-- | 每块大小。64 KiB 与管道/ssh 的内部缓冲区同量级：再小就只剩 syscall 开销。
+streamChunkSize :: Int
+streamChunkSize = 64 * 1024
+
+-- | 增量哈希的一步。
+--
+--   **必须强制求值**：cryptonite 的 'hashUpdate' 是惰性的，不 @seq@ 的话整条
+--   更新链会把每一块的 ByteString 都扣在内存里（实测 2 GB 文件：惰性链常驻
+--   1.17 GB，每块 seq 后只有 86 KB）。
+hashStep :: Context SHA512 -> BS.ByteString -> Context SHA512
+hashStep ctx bs = let ctx' = hashUpdate ctx bs in ctx' `seq` ctx'
+
+-- | 空的 SHA512 上下文
+hashInit512 :: Context SHA512
+hashInit512 = hashInit
+
+-- | 收尾成 hex 字符串
+hashFinish :: Context SHA512 -> String
+hashFinish = show . (hashFinalize :: Context SHA512 -> Digest SHA512)
+
+-- | 泵数据：从 @src@ 读最多 @limit@ 字节（'Nothing' = 读到 EOF），写入 @mdst@（若给定），
+--   同时（可选）推进 SHA512。返回 @(哈希, 实读字节数)@。
+--
+--   **读写异常不抛出**，而是返回已经处理完的字节数：调用方靠这个数字补齐载荷，
+--   保证帧（"size 字节裸数据"）始终对齐，后面的命令不会错位。
+pump
+    :: Handle          -- ^ 源
+    -> Maybe Handle    -- ^ 目的（'Nothing' = 丢弃）
+    -> Bool            -- ^ 是否计算哈希（纯转发时不需要）
+    -> Maybe Integer   -- ^ 上限（'Nothing' = 读到 EOF）
+    -> IO (String, Integer)
+pump src mdst hashing mlimit = go hashInit512 0
+  where
+    go ctx n = case mlimit of
+        Just lim | n >= lim -> return (finish ctx, n)
+        _ -> do
+            let want = case mlimit of
+                    Just lim -> fromIntegral (min (toInteger streamChunkSize) (lim - n))
+                    Nothing  -> streamChunkSize
+            r <- try (BS.hGetSome src want)
+            case r of
+                Left e -> do
+                    ignoreIOError e
+                    return (finish ctx, n)
+                Right chunk
+                    | BS.null chunk -> return (finish ctx, n)
+                    | otherwise -> do
+                        w <- case mdst of
+                            Nothing -> return (Right ())
+                            Just d  -> try (BS.hPut d chunk)
+                        case w of
+                            Left e -> do
+                                ignoreIOError e
+                                return (finish ctx, n)
+                            Right () ->
+                                go (if hashing then hashStep ctx chunk else ctx)
+                                   (n + fromIntegral (BS.length chunk))
+    finish ctx = if hashing then hashFinish ctx else ""
+    ignoreIOError :: IOException -> IO ()
+    ignoreIOError _ = return ()
+
+-- | 精确搬运 @n@ 字节（不算哈希，纯转发用）；返回实搬字节数
+copyExactly :: Handle -> Handle -> Integer -> IO Integer
+copyExactly src dst n = snd <$> pump src (Just dst) False (Just n)
+
+-- | 精确搬运 @n@ 字节，同时算 SHA512；返回 @(哈希, 实搬字节数)@
+copyExactlyHash :: Handle -> Maybe Handle -> Integer -> IO (String, Integer)
+copyExactlyHash src mdst n = pump src mdst True (Just n)
+
+-- | 排空 @n@ 字节（丢弃载荷）：发送端已经答应的数据必须吃掉，否则它的 stdout
+--   会被写满而卡住，后续命令全部错位。
+discardExactly :: Handle -> Integer -> IO ()
+discardExactly h n = () <$ pump h Nothing False (Just n)
+
+-- | 写 @n@ 个零字节（分块，不会给 1 GB 分配一块内存）。
+--
+--   用途：发送端读源出错/提前 EOF 时把帧补齐 —— 接收端长度仍然对齐，而哈希必然
+--   对不上，于是它自己删临时文件、回错误。这比悄悄截短载荷（会把后面的命令当数据读）安全。
+padZeros :: Handle -> Integer -> IO ()
+padZeros h = go
+  where
+    zeros = BS.replicate streamChunkSize 0
+    go n
+        | n <= 0 = return ()
+        | otherwise = do
+            let m = min n (toInteger streamChunkSize)
+            BS.hPut h (if m >= toInteger streamChunkSize then zeros else BS.take (fromIntegral m) zeros)
+            go (n - m)
 
 -- | 从 Handle 精确读取 n 字节，保证读满或 EOF
 --
---   用于二进制传输（RECV），不会因短读而丢数据
+--   只用于**链接内容**这类短内容（文件一律走 'pump' 流式）。
 hGetExactly :: Handle -> Int -> IO BS.ByteString
 hGetExactly h n = BS.concat . reverse <$> go n []
   where
@@ -71,18 +164,6 @@ hGetExactly h n = BS.concat . reverse <$> go n []
         if got == 0
             then return chunks
             else go (remaining - got) (chunk : chunks)
-
--- | 向 Handle 完整写入 ByteString，末尾 flush 一次。
---
---   为什么不再分块：'BS.hPut' 自己会写满 —— 实测单次调用 1 MB / 64 MB / 512 MB
---   经管道全部到达，不会短写；分块只是白做一次 'BS.splitAt' 拷贝。
---
---   为什么不再每块 flush：老实现每 8 KB 就 flush 一次，1 GB 就是 13 万次
---   write+flush 系统调用，纯粹是吞吐损耗（管道本身有 64 KB 缓冲、ssh 会持续排空，
---   阻塞写天然就是需要的背压）。缓冲区尾巴由函数末尾这一次 'hFlush' 推出 ——
---   调用方随后会在通道上等响应，所以必须确保已经发出。
-hPutFully :: Handle -> BS.ByteString -> IO ()
-hPutFully h bs = BS.hPut h bs >> hFlush h
 
 -- ============================================================================
 -- Helper 协议通信：一行一个规范 JSON（见 Msg）
@@ -165,14 +246,18 @@ syncFileAttrsLocal srcPath dstPath = do
 -- ============================================================================
 
 -- | 计算内存中 ByteString 的 SHA512 哈希（hex 字符串），无需读磁盘
+--
+--   只用于**已经在内存里的短内容**（链接指向、ignore 文件）；文件一律走 'hashFile'。
 hashBytes :: BS.ByteString -> String
 hashBytes = show . (hash :: BS.ByteString -> Digest SHA512)
 
--- | 计算本地文件 SHA512 哈希（hex 字符串）
+-- | 流式计算本地文件 SHA512（hex 字符串），内存 O(1)
+--
+--   旧实现是 @BS.readFile@ 后再算：1 GB 文件就是 1 GB 常驻。
 hashFile :: FilePath -> IO String
-hashFile fp = do
-    content <- BS.readFile fp
-    return $ hashBytes content
+hashFile fp = bracket (openBinaryFile fp ReadMode) hClose $ \h -> do
+    sz <- hFileSize h
+    fst <$> copyExactlyHash h Nothing sz
 
 -- | 只把 mtime（与 atime）设成给定秒数：不动内容、不动 mode。
 --
@@ -253,29 +338,27 @@ ensureDirChain = go (0 :: Int)
                                                 else return $ Left
                                                     ("cannot create directory " ++ d ++ ": " ++ show e)
 
--- | 原子写入 + 校验：先写临时文件 → 设属性 → 算哈希比对 → 通过才 rename。
+-- ============================================================================
+-- 目标落地：临时文件 → 校验 → rename
 --
---   这是 rsync 的核心安全保证：
---   * 校验在 rename 之前——哈希不匹配则删除临时文件，目标文件完全不受影响
---   * 校验通过才原子替换——新文件从出现的第一刻起内容和属性就完全正确
---   * 不会出现"写完了才发现不对但原文件已经没了"的情况
+--   这是 rsync 的核心安全保证（与文件大小无关，流式同样成立）：
+--   * 校验在 rename 之前——哈希不匹配则删临时文件，目标文件完全不受影响；
+--   * 校验通过才原子替换——新文件从出现的第一刻起内容和属性就完全正确；
+--   * 不会出现"写完了才发现不对但原文件已经没了"的情况。
 --
 --   目录语义（与 rsync 一致）：
 --   * 同步根 @root@ 必须**已存在**——不自动创建，避免 root 写错（或对端路径
 --     不存在）时凭空造出一整棵树；
 --   * 根**之下**的中间目录（目标文件全路径的父目录）按需**递归**创建，
 --     否则往全新的空目录同步时，任何嵌套文件都会因"父目录不存在"而失败。
+-- ============================================================================
 --
---   返回 @Right ()@ 表示写入和校验均成功，@Left err@ 表示失败（原文件未动）。
-writeFileVerified
-    :: FilePath       -- ^ 同步根（必须已存在，不会被自动创建）
-    -> FilePath       -- ^ 目标文件全路径（@root </> relPath@）
-    -> BS.ByteString  -- ^ 文件内容
-    -> Int            -- ^ 目标权限 mode
-    -> Integer        -- ^ 目标 mtime（epoch 秒）
-    -> String         -- ^ 期望的 SHA512 哈希（hex）
-    -> IO (Either String ())
-writeFileVerified root path content mode_ mtime_ expectedHash = do
+-- | 准备目标：校验同步根、解析末端链接、递归建目录链、建可识别临时文件。
+--
+--   返回 @(实际目标路径, 临时文件路径, 句柄)@。提交用 'commitReceived'；放弃用
+--   'removeQuietly'（临时文件命名规则见 'Tmp'：中断留下的残骸人工清）。
+openTargetTemp :: FilePath -> FilePath -> IO (Either String (FilePath, FilePath, Handle))
+openTargetTemp root path = do
     rootExists <- doesDirectoryExist root
     if not rootExists
         then return $ Left ("sync root does not exist: " ++ root)
@@ -285,22 +368,68 @@ writeFileVerified root path content mode_ mtime_ expectedHash = do
             let dir = takeDirectory target
             mk <- ensureDirChain dir
             case mk of
-                Left e -> return $ Left e
-                Right () -> withTemp dir $ \tmpPath h -> do
-                    BS.hPut h content
+                Left e -> return (Left e)
+                Right () -> do
+                    (tmpPath, h) <- Tmp.createTemp dir
+                    return (Right (target, tmpPath, h))
+
+-- | 删一个文件，不存在/失败都静默（清理临时文件用）
+removeQuietly :: FilePath -> IO ()
+removeQuietly fp = removeFile fp `catch` handler
+  where
+    handler :: IOException -> IO ()
+    handler _ = return ()
+
+-- | 校验 + 设属性 + 提交（rename）。**校验在 rename 之前**：不通过就删临时文件，
+--   目标路径上的旧文件完全不受影响。
+commitReceived
+    :: FilePath    -- ^ 目标路径
+    -> FilePath    -- ^ 临时文件
+    -> Int         -- ^ 目标 mode
+    -> Integer     -- ^ 目标 mtime（epoch 秒）
+    -> String      -- ^ 本端边收边算的哈希
+    -> String      -- ^ 发送端边读边算的哈希
+    -> IO (Either String ())
+commitReceived target tmpPath mode_ mtime_ actual expected
+    | actual /= expected = do
+        removeQuietly tmpPath
+        return $ Left "verification failed before commit; target untouched"
+    | otherwise = do
+        setFileMode tmpPath (fromIntegral mode_)
+        setFileTimes tmpPath (fromIntegral mtime_) (fromIntegral mtime_)
+        renameFile tmpPath target
+        return (Right ())
+
+-- | 本地文件 → 本地目标（流式，内存 O(1)）。
+--
+--   不计算哈希：同一批字节既读又写，哈希在这里提供不了任何信息（旧实现的两个
+--   哈希都算在同一块内存上，比较恒真）。真正有意义的检查是**源文件没有被截断**：
+--   实读字节数小于开始时的 size 就丢弃临时文件 —— 否则会把一个前缀当成完整文件提交。
+copyFileStream
+    :: FilePath -> FilePath -> FilePath -> Int -> Integer -> IO (Either String ())
+copyFileStream srcPath root path mode_ mtime_ = do
+    r <- try (openBinaryFile srcPath ReadMode)
+    case r of
+        Left e -> return $ Left ("cannot read source: " ++ show (e :: IOException))
+        Right srcH -> do
+            sz0 <- hFileSize srcH
+            res <- openTargetTemp root path >>= \prep -> case prep of
+                Left e -> return (Left e)
+                Right (target, tmpPath, h) -> do
+                    n <- copyExactly srcH h sz0
+                    hFlush h
                     hClose h
-                    -- 属性在 rename 前设好，保证新文件立即可用
-                    setFileMode tmpPath (fromIntegral mode_)
-                    setFileTimes tmpPath (fromIntegral mtime_) (fromIntegral mtime_)
-                    -- 核⼼：校验在 rename 之前，不通过则丢弃临时文件
-                    let actualHash = hashBytes content
-                    if actualHash /= expectedHash
+                    if n < sz0
                         then do
-                            removeFile tmpPath
-                            return $ Left "verification failed before commit; target untouched"
+                            removeQuietly tmpPath
+                            return $ Left "source truncated while copying; target untouched"
                         else do
+                            setFileMode tmpPath (fromIntegral mode_)
+                            setFileTimes tmpPath (fromIntegral mtime_) (fromIntegral mtime_)
                             renameFile tmpPath target
-                            return $ Right ()
+                            return (Right ())
+            hClose srcH
+            return res
 
 -- | 安全删除文件：不存在则静默跳过，不抛异常。
 --
