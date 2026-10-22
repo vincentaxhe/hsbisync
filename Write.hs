@@ -116,9 +116,14 @@ pump src mdst hashing mlimit = go hashInit512 0
                             Left e -> do
                                 ignoreIOError e
                                 return (finish ctx, n)
-                            Right () ->
-                                go (if hashing then hashStep ctx chunk else ctx)
-                                   (n + fromIntegral (BS.length chunk))
+                            Right () -> do
+                                -- **必须在这里强制求值**：'go' 的参数是惰性的，
+                                -- 直接 @go (if hashing then hashStep ctx chunk else ctx)@
+                                -- 会堆起一串 thunk，每个都捕获着这一块的 chunk；
+                                -- 而不算哈希时 ctx 永远不被求值 → 整份文件都留在内存里
+                                -- （实测 256 MB 文件 = 264 MB 驻留）。
+                                let ctx' = if hashing then hashStep ctx chunk else ctx
+                                ctx' `seq` go ctx' (n + fromIntegral (BS.length chunk))
     finish ctx = if hashing then hashFinish ctx else ""
     ignoreIOError :: IOException -> IO ()
     ignoreIOError _ = return ()

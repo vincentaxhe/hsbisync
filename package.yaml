@@ -39,3 +39,8 @@ executables:
     #    表现为整个程序"静默卡死"且无法诊断；
     #  * concurrently 并行读两端状态也需要它才真正并行。
     - -threaded
+    # -rtsopts：允许用 +RTS 调运行时（诊断内存 / GC 时需要）：
+    #   +RTS -s            打印最大驻留（maximum residency）
+    #   +RTS -M<size>      给堆设上限（能传完 = 内存确实 O(1)）
+    #   +RTS -c            压缩式 GC
+    - -rtsopts
