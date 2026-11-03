@@ -1,0 +1,53 @@
+cabal-version: 1.12
+
+-- This file has been generated from package.yaml by hpack version 0.39.1.
+--
+-- see: https://github.com/sol/hpack
+
+name:           hsbisync
+version:        0.1.0.0
+description:    A bidirectional file sync tool written in Haskell
+homepage:       https://github.com/vincentaxhe/hsbisync#readme
+bug-reports:    https://github.com/vincentaxhe/hsbisync/issues
+author:         Vincent
+maintainer:     vincentaxhe
+copyright:      2026 Vincent
+license:        MIT
+build-type:     Simple
+
+source-repository head
+  type: git
+  location: https://github.com/vincentaxhe/hsbisync
+
+executable hsbisync
+  main-is: Main.hs
+  other-modules:
+      Arg
+      Connect
+      Exe
+      Help
+      Helper
+      Msg
+      State
+      Sync
+      Tmp
+      Write
+      Paths_hsbisync
+  hs-source-dirs:
+      ./
+  ghc-options: -Wall -O2 -threaded -rtsopts
+  build-depends:
+      async
+    , base >=4.7 && <5
+    , bytestring
+    , containers
+    , cryptonite
+    , directory
+    , filepath
+    , gitignore-ospath
+    , memory
+    , process
+    , text
+    , time
+    , unix
+  default-language: Haskell2010

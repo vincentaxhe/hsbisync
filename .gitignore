@@ -1,0 +1,23 @@
+# Stack 构建产物
+.stack-work/
+dist-newstyle/
+
+# `stack build --copy-bins --local-bin-path .` 生成的二进制（仓库根目录）
+/hsbisync
+/hsbisync.exe
+
+# GHC 直编残留
+*.hi
+*.o
+
+# CI 输出的打包目录
+/dist/
+/out/
+
+# hsbisync 自身的同步元数据（本仓库被当作同步根时产生）
+.bisync/
+
+# 编辑器 / 系统
+.DS_Store
+*.swp
+*~

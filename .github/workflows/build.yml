@@ -1,0 +1,106 @@
+name: build
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write # 打 tag 时用 GITHUB_TOKEN 创建 release
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 树莓派（64 位 Raspberry Pi OS / Bookworm 及以上）：
+          # 原生 arm64 runner，不用 QEMU，速度和 x86 差不多。
+          # 选 22.04 而不是 24.04 是为了 glibc 基线更低（2.35 < Bookworm 的 2.36），
+          # 产物在 Bookworm / Trixie 上都能直接跑。
+          - name: aarch64-linux (Raspberry Pi)
+            runner: ubuntu-22.04-arm
+            arch: aarch64
+          # x86_64 那份只是为了方便（本地机器 / LibreELEC 盒子）；不需要可以删掉
+          - name: x86_64-linux
+            runner: ubuntu-22.04
+            arch: x86_64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential libgmp-dev libtinfo6 xz-utils
+
+      # 直接用 stack 官方静态二进制（与本地 stack 3.9.3 对齐），
+      # GHC 9.10.3 由 stack 按平台自动下载（aarch64 用 ghc-9.10.3-aarch64-deb11 绑定版本）。
+      - name: Install stack
+        run: |
+          set -euo pipefail
+          case "$RUNNER_ARCH" in
+            X64)   STACK_ARCH=x86_64  ;;
+            ARM64) STACK_ARCH=aarch64 ;;
+            *) echo "unsupported arch: $RUNNER_ARCH"; exit 1 ;;
+          esac
+          curl -sSL -o /tmp/stack.tar.gz \
+            "https://github.com/commercialhaskell/stack/releases/download/v3.9.3/stack-3.9.3-linux-${STACK_ARCH}.tar.gz"
+          tar xzf /tmp/stack.tar.gz -C /tmp
+          sudo install -m 755 "/tmp/stack-3.9.3-linux-${STACK_ARCH}/stack" /usr/local/bin/stack
+          stack --version
+
+      # ~/.stack 里是 GHC 和依赖的源码/快照包；.stack-work 里是本项目的产物。
+      # 第一次跑（冷缓存）大约 10 分钟，之后 1~2 分钟。
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.stack
+            .stack-work
+          key: stack-${{ matrix.arch }}-${{ hashFiles('stack.yaml', 'stack.yaml.lock', 'package.yaml') }}
+          restore-keys: |
+            stack-${{ matrix.arch }}-
+
+      - name: Build
+        run: stack build --copy-bins --local-bin-path dist
+
+      - name: Check binary
+        run: |
+          set -euo pipefail
+          file dist/hsbisync
+          strip --strip-all dist/hsbisync
+          ls -l dist/hsbisync
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            VER="${GITHUB_REF_NAME}"
+          else
+            VER="$(git rev-parse --short HEAD)"
+          fi
+          NAME="hsbisync-${VER}-${{ matrix.arch }}-linux"
+          mkdir -p out
+          tar -czf "out/${NAME}.tar.gz" -C dist hsbisync
+          ( cd out && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256" )
+          ls -l out
+          echo "PKG_NAME=${NAME}" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.arch }}-linux
+          path: out/*
+          if-no-files-found: error
+
+      # 只有打 v* 标签时才发 Release（把两个架构的包都挂上去）
+      - name: Create release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/*
+          generate_release_notes: true

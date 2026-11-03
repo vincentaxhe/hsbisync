@@ -1,9 +1,9 @@
 name:                hsbisync
 version:             0.1.0.0
-github:              "user/hsbisync"
+github:              "vincentaxhe/hsbisync"
 license:             MIT
 author:              "Vincent"
-maintainer:          "vincent@example.com"
+maintainer:          "vincentaxhe"
 copyright:           "2026 Vincent"
 
 description:         A bidirectional file sync tool written in Haskell
