@@ -5,7 +5,7 @@ cabal-version: 1.12
 -- see: https://github.com/sol/hpack
 
 name:           hsbisync
-version:        0.1.0.0
+version:        0.1.1
 description:    A bidirectional file sync tool written in Haskell
 homepage:       https://github.com/vincentaxhe/hsbisync#readme
 bug-reports:    https://github.com/vincentaxhe/hsbisync/issues
