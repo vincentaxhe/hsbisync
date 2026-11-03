@@ -13,8 +13,11 @@ NAME
      hsbisync - bidirectional file synchronizer between two directories
 
 SYNOPSIS
-     hsbisync sync <profile> [--jail <root>]...
+     hsbisync sync <profile> [--jail <root>]... [--no-confirm]
      hsbisync sync <profile> <root1> <root2> [--jail <root>]...
+                 [--no-confirm]
+     hsbisync jail <profile>
+     hsbisync unjail <profile>
      hsbisync diff <profile>
      hsbisync profile
      hsbisync help | --help
@@ -41,13 +44,26 @@ SUBCOMMANDS
          written to .bisync/<profile>/repo on both ends, so the argument-less
          form can be used afterwards.
 
-         Option --jail <root> (repeatable; 1 / 2 also name the two roots)
-         turns that end into a jail repository; see JAIL REPOSITORIES.
-         --jail only removes the flag itself - the path after it is still a
-         positional argument, so these three forms are equivalent:
+         Option --jail <root> (repeatable) only makes sure that end has an
+         empty link_table.json (nothing happens if it already exists) so the
+         link phase compares against the table. It does not move any links;
+         use the jail / unjail subcommands for that. An end not named by
+         --jail is left untouched. It is a switch, so the path stays a
+         positional argument:
              sync p --jail A B
-             sync p --jail A --jail B
              sync p A --jail B
+
+         Option --no-confirm: answer y at every confirmation (scripts, no tty).
+
+     jail <profile>
+         Turn the current directory into a jail repository: existing symlinks
+         move into link_table.json and are unlinked; the link target's content
+         is then synced as real directories at the same relative path.
+
+     unjail <profile>
+         The reverse: the table's entries are recreated as real symlinks
+         (whatever occupies that path is removed first; the content is
+         re-synced), then the table is deleted.
 
      diff <profile>
          Read-only preview: changes of the current directory relative to the
@@ -68,44 +84,21 @@ ROOTS
          [user@]host:/remote/path
 
 JAIL REPOSITORIES
-     Use case: pushing dotfiles from machine A to machine B, where B wants
-     only the content and not A's absolute-path symlinks (such as
-     /home/A/.config/xxx). A jail repository records links only in a table,
-     creates no links on disk, and lays the link target's content down at the
-     same relative path as a real directory - so programs on B read the
-     config directly.
-
-     The test is whether the file exists, not whether --jail was passed: once
-     an end has .bisync/<profile>/link_table.json, later syncs need no --jail
-     and still work from the table. Deleting that file returns the end to a
-     normal repository.
+     A jail end keeps symlinks only in .bisync/<profile>/link_table.json and
+     creates none on disk; the link target's content is synced as ordinary
+     files/directories at the same relative path - which is what a host that
+     should just receive config content needs.
 
      The table is one line of JSON keyed by relative path; empty is {}:
          {"conf":{"target":"/home/a/.config/x","size":19,
                   "mtime":1758300001}}
 
-     size is the link's st_size (the byte length of the target string) and
-     mtime is the link's own mtime; these two are exactly the comparison key
-     of the link phase, and a jail end has no lstat to consult, so they must
-     be recorded. A malformed table is an error, never treated as empty
-     (which would mark every link as deleted).
+     size is the link's st_size and mtime the link's own mtime - the link
+     phase's comparison key, which a jail end has no lstat to obtain. A
+     malformed table is an error, never treated as empty.
 
-     Behavioural difference: on a jail end the set of links comes from the
-     table, not from scanning the directory, and no real links exist on disk.
-     The link target's content is synced as ordinary files/directories at the
-     same relative path. Links added to the table are recreated as real
-     symlinks on a normal end. Both ends being jail also works (the table's
-     target and size/mtime are compared).
-
-     Turning an existing repository with links into a jail: it starts from an
-     empty table, so the pre-existing real links are not recorded and do not
-     take part in syncing - they simply stay on disk (the table is the only
-     truth). Start a jail end from an empty directory, or write the entries
-     into the table by hand.
-
-     --jail on a remote end does not touch the remote side: create the empty
-     table there by hand first (the error message prints the commands), then
-     run the sync.
+     --jail / --unjail do not touch a remote root; create or delete the table
+     there by hand.
 
 SYNC PROCEDURE
      A sync runs in 6 steps:
@@ -183,9 +176,8 @@ FILES
          The ignore rules, gitignore syntax. Aligned on both ends by step 2.
 
      .bisync/<profile>/link_table.json
-         The link table of a jail repository; its presence is what makes the
-         end jail, and a normal repository has none. Never synced. See JAIL
-         REPOSITORIES for the format.
+         The link table of a jail repository; never synced. Its presence makes
+         the end jail; the jail / unjail subcommands switch between forms.
 
      The three baseline files (one set for the file tree and one for the
      symlink tree, with the same shape):
@@ -256,4 +248,10 @@ EXAMPLES
 
      List all profiles:
          hsbisync profile
+
+     Turn the current directory into a jail repository:
+         hsbisync jail local
+
+     Turn it back into a normal repository:
+         hsbisync unjail local
 ```

@@ -8,7 +8,7 @@ import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe, isJust)
 import qualified Data.Map as Map
 import qualified Data.Set as Set
-import System.Directory (canonicalizePath, createDirectoryIfMissing, doesFileExist)
+import System.Directory (canonicalizePath, createDirectoryIfMissing, doesFileExist, removeFile)
 import System.FilePath ((</>))
 import System.IO
     ( IOMode(ReadMode), hClose, hFileSize, hFlush, openBinaryFile, stdout, stdin
@@ -28,10 +28,10 @@ import Connect (destroyHelper, handshakeInfo, prepareRemotes, spawnHelper)
 import qualified LinkTable
 import State
     ( FileState(..), FileChange(..), StateKind(..)
-    , parseStateValue, statRel
+    , parseStateValue, statRel, statLinkRel
     , currentStateWith, currentLinkState
     , lastStateKind, appendAddedKind, appendDeletedKind, discardStateUnder, posixSecs
-    , linkTableOf
+    , linkTableOf, readProfileIgnore, scanRelLinks
     , indexStates, dedup
     )
 import Sync (sync, SyncAction(..), resolveConflicts, SideStats(..), sideStateLabel)
@@ -70,20 +70,22 @@ printBanner = do
     putStrLn "  hsbisync - Bidirectional Sync"
     putStrLn "==================================="
 
--- | @--jail <root|1|2>@（可重复）指定的目标端（入口读完参数后设置）
+-- | @--jail <root>@（可重复）指定的目标端（入口读完参数后设置）
 {-# NOINLINE jailTargets #-}
 jailTargets :: IORef [String]
 jailTargets = unsafePerformIO (newIORef [])
 
--- | 由入口设置：本轮要把哪些端变成 jail 型仓库
+-- | 由入口设置：本轮哪几端是 jail 型仓库
 setJailTargets :: [String] -> IO ()
 setJailTargets = writeIORef jailTargets
 
--- | 读入口设置的 @--jail@ 列表
---
---   也用于 @hsbisync sync <profile> --jail <r1> <r2>@ 这种"根写在开关里"的形式。
-getJailTargets :: IO [String]
-getJailTargets = readIORef jailTargets
+-- | @--no-confirm@：所有确认处自动答 y（脚本 / 无终端时用）
+{-# NOINLINE autoConfirm #-}
+autoConfirm :: IORef Bool
+autoConfirm = unsafePerformIO (newIORef False)
+
+setAutoConfirm :: Bool -> IO ()
+setAutoConfirm = writeIORef autoConfirm
 
 -- | 本轮同步的 profile（链接表路径 @<root>/.bisync/<profile>/link_table.json@ 要用它）
 {-# NOINLINE currentProfile #-}
@@ -93,38 +95,109 @@ currentProfile = unsafePerformIO (newIORef Nothing)
 setCurrentProfile :: String -> IO ()
 setCurrentProfile = writeIORef currentProfile . Just
 
--- | 按 @--jail@ 在指定端创建空的链接表（已存在则不动）。
+-- | 按 @--jail@ 在指定端**只保证 link_table.json 存在**（空表；已存在则不动）。
 --
---   链接表 = @<root>/.bisync/<profile>/link_table.json@，存在性就是模式；
---   删掉它就回到普通仓库。@--jail@ 可以给多次（两端都是 jail 也行）。
-applyJailTarget :: String -> Root -> Root -> IO ()
-applyJailTarget profile r1 r2 = do
-    specs <- getJailTargets
-    mapM_ applyOne specs
+--   它不搬链接、不做任何转换 —— 转换只能用子命令 @jail@ / @unjail@。
+--   不在 @--jail@ 列表里的端完全不动（不保证表不存在）。
+--   之后链接阶段会自动按“表在不在”选择口径。
+applyRepoModes :: String -> Root -> Root -> IO ()
+applyRepoModes profile r1 r2 = do
+    specs <- readIORef jailTargets
+    case [ s | s <- specs, s `notElem` map rootText [r1, r2] ] of
+        (bad:_) -> die ("--jail must name one of the two roots; got: " ++ bad)
+        []      -> return ()
+    mapM_ (applyOne specs) [r1, r2]
   where
-    applyOne s = case pick s of
-        Nothing -> die ("--jail must name one of the two roots (or 1 / 2); got: " ++ s)
-        Just (Local root) -> do
+    applyOne specs (Local root)
+        | root `elem` specs = do
             ok <- LinkTable.exists root profile
-            when (not ok) $ do
-                createDirectoryIfMissing True (root </> ".bisync" </> profile)
-                LinkTable.save root profile LinkTable.isEmptyTable
-                putStrLn ("  jail mode: created " ++ LinkTable.tablePath root profile)
-        Just (Remote host root) -> die $ unlines
-            [ "--jail on a remote root needs the table created on that host:"
-            , "  ssh " ++ host ++ " mkdir -p " ++ shell (root </> ".bisync" </> profile)
+            unless ok $ do
+                -- 空表 + 磁盘上还有真链接 = 这些链接在链接阶段"消失"，会向
+                -- 对端传播删除。先让用户在该端跑 jail 子命令，把链接搬进表。
+                ign <- readProfileIgnore root (Just profile)
+                old <- scanRelLinks Nothing root root ign
+                if not (null old)
+                    then die $ unlines
+                        [ "--jail: " ++ root ++ " still has " ++ show (length old)
+                            ++ " real symlink(s); an empty table would delete them on the peer"
+                        , "  convert it first:  cd " ++ root ++ " && hsbisync jail " ++ profile
+                        ]
+                    else do
+                        createDirectoryIfMissing True (root </> ".bisync" </> profile)
+                        LinkTable.save root profile LinkTable.isEmptyTable
+                        putStrLn ("  jail: created " ++ LinkTable.tablePath root profile)
+        | otherwise = return ()
+    applyOne specs (Remote host p)
+        | (host ++ ":" ++ p) `elem` specs = die $ unlines
+            [ "--jail does not touch a remote root; create the table there by hand:"
+            , "  ssh " ++ host ++ " mkdir -p " ++ (p </> ".bisync" </> profile)
             , "  ssh " ++ host ++ " \"printf '{}' > "
-                ++ shell (LinkTable.tablePath root profile) ++ "\""
+                ++ (p </> ".bisync" </> profile </> "link_table.json") ++ "\""
             ]
-    pick s
-        | s == "1"         = Just r1
-        | s == "2"         = Just r2
-        | s == rootText r1  = Just r1
-        | s == rootText r2  = Just r2
-        | otherwise         = Nothing
+        | otherwise = return ()
     rootText (Local p)    = p
     rootText (Remote h p) = h ++ ":" ++ p
-    shell = id
+
+-- | @hsbisync jail <profile>@：把当前目录转成 jail 型仓库。
+--
+--   现有真实链接收进表并从磁盘上删掉（只 unlink），链接子树下的文件基线
+--   作废 —— 之后链接目标的内容会作为真实目录落到同一相对路径。
+--   已经是 jail 则什么都不做。
+convertToJail :: String -> FilePath -> IO ()
+convertToJail profile root = do
+    already <- LinkTable.exists root profile
+    if already
+        then putStrLn ("  already jail: " ++ LinkTable.tablePath root profile)
+        else do
+            ign  <- readProfileIgnore root (Just profile)
+            rels <- scanRelLinks Nothing root root ign
+            entries <- mapM (mkEntry root) rels
+            createDirectoryIfMissing True (root </> ".bisync" </> profile)
+            LinkTable.save root profile (Map.fromList entries)
+            mapM_ (\r -> removeLinkSafe (root </> r)) rels
+            mapM_ (discardStateUnder root (Just profile)) rels
+            putStrLn $ "  jail: " ++ show (length rels) ++ " link(s) -> "
+                       ++ LinkTable.tablePath root profile
+
+-- | 普通仓库 -> jail：把现有真实链接收进表，并从磁盘上删掉（只 unlink）。
+--
+--   删掉链接后，那些路径在本端就“不存在”了；若不把它们在文件基线里的
+--   条目作废，下一轮会算成“本端删除了它们”并把对端的真实文件删掉。
+--   （内部使用，入口见 'convertToJail'。）
+mkEntry :: FilePath -> FilePath -> IO (String, LinkTable.Entry)
+mkEntry root rel = do
+    FileState sz mt _ _ <- statLinkRel root rel
+    target <- readLinkContent (root </> rel)
+    return (rel, LinkTable.Entry (targetText target) sz (posixSecs mt))
+
+-- | @hsbisync unjail <profile>@：把当前目录转回普通仓库。
+--
+--   表里的条目在磁盘上重建成真实链接；链接位置可能已被真实文件/目录占用
+--   （jail 期间链接目标的内容就落在那里），'writeLinkVerified' 会先把占位
+--   整体删掉再建链接 —— 内容不会丢：它本来就还会从对端重新同步。
+--
+--   同样要作废文件基线，否则“路径要么悬空、要么指向根外”会被算成本端删除。
+convertFromJail :: String -> FilePath -> IO ()
+convertFromJail profile root = do
+    ok <- LinkTable.exists root profile
+    unless ok (putStrLn ("  not a jail: " ++ LinkTable.tablePath root profile))
+    when ok $ do
+        r <- LinkTable.load root profile
+        case r of
+            Left e   -> ioError (userError e)
+            Right tbl -> do
+                mapM_ (restore tbl) (Map.toAscList tbl)
+                mapM_ (discardStateUnder root (Just profile)) (Map.keys tbl)
+                removeFile (LinkTable.tablePath root profile)
+                putStrLn $ "  unjail: " ++ show (Map.size tbl) ++ " link(s) restored"
+  where
+    restore _ (rel, e) = do
+        let content = T.encodeUtf8 (T.pack (LinkTable.entryTarget e))
+        res <- writeLinkVerified root (root </> rel) content 0o777
+                                  (LinkTable.entryMtime e) (hashBytes content)
+        case res of
+            Right () -> return ()
+            Left err -> ioError (userError (rel ++ ": " ++ err))
 
 -- ============================================================================
 -- 本地端的链接操作（按“本端是不是 jail 型仓库”分支）
@@ -226,10 +299,10 @@ runSync srcKind profile root1 root2 = do
             requireRoot root1
             requireRoot root2
             return (False, False)
-    -- --jail <root|1|2>：在指定端创建空链接表（存在即模式；删掉即回普通仓库）。
+    -- --jail <root>：决定本次哪端是 jail（存在即模式；不带开关的本地端默认普通）
     --   放在目录检查之后：否则 createDirectoryIfMissing True 会顺手把缺失的同步根
     --   建出来，绕过"只建一层"与"免参模式只查不建"的约定。
-    applyJailTarget profile root1 root2
+    applyRepoModes profile root1 root2
     prepareRemotes profile [root1, root2]
     handshakes <- handshakeInfo [root1, root2]
     repos <- case srcKind of
@@ -536,16 +609,24 @@ setMtimeOnlySide (Rmt hh) relPath t = do
 --   EOF 视为 No（管道输入不足时不会抛异常挂掉）。
 askYesNo :: String -> IO Bool
 askYesNo prompt = do
-    putStr prompt
-    hFlush stdout
-    hSetBuffering stdin NoBuffering
-    hSetEcho stdin False
-    answer <- getChar `catch` eofAsNo
-    hSetEcho stdin True
-    putStrLn [answer]
-    drainAvailable
-    return (toLower answer == 'y')
+    auto <- readIORef autoConfirm
+    if auto
+        then do
+            putStrLn (prompt ++ "y  (--no-confirm)")
+            return True
+        else ask
   where
+    ask = do
+        putStr prompt
+        hFlush stdout
+        hSetBuffering stdin NoBuffering
+        hSetEcho stdin False
+        answer <- getChar `catch` eofAsNo
+        hSetEcho stdin True
+        putStrLn [answer]
+        drainAvailable
+        return (toLower answer == 'y')
+
     eofAsNo :: IOException -> IO Char
     eofAsNo _ = return 'n'
 

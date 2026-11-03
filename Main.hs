@@ -22,7 +22,10 @@ import Data.Time.LocalTime (getCurrentTimeZone, utcToLocalTime)
 import GHC.IO.Encoding (setFileSystemEncoding, setLocaleEncoding, utf8)
 
 import Arg (Root(..), parseRoot, parseSyncThree)
-import Exe (RootSource(..), printBanner, runSync, setJailTargets)
+import Exe
+    ( RootSource(..), convertFromJail, convertToJail
+    , printBanner, runSync, setAutoConfirm, setJailTargets
+    )
 import Help (showHelp)
 import Helper (runHelper)
 import State
@@ -46,15 +49,18 @@ main = do
     setFileSystemEncoding utf8
     setLocaleEncoding utf8
     args0 <- getArgs
-    -- --jail <root>（可重复）：把这些端变成 jail 型仓库（创建 link_table.json）。
+    -- --jail <root>（可重复）：本次同步把该端当 jail 型仓库。
     -- 用空格分隔而不是 --jail=<root>：路径里带引号/空格时省得和 shell 转义拧。
     (args, jailSpecs) <- case splitJail args0 of
         Left e  -> die e
         Right r -> return r
     setJailTargets jailSpecs
+    -- --no-confirm：所有确认自动答 y（脚本 / 无终端时用）
+    let (syncArgs, noConfirm) = splitNoConfirm args
+    setAutoConfirm noConfirm
     -- 每个子命令**先按参数个数**校验：数量不对就直接给出该子命令的正确用法，
     -- 多余参数也算错误（不静默忽略）。只有数量正确时才谈得上"实质性的误用"。
-    case args of
+    case syncArgs of
         "--helper" : rest  -> helperMain rest
         "help" : rest
             | null rest    -> showHelp
@@ -64,18 +70,20 @@ main = do
             | otherwise    -> die "Usage: hsbisync --help"
         "diff" : rest      -> cmdDiff rest
         "profile" : rest   -> cmdProfile rest
+        "jail" : rest     -> cmdConvert True rest
+        "unjail" : rest   -> cmdConvert False rest
         "sync" : rest      -> syncCmd rest
         _                  -> showHelp
 
 -- | 完整说明文在 Help.hs（单一维护点）；此处只负责分发。
 
--- | 从参数里抽出 @--jail@ 标记（可重复）：它后面紧跟的那个路径就是 jail 仓库。
+-- | 从参数里抽出 @--jail@ 标记（可重复）：它后面紧跟的那个路径就是 jail 端。
 --
---   只移除 @--jail@ 这个 token，**路径本身留在位置参数里** —— 所以：
+--   只移除开关本身，**路径仍留在位置参数里** —— 所以：
 --
---   > sync p --jail A B      -- ✓ A 是 jail，两端是 A 和 B
---   > sync p --jail A --jail B   -- ✓ 两端都 jail
---   > sync p A B --jail A    -- ✗ 去掉 --jail 后有三个路径 → 参数个数校验报错
+--   > sync p --jail A B        -- ✓ A 是 jail，两端是 A 和 B
+--   > sync p --jail A --jail B -- ✓ 两端都是 jail
+--   > sync p A B --jail A    -- ✗ 去掉开关后有三个路径 → 参数个数校验报错
 --
 --   路径里的空格/引号完全由 shell 负责，程序不做任何拼接。
 splitJail :: [String] -> Either String ([String], [String])
@@ -85,6 +93,11 @@ splitJail = go [] []
     go _ _ ["--jail"] = Left "--jail requires a path: --jail <root>"
     go pos specs ("--jail" : x : rest) = go (x : pos) (x : specs) rest
     go pos specs (a : rest) = go (a : pos) specs rest
+
+-- | 抽掉无值的 @--no-confirm@（可以出现在任意位置）
+splitNoConfirm :: [String] -> ([String], Bool)
+splitNoConfirm xs =
+    (filter (/= "--no-confirm") xs, "--no-confirm" `elem` xs)
 
 -- ============================================================================
 -- Helper 模式
@@ -114,12 +127,31 @@ dropPrefix prefix s
     | otherwise = s
 
 -- ============================================================================
+-- jail / unjail 子命令：在当前目录做仓库形态转换
+-- ============================================================================
+
+-- | @hsbisync jail <profile>@ / @hsbisync unjail <profile>@
+--
+--   只作用于**当前目录**（就是同步根本端）。已经是目标形态则什么都不做。
+--   转换只做一次；之后同步流程根据 link_table.json 在不在自动选口径。
+cmdConvert :: Bool -> [String] -> IO ()
+cmdConvert toJail args = case args of
+    [profile] -> do
+        cwd <- getCurrentDirectory
+        _ <- requireProfileDir cwd profile
+        if toJail
+            then convertToJail profile cwd
+            else convertFromJail profile cwd
+    _ -> die ("Usage: hsbisync " ++ verb ++ " <profile>")
+  where
+    verb = if toJail then "jail" else "unjail"
+
+-- ============================================================================
 -- sync 子命令
 -- ============================================================================
 
 -- | hsbisync sync <profile> [<root1> <root2>]
 --   一个参数：读 .bisync/<profile>/repo 获取对端地址
---   两个参数：`--jail=<root1>` + 位置参数 <root2>（把一端的根写在开关里）
 --   三个参数：profile + 双端直接同步
 syncCmd :: [String] -> IO ()
 syncCmd [profile] = syncFromRepo profile
