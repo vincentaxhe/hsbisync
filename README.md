@@ -183,10 +183,12 @@ LIMITATIONS
      automatic merge, only a list for a human to handle. No history is kept, so
      there is no rollback.
 
-     File transfer: the whole file is read into memory and written out, so very
-     large files may OOM. No delta transfer, no resumable transfer. Temporary
-     files left by an interruption are not cleaned up automatically and may be
-     synced as ordinary files. No fsync.
+     File transfer: payloads are streamed in 64 KiB chunks - read while
+     sending, written while receiving - so peak memory depends on the chunk
+     size, not on the file size. No delta transfer, and no resumable transfer
+     either (a rerun after an interruption starts over from the beginning).
+     Temporary files left by an interruption are not cleaned up automatically
+     and may be synced as ordinary files. No fsync.
 
 EXAMPLES
      First sync:
