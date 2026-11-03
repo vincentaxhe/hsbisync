@@ -27,6 +27,7 @@ executable hsbisync
       Exe
       Help
       Helper
+      LinkTable
       Msg
       State
       Sync

@@ -8,7 +8,7 @@ import Data.Time (UTCTime)
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime, utcTimeToPOSIXSeconds)
 
 import System.Directory
-    ( createDirectoryIfMissing, doesFileExist
+    ( createDirectoryIfMissing, doesDirectoryExist, doesFileExist
     , listDirectory, removeDirectory, removeFile, renameFile
     )
 import System.FilePath (takeFileName, (</>), takeDirectory, dropTrailingPathSeparator)
@@ -21,6 +21,7 @@ import System.Posix.Files
     )
 import System.Posix.Types (DeviceID, FileID)
 import Ignore (Ignore, parse, ignores)
+import qualified LinkTable
 import qualified Data.Map as Map
 import qualified Data.Set as Set
 import qualified Msg
@@ -349,8 +350,26 @@ classifyLinkEntry path = do
 --
 --   与文件阶段同口径：跳过根目录下的 @.bisync@、按 ignore 规则过滤
 --   （目录链接按"目录"参与匹配，使 @dir/@ 这类规则能命中）。
-scanRelLinks :: FilePath -> FilePath -> Ignore -> IO [FilePath]
-scanRelLinks root dir ignoreRules = do
+--
+--   第一个参数是"链接表模式"：
+--     * @Nothing@      —— 普通仓库：用 lstat 判断是不是链接；
+--     * @Just table@   —— jail 型仓库：磁盘上没有真链接（都是真实目录/文件），
+--                         **表中命中即当链接**，且绝不解析它的目标。
+scanRelLinks :: Maybe LinkTable.Table -> FilePath -> FilePath -> Ignore -> IO [FilePath]
+-- 表模式：**表就是真相**，不扫目录 —— 只把表里的键按 ignore 过滤后返回。
+--   磁盘上没有对应目录是正常的（链接目标的内容可能还没同步过来），
+--   所以不能靠 listDirectory 来找"哪些条目是链接"。
+scanRelLinks (Just tbl) root _ ignoreRules = do
+    let names = Map.keys tbl
+    osPaths <- mapM encodeFS names
+    kinds <- mapM (\n -> do
+                       isDir <- doesDirectoryExist (root </> n)
+                       return (if isDir then LinkDirEntry else LinkEntry)) names
+    let isDirFlag k = k == LinkDirEntry
+        ignored = zipWith (ignores ignoreRules) osPaths (map isDirFlag kinds)
+    return [ n | (n, ign) <- zip names ignored, not ign ]
+
+scanRelLinks Nothing root dir ignoreRules = do
     entries <- listDirectory dir
     let atRoot  = dir == root
         visible = [ e | e <- entries
@@ -370,20 +389,38 @@ scanRelLinks root dir ignoreRules = do
     let links = [ l | (l, k) <- kept, k == LinkEntry || k == LinkDirEntry ]
         dirs  = [ d | (d, RealDirEntry) <- kept ]
 
-    subs <- concat <$> mapM (\d -> scanRelLinks root d ignoreRules) dirs
+    subs <- concat <$> mapM (\d -> scanRelLinks Nothing root d ignoreRules) dirs
     return (map (makeRelative root) links ++ subs)
 
 -- | 扫描同步目录中所有"可见"软链接（相对路径）
-scanLinks :: FilePath -> Maybe String -> IO [FilePath]
-scanLinks root mTag = do
+scanLinks :: Maybe LinkTable.Table -> FilePath -> Maybe String -> IO [FilePath]
+scanLinks mtbl root mTag = do
     ign <- readProfileIgnore root mTag
-    scanRelLinks root root ign
+    scanRelLinks mtbl root root ign
+
+-- | 读本端的链接表：文件不存在 → @Nothing@（普通仓库）；内容坏 → 直接报错
+--   （当空表会把所有链接判成"消失"，太危险）。
+linkTableOf :: FilePath -> Maybe String -> IO (Maybe LinkTable.Table)
+linkTableOf root mTag = case mTag of
+    Nothing -> return Nothing
+    Just tag
+        | null tag  -> return Nothing
+        | otherwise -> do
+            ok <- LinkTable.exists root tag
+            if not ok
+                then return Nothing
+                else do
+                    r <- LinkTable.load root tag
+                    case r of
+                        Left e  -> ioError (userError e)
+                        Right t -> return (Just t)
 
 -- | 扫描所有软链接的 FileState 列表（相对路径）
 currentLinkState :: FilePath -> Maybe String -> IO [FileState]
 currentLinkState root mTag = do
-    links <- scanLinks root mTag
-    mapM (statLinkRel root) links
+    mtbl <- linkTableOf root mTag
+    links <- scanLinks mtbl root mTag
+    mapM (statLinkRelT mtbl root) links
 
 -- | 链接条目的元信息：lstat（不跟随）
 --
@@ -396,6 +433,17 @@ statLinkRel root relPath = do
         mt = posixSecondsToUTCTime (realToFrac (modificationTime fs))
         md = fromIntegral (fileMode fs) .&. 0o7777
     return $ FileState sz mt md relPath
+
+-- | 同 'statLinkRel'，但支持链接表模式（表里只有 target 与 mtime）。
+statLinkRelT :: Maybe LinkTable.Table -> FilePath -> FilePath -> IO FileState
+statLinkRelT Nothing      root relPath = statLinkRel root relPath
+statLinkRelT (Just tbl) _ relPath = case Map.lookup relPath tbl of
+    Nothing -> ioError (userError ("link table: no entry for " ++ relPath))
+    Just e  -> return $ FileState
+        (LinkTable.entrySize e)
+        (posixSecondsToUTCTime (fromIntegral (LinkTable.entryMtime e)))
+        0o777
+        relPath
 
 -- ============================================================================
 -- 获取上次同步状态（从 .bisync/ 目录读取）
@@ -425,6 +473,11 @@ kindFileNames LinkKind = ("link_state", "link_added", "link_deleted")
 statKindRel :: StateKind -> FilePath -> FilePath -> IO FileState
 statKindRel FileKind = statRel
 statKindRel LinkKind = statLinkRel
+
+-- | 同 'statKindRel'，但链接条目可以走链接表
+statKindRelT :: Maybe LinkTable.Table -> StateKind -> FilePath -> FilePath -> IO FileState
+statKindRelT _ FileKind = statRel
+statKindRelT mtbl LinkKind = statLinkRelT mtbl
 
 -- | 从状态目录读取上次同步状态（只读，不写回不删文件）
 --
@@ -630,7 +683,8 @@ appendAddedKind kind root mTag relPath = do
         (_, addedName, _) = kindFileNames kind
         addedFp = stateDir </> addedName
     createDirectoryIfMissing True stateDir
-    fs <- statKindRel kind root relPath
+    mtbl <- linkTableOf root mTag
+    fs <- statKindRelT mtbl kind root relPath
     let line = T.encodeUtf8 (T.pack (show (size fs) ++ "," ++ show (posixSecs (mtime fs)) ++ ","))
             <> T.encodeUtf8 (T.pack relPath)
             <> BS.singleton 10

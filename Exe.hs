@@ -4,27 +4,34 @@ import Control.Concurrent.Async (concurrently)
 import Control.Exception (ErrorCall, IOException, bracket, catch, displayException, try)
 import Control.Monad (filterM, forM, forM_, unless, when)
 import Data.Char (toLower)
+import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe, isJust)
 import qualified Data.Map as Map
 import qualified Data.Set as Set
-import System.Directory (canonicalizePath, doesFileExist)
+import System.Directory (canonicalizePath, createDirectoryIfMissing, doesFileExist)
 import System.FilePath ((</>))
 import System.IO
     ( IOMode(ReadMode), hClose, hFileSize, hFlush, openBinaryFile, stdout, stdin
     , hSetEcho, hSetBuffering, BufferMode(..)
     , hReady
     )
+import System.IO.Unsafe (unsafePerformIO)
 import System.Posix.User (getEffectiveUserName)
+import qualified Data.Text as T (pack, unpack)
+import qualified Data.Text.Encoding as T (encodeUtf8, decodeUtf8With)
+import qualified Data.Text.Encoding.Error as TEE (lenientDecode)
 
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as B8
 
 import Connect (destroyHelper, handshakeInfo, prepareRemotes, spawnHelper)
+import qualified LinkTable
 import State
     ( FileState(..), FileChange(..), StateKind(..)
     , parseStateValue, statRel
     , currentStateWith, currentLinkState
     , lastStateKind, appendAddedKind, appendDeletedKind, discardStateUnder, posixSecs
+    , linkTableOf
     , indexStates, dedup
     )
 import Sync (sync, SyncAction(..), resolveConflicts, SideStats(..), sideStateLabel)
@@ -39,6 +46,7 @@ import Write
 import qualified Msg
 import Arg
     ( Root(..)
+    , die
     , ensureRoot, formatOwnPath, requireRoot, rootLabel
     )
 
@@ -62,6 +70,111 @@ printBanner = do
     putStrLn "  hsbisync - Bidirectional Sync"
     putStrLn "==================================="
 
+-- | @--jail <root|1|2>@（可重复）指定的目标端（入口读完参数后设置）
+{-# NOINLINE jailTargets #-}
+jailTargets :: IORef [String]
+jailTargets = unsafePerformIO (newIORef [])
+
+-- | 由入口设置：本轮要把哪些端变成 jail 型仓库
+setJailTargets :: [String] -> IO ()
+setJailTargets = writeIORef jailTargets
+
+-- | 读入口设置的 @--jail@ 列表
+--
+--   也用于 @hsbisync sync <profile> --jail <r1> <r2>@ 这种"根写在开关里"的形式。
+getJailTargets :: IO [String]
+getJailTargets = readIORef jailTargets
+
+-- | 本轮同步的 profile（链接表路径 @<root>/.bisync/<profile>/link_table.json@ 要用它）
+{-# NOINLINE currentProfile #-}
+currentProfile :: IORef (Maybe String)
+currentProfile = unsafePerformIO (newIORef Nothing)
+
+setCurrentProfile :: String -> IO ()
+setCurrentProfile = writeIORef currentProfile . Just
+
+-- | 按 @--jail@ 在指定端创建空的链接表（已存在则不动）。
+--
+--   链接表 = @<root>/.bisync/<profile>/link_table.json@，存在性就是模式；
+--   删掉它就回到普通仓库。@--jail@ 可以给多次（两端都是 jail 也行）。
+applyJailTarget :: String -> Root -> Root -> IO ()
+applyJailTarget profile r1 r2 = do
+    specs <- getJailTargets
+    mapM_ applyOne specs
+  where
+    applyOne s = case pick s of
+        Nothing -> die ("--jail must name one of the two roots (or 1 / 2); got: " ++ s)
+        Just (Local root) -> do
+            ok <- LinkTable.exists root profile
+            when (not ok) $ do
+                createDirectoryIfMissing True (root </> ".bisync" </> profile)
+                LinkTable.save root profile LinkTable.isEmptyTable
+                putStrLn ("  jail mode: created " ++ LinkTable.tablePath root profile)
+        Just (Remote host root) -> die $ unlines
+            [ "--jail on a remote root needs the table created on that host:"
+            , "  ssh " ++ host ++ " mkdir -p " ++ shell (root </> ".bisync" </> profile)
+            , "  ssh " ++ host ++ " \"printf '{}' > "
+                ++ shell (LinkTable.tablePath root profile) ++ "\""
+            ]
+    pick s
+        | s == "1"         = Just r1
+        | s == "2"         = Just r2
+        | s == rootText r1  = Just r1
+        | s == rootText r2  = Just r2
+        | otherwise         = Nothing
+    rootText (Local p)    = p
+    rootText (Remote h p) = h ++ ":" ++ p
+    shell = id
+
+-- ============================================================================
+-- 本地端的链接操作（按“本端是不是 jail 型仓库”分支）
+-- ============================================================================
+
+-- | 读链接的“内容”：普通仓库读真实链接；链接表模式查表
+lclLinkContent :: FilePath -> FilePath -> IO BS.ByteString
+lclLinkContent root relPath = do
+    tag  <- readIORef currentProfile
+    mtbl <- linkTableOf root tag
+    case mtbl of
+        Nothing -> readLinkContent (root </> relPath)
+        Just tbl -> case Map.lookup relPath tbl of
+            Nothing -> ioError (userError ("link table: no entry for " ++ relPath))
+            Just e  -> return (T.encodeUtf8 (T.pack (LinkTable.entryTarget e)))
+
+-- | 写入链接：普通仓库建真链接；链接表模式只写表（磁盘上不出现链接）
+lclLinkWrite :: FilePath -> FilePath -> BS.ByteString -> Int -> Integer -> String
+             -> IO (Either String ())
+lclLinkWrite root relPath content md mt expected = do
+    tag  <- readIORef currentProfile
+    mtbl <- linkTableOf root tag
+    case mtbl of
+        Nothing -> writeLinkVerified root (root </> relPath) content md mt expected
+        Just tbl
+            | hashBytes content /= expected ->
+                return (Left "verification failed before commit; target untouched")
+            | otherwise -> do
+                LinkTable.save root (fromMaybe "" tag)
+                    (LinkTable.putEntry relPath
+                        (LinkTable.Entry (targetText content)
+                                         (fromIntegral (BS.length content)) mt) tbl)
+                return (Right ())
+
+-- | 删除链接：普通仓库 unlink；链接表模式删条目（目录/文件不动）
+lclLinkRemove :: FilePath -> FilePath -> IO Bool
+lclLinkRemove root relPath = do
+    tag  <- readIORef currentProfile
+    mtbl <- linkTableOf root tag
+    case mtbl of
+        Nothing -> removeLinkSafe (root </> relPath)
+        Just tbl -> do
+            let (tbl', had) = LinkTable.delEntry relPath tbl
+            when had $ LinkTable.save root (fromMaybe "" tag) tbl'
+            return had
+
+-- | 指向字符串的字节 → String
+targetText :: BS.ByteString -> String
+targetText = T.unpack . T.decodeUtf8With TEE.lenientDecode
+
 -- | 同步主流程：标题之后一共 **6 步**
 --
 --   0. （不编号）先明确两端地址与 profile
@@ -84,6 +197,8 @@ runSync srcKind profile root1 root2 = do
     let (mHost1, path1) = case root1 of Local p -> (Nothing, p); Remote h p -> (Just h, p)
         (mHost2, path2) = case root2 of Local p -> (Nothing, p); Remote h p -> (Just h, p)
         mTag = Just profile
+
+    setCurrentProfile profile
 
     -- 阶段 0：先明确两端地址（本地端就是一个路径，没有 local: 这种写法）
     putStrLn $ "\n  root1 = " ++ rootLabel root1
@@ -111,6 +226,10 @@ runSync srcKind profile root1 root2 = do
             requireRoot root1
             requireRoot root2
             return (False, False)
+    -- --jail <root|1|2>：在指定端创建空链接表（存在即模式；删掉即回普通仓库）。
+    --   放在目录检查之后：否则 createDirectoryIfMissing True 会顺手把缺失的同步根
+    --   建出来，绕过"只建一层"与"免参模式只查不建"的约定。
+    applyJailTarget profile root1 root2
     prepareRemotes profile [root1, root2]
     handshakes <- handshakeInfo [root1, root2]
     repos <- case srcKind of
@@ -816,7 +935,7 @@ delEnd SKFile (Rmt hh)  relPath = do
         Left err -> error $ "FATAL: remote unlink failed: " ++ err
         Right _  -> return True
 delEnd SKLink (Lcl root) relPath = do
-    ok <- removeLinkSafe (root </> relPath)
+    ok <- lclLinkRemove root relPath
     unless ok $ putStrLn $ "  WARNING: not a symlink, left untouched: " ++ relPath
     return ok
 delEnd SKLink (Rmt hh) relPath = do
@@ -937,12 +1056,11 @@ transferFile (Rmt hhSrc) (Rmt hhDst) relPath srcMode srcMtime = do
 
 transferLink :: Side -> Side -> FilePath -> Int -> Integer -> IO (Either String ())
 transferLink (Lcl srcRoot) (Lcl dstRoot) relPath srcMode srcMtime = do
-    content <- readLinkContent (srcRoot </> relPath)
-    writeLinkVerified dstRoot (dstRoot </> relPath) content srcMode srcMtime
-        (hashBytes content)
+    content <- lclLinkContent srcRoot relPath
+    lclLinkWrite dstRoot relPath content srcMode srcMtime (hashBytes content)
 
 transferLink (Lcl srcRoot) (Rmt hhDst) relPath srcMode srcMtime = do
-    content <- readLinkContent (srcRoot </> relPath)
+    content <- lclLinkContent srcRoot relPath
     let hsh = hashBytes content
         sz  = toInteger (BS.length content)
     eb <- remoteRecvBegin hhDst SKLink relPath sz srcMode srcMtime
@@ -963,7 +1081,7 @@ transferLink (Rmt hhSrc) (Lcl dstRoot) relPath srcMode srcMtime = do
             case eh of
                 Left e -> return (Left e)
                 Right expected ->
-                    writeLinkVerified dstRoot (dstRoot </> relPath) content srcMode srcMtime expected
+                    lclLinkWrite dstRoot relPath content srcMode srcMtime expected
 
 transferLink (Rmt hhSrc) (Rmt hhDst) relPath srcMode srcMtime = do
     es <- remoteSend hhSrc SKLink relPath

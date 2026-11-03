@@ -13,8 +13,8 @@ NAME
      hsbisync - bidirectional file synchronizer between two directories
 
 SYNOPSIS
-     hsbisync sync <profile>
-     hsbisync sync <profile> <root1> <root2>
+     hsbisync sync <profile> [--jail <root>]...
+     hsbisync sync <profile> <root1> <root2> [--jail <root>]...
      hsbisync diff <profile>
      hsbisync profile
      hsbisync help | --help
@@ -41,6 +41,14 @@ SUBCOMMANDS
          written to .bisync/<profile>/repo on both ends, so the argument-less
          form can be used afterwards.
 
+         Option --jail <root> (repeatable; 1 / 2 also name the two roots)
+         turns that end into a jail repository; see JAIL REPOSITORIES.
+         --jail only removes the flag itself - the path after it is still a
+         positional argument, so these three forms are equivalent:
+             sync p --jail A B
+             sync p --jail A --jail B
+             sync p A --jail B
+
      diff <profile>
          Read-only preview: changes of the current directory relative to the
          last baseline, with the dimension that changed (size, old and new
@@ -58,6 +66,46 @@ ROOTS
      Two forms of root address:
          /local/path
          [user@]host:/remote/path
+
+JAIL REPOSITORIES
+     Use case: pushing dotfiles from machine A to machine B, where B wants
+     only the content and not A's absolute-path symlinks (such as
+     /home/A/.config/xxx). A jail repository records links only in a table,
+     creates no links on disk, and lays the link target's content down at the
+     same relative path as a real directory - so programs on B read the
+     config directly.
+
+     The test is whether the file exists, not whether --jail was passed: once
+     an end has .bisync/<profile>/link_table.json, later syncs need no --jail
+     and still work from the table. Deleting that file returns the end to a
+     normal repository.
+
+     The table is one line of JSON keyed by relative path; empty is {}:
+         {"conf":{"target":"/home/a/.config/x","size":19,
+                  "mtime":1758300001}}
+
+     size is the link's st_size (the byte length of the target string) and
+     mtime is the link's own mtime; these two are exactly the comparison key
+     of the link phase, and a jail end has no lstat to consult, so they must
+     be recorded. A malformed table is an error, never treated as empty
+     (which would mark every link as deleted).
+
+     Behavioural difference: on a jail end the set of links comes from the
+     table, not from scanning the directory, and no real links exist on disk.
+     The link target's content is synced as ordinary files/directories at the
+     same relative path. Links added to the table are recreated as real
+     symlinks on a normal end. Both ends being jail also works (the table's
+     target and size/mtime are compared).
+
+     Turning an existing repository with links into a jail: it starts from an
+     empty table, so the pre-existing real links are not recorded and do not
+     take part in syncing - they simply stay on disk (the table is the only
+     truth). Start a jail end from an empty directory, or write the entries
+     into the table by hand.
+
+     --jail on a remote end does not touch the remote side: create the empty
+     table there by hand first (the error message prints the commands), then
+     run the sync.
 
 SYNC PROCEDURE
      A sync runs in 6 steps:
@@ -81,12 +129,13 @@ SYNC PROCEDURE
      [3/6] Syncing symlinks ...
          Only the link's own lstat is compared (its length is the length of the
          target string, plus the link's own mtime); the link is not followed.
-         If the link structures on the two ends do not agree (unresolved
-         conflicts, actions that did not land, or a refusal at the confirmation
-         prompt), steps 4 to 6 are skipped entirely. The reason: the file phase
-         compares by relative path + (size, mtime), which assumes that the same
-         path refers to the same object on both ends; when links are not aligned
-         that assumption fails.
+         A jail end has no lstat: the link set and both values come from
+         link_table.json. If the link structures on the two ends do not agree
+         (unresolved conflicts, actions that did not land, or a refusal at the
+         confirmation prompt), steps 4 to 6 are skipped entirely. The reason:
+         the file phase compares by relative path + (size, mtime), which assumes
+         that the same path refers to the same object on both ends; when links
+         are not aligned that assumption fails.
 
      [4/6] Reading states ...
          Both ends are scanned in parallel (each filtered by the now-identical
@@ -132,6 +181,11 @@ FILES
 
      .bisync/<profile>/ignore
          The ignore rules, gitignore syntax. Aligned on both ends by step 2.
+
+     .bisync/<profile>/link_table.json
+         The link table of a jail repository; its presence is what makes the
+         end jail, and a normal repository has none. Never synced. See JAIL
+         REPOSITORIES for the format.
 
      The three baseline files (one set for the file tree and one for the
      symlink tree, with the same shape):

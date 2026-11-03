@@ -22,7 +22,7 @@ import Data.Time.LocalTime (getCurrentTimeZone, utcToLocalTime)
 import GHC.IO.Encoding (setFileSystemEncoding, setLocaleEncoding, utf8)
 
 import Arg (Root(..), parseRoot, parseSyncThree)
-import Exe (RootSource(..), printBanner, runSync)
+import Exe (RootSource(..), printBanner, runSync, setJailTargets)
 import Help (showHelp)
 import Helper (runHelper)
 import State
@@ -45,7 +45,13 @@ main = do
     -- 顺序很重要：必须在创建句柄、读参数之前执行。
     setFileSystemEncoding utf8
     setLocaleEncoding utf8
-    args <- getArgs
+    args0 <- getArgs
+    -- --jail <root>（可重复）：把这些端变成 jail 型仓库（创建 link_table.json）。
+    -- 用空格分隔而不是 --jail=<root>：路径里带引号/空格时省得和 shell 转义拧。
+    (args, jailSpecs) <- case splitJail args0 of
+        Left e  -> die e
+        Right r -> return r
+    setJailTargets jailSpecs
     -- 每个子命令**先按参数个数**校验：数量不对就直接给出该子命令的正确用法，
     -- 多余参数也算错误（不静默忽略）。只有数量正确时才谈得上"实质性的误用"。
     case args of
@@ -62,6 +68,23 @@ main = do
         _                  -> showHelp
 
 -- | 完整说明文在 Help.hs（单一维护点）；此处只负责分发。
+
+-- | 从参数里抽出 @--jail@ 标记（可重复）：它后面紧跟的那个路径就是 jail 仓库。
+--
+--   只移除 @--jail@ 这个 token，**路径本身留在位置参数里** —— 所以：
+--
+--   > sync p --jail A B      -- ✓ A 是 jail，两端是 A 和 B
+--   > sync p --jail A --jail B   -- ✓ 两端都 jail
+--   > sync p A B --jail A    -- ✗ 去掉 --jail 后有三个路径 → 参数个数校验报错
+--
+--   路径里的空格/引号完全由 shell 负责，程序不做任何拼接。
+splitJail :: [String] -> Either String ([String], [String])
+splitJail = go [] []
+  where
+    go pos specs [] = Right (reverse pos, reverse specs)
+    go _ _ ["--jail"] = Left "--jail requires a path: --jail <root>"
+    go pos specs ("--jail" : x : rest) = go (x : pos) (x : specs) rest
+    go pos specs (a : rest) = go (a : pos) specs rest
 
 -- ============================================================================
 -- Helper 模式
@@ -96,6 +119,7 @@ dropPrefix prefix s
 
 -- | hsbisync sync <profile> [<root1> <root2>]
 --   一个参数：读 .bisync/<profile>/repo 获取对端地址
+--   两个参数：`--jail=<root1>` + 位置参数 <root2>（把一端的根写在开关里）
 --   三个参数：profile + 双端直接同步
 syncCmd :: [String] -> IO ()
 syncCmd [profile] = syncFromRepo profile

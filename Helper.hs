@@ -25,6 +25,7 @@ import State
     ( FileState(..), StateKind(..)
     , appendAddedKind, appendDeletedKind
     , currentStateWith, currentLinkState, lastStateKind
+    , linkTableOf
     , stateBuilder, discardStateUnder
     )
 import Write
@@ -34,6 +35,11 @@ import Write
     , copyExactlyHash, padZeros, openTargetTemp, commitReceived, removeQuietly
     )
 import qualified Msg
+import qualified LinkTable
+import qualified Data.Map as Map
+import qualified Data.Text as T (pack, unpack)
+import qualified Data.Text.Encoding as T (encodeUtf8, decodeUtf8With)
+import qualified Data.Text.Encoding.Error as TEE (lenientDecode)
 
 -- ============================================================================
 -- 入口
@@ -124,9 +130,9 @@ commandLoop root mTag = go
         "settime"   -> cmdSetTime   root req
         "add"       -> withPath $ cmdAdd    root mTag kind
         "delete"    -> withPath $ cmdDelete root mTag kind
-        "unlink"    -> withPath $ cmdUnlink root kind
-        "hash"      -> withPath $ cmdHash   root kind
-        "send"      -> withPath $ cmdSend   root kind
+        "unlink"    -> withPath $ cmdUnlink root mTag kind
+        "hash"      -> withPath $ cmdHash   root mTag kind
+        "send"      -> withPath $ cmdSend   root mTag kind
         "recv"      -> withPath $ cmdRecv   root mTag kind req
         "getstat"   -> withPath $ cmdGetStat root
         other       -> replyErr ("unknown command: " ++ other)
@@ -197,14 +203,35 @@ cmdDelete root mTag kind path = do
     appendDeletedKind kind root mTag path
     replyOk []
 
+-- | 链接的"内容"：普通仓库读真实链接；链接表模式查表
+linkContent :: FilePath -> Maybe String -> FilePath -> IO BS.ByteString
+linkContent root mTag relPath = do
+    mtbl <- linkTableOf root mTag
+    case mtbl of
+        Nothing -> readLinkContent (root </> relPath)
+        Just tbl -> case Map.lookup relPath tbl of
+            Nothing -> ioError (userError ("link table: no entry for " ++ relPath))
+            Just e  -> return (T.encodeUtf8 (T.pack (LinkTable.entryTarget e)))
+
+-- | 指向字符串的字节 → String（与 'linkContent' 对称）
+targetText :: BS.ByteString -> String
+targetText = T.unpack . T.decodeUtf8With TEE.lenientDecode
+
 -- | 文件：删的是**目标**（'removeFileSafe' 先解析末端链接，保留链接本身）；
 --   链接：只 unlink 链接自己。占位不是链接时回 @notLink@，主控端只告警不删。
-cmdUnlink :: FilePath -> StateKind -> FilePath -> IO ()
-cmdUnlink root kind path = case kind of
+cmdUnlink :: FilePath -> Maybe String -> StateKind -> FilePath -> IO ()
+cmdUnlink root mTag kind path = case kind of
     FileKind -> removeFileSafe (root </> path) >> replyOk []
     LinkKind -> do
-        ok <- removeLinkSafe (root </> path)
-        replyOk (if ok then [] else [("notLink", Msg.JBool True)])
+        mtbl <- linkTableOf root mTag
+        case mtbl of
+            Nothing -> do
+                ok <- removeLinkSafe (root </> path)
+                replyOk (if ok then [] else [("notLink", Msg.JBool True)])
+            Just tbl -> do
+                let (tbl', had) = LinkTable.delEntry path tbl
+                when had $ LinkTable.save root (fromMaybe "" mTag) tbl'
+                replyOk (if had then [] else [("notLink", Msg.JBool True)])
 
 -- ============================================================================
 -- HASH
@@ -213,10 +240,10 @@ cmdUnlink root kind path = case kind of
 -- | @{"cmd":"hash",…}@ → @{"hash":"…"}@
 --
 --   文件走**流式**哈希（内存 O(1)）；链接的内容就是指向字符串，很短。
-cmdHash :: FilePath -> StateKind -> FilePath -> IO ()
-cmdHash root kind path = case kind of
+cmdHash :: FilePath -> Maybe String -> StateKind -> FilePath -> IO ()
+cmdHash root mTag kind path = case kind of
     LinkKind -> do
-        content <- readLinkContent (root </> path)
+        content <- linkContent root mTag path
         replyOk [("hash", Msg.str (hashBytes content))]
     FileKind -> do
         r <- try (hashFile (root </> path))
@@ -232,10 +259,10 @@ cmdHash root kind path = case kind of
 --
 --   读源出错 / 提前 EOF 时用 'padZeros' 把帧补齐 —— 接收端长度仍对齐，而哈希
 --   必然对不上，于是它自己删临时文件、回错误（比截短载荷安全得多）。
-cmdSend :: FilePath -> StateKind -> FilePath -> IO ()
-cmdSend root kind path = case kind of
+cmdSend :: FilePath -> Maybe String -> StateKind -> FilePath -> IO ()
+cmdSend root mTag kind path = case kind of
     LinkKind -> do
-        content <- readLinkContent (root </> path)
+        content <- linkContent root mTag path
         replyOk [("size", Msg.int (fromIntegral (BS.length content)))]
         BS.hPut stdout content
         hFlush stdout
@@ -298,19 +325,38 @@ cmdRecv root mTag kind req path =
                                 either replyErr (const (replyOk [])) r
 
     -- 链接：内容很短（指向字符串），照旧整块；落地流程不变
+    --
+    --   **必须先回 OK 再读载荷**（与 recvFile 对称）：主控端发完请求会等这一行，
+    --   少了它两边互等，表现为"链接阶段确认后静默卡死"。
+    --
+    --   链接表模式（jail 型仓库）：不建真实链接，只往表里写一条；
+    --   内容照旧由文件阶段写成真实目录 —— 所以这里也不用作废子基线。
     recvLink sz md mt = do
+        replyOk []
         content <- hGetExactly stdin (fromIntegral sz)
         mh <- readHashTrailer
         case mh of
             Nothing -> replyErr "recv: missing hash trailer"
             Just expected -> do
-                r <- writeLinkVerified root full content md mt expected
-                case r of
-                    Right () -> do
-                        -- 链接刚建/改：本端该链接子树下的文件基线条目已过期，就地作废
-                        discardStateUnder root mTag path
-                        replyOk []
-                    Left err -> replyErr err
+                mtbl <- linkTableOf root mTag
+                case mtbl of
+                    Just tbl
+                        | hashBytes content /= expected ->
+                            replyErr "verification failed before commit; target untouched"
+                        | otherwise -> do
+                            LinkTable.save root (fromMaybe "" mTag)
+                                (LinkTable.putEntry path
+                                    (LinkTable.Entry (targetText content)
+                                                     (fromIntegral (BS.length content)) mt) tbl)
+                            replyOk []
+                    Nothing -> do
+                        r <- writeLinkVerified root full content md mt expected
+                        case r of
+                            Right () -> do
+                                -- 链接刚建/改：本端该链接子树下的文件基线条目已过期，就地作废
+                                discardStateUnder root mTag path
+                                replyOk []
+                            Left err -> replyErr err
 
 -- | 载荷之后那条哈希尾行：@{"ok":true,"hash":"…"}@
 readHashTrailer :: IO (Maybe String)
