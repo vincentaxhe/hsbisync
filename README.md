@@ -97,8 +97,9 @@ JAIL REPOSITORIES
      phase's comparison key, which a jail end has no lstat to obtain. A
      malformed table is an error, never treated as empty.
 
-     --jail / --unjail do not touch a remote root; create or delete the table
-     there by hand.
+     --jail works on a remote root too: the helper creates the empty table
+     there (and refuses if that end still has real links). The jail / unjail
+     conversion subcommands act on the local current directory only.
 
 SYNC PROCEDURE
      A sync runs in 6 steps:

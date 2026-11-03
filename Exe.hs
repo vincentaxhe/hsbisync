@@ -128,12 +128,17 @@ applyRepoModes profile r1 r2 = do
                         putStrLn ("  jail: created " ++ LinkTable.tablePath root profile)
         | otherwise = return ()
     applyOne specs (Remote host p)
-        | (host ++ ":" ++ p) `elem` specs = die $ unlines
-            [ "--jail does not touch a remote root; create the table there by hand:"
-            , "  ssh " ++ host ++ " mkdir -p " ++ (p </> ".bisync" </> profile)
-            , "  ssh " ++ host ++ " \"printf '{}' > "
-                ++ (p </> ".bisync" </> profile </> "link_table.json") ++ "\""
-            ]
+        | (host ++ ":" ++ p) `elem` specs =
+            -- 远端也自动建空表（走 helper 的 jail 命令，同样有“还有真链接就拒绝”的护栏）
+            bracket (spawnHelper host p profile) destroyHelper $ \hh -> do
+                r <- call hh (Msg.obj [("cmd", Msg.str "jail")])
+                case r of
+                    Left e -> die ("--jail: " ++ host ++ ":" ++ p ++ ": " ++ e)
+                    Right resp
+                        | (Msg.field "created" resp >>= Msg.asBool) == Just True ->
+                            putStrLn $ "  jail: created " ++ host ++ ":" ++ p
+                                       ++ "/.bisync/" ++ profile ++ "/link_table.json"
+                        | otherwise -> return ()
         | otherwise = return ()
     rootText (Local p)    = p
     rootText (Remote h p) = h ++ ":" ++ p

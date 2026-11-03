@@ -4,7 +4,7 @@ import Control.Exception (ErrorCall, IOException, catch, displayException, try)
 import Control.Monad (unless, when)
 import Data.Bits ((.&.))
 import Data.Maybe (fromMaybe, listToMaybe)
-import System.Directory (doesFileExist)
+import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.Environment (getExecutablePath, lookupEnv)
 import System.FilePath ((</>))
 import System.IO
@@ -25,7 +25,7 @@ import State
     ( FileState(..), StateKind(..)
     , appendAddedKind, appendDeletedKind
     , currentStateWith, currentLinkState, lastStateKind
-    , linkTableOf
+    , linkTableOf, readProfileIgnore, scanRelLinks
     , stateBuilder, discardStateUnder
     )
 import Write
@@ -126,6 +126,7 @@ commandLoop root mTag = go
         "last"      -> cmdLast      root mTag kind
         "getignore" -> cmdGetIgnore root mTag
         "putrepo"   -> cmdPutRepo   root mTag req
+        "jail"      -> cmdJail      root mTag
         "setstat"   -> cmdSetStat   root req
         "settime"   -> cmdSetTime   root req
         "add"       -> withPath $ cmdAdd    root mTag kind
@@ -462,6 +463,34 @@ repoAlready fp addr = do
     if not e
         then return False
         else (== B8.pack addr) . B8.strip <$> BS.readFile fp
+
+-- ============================================================================
+-- JAIL — 主控端 --jail 指向远端时，只保证表存在（空表）
+-- ============================================================================
+
+-- | @{"cmd":"jail"}@ → @{"created":true|false}@
+--
+--   表已存在 → created=false（主控端不重复提示）。
+--   该端还有真实链接 → 报错，让用户先在那台机器上跑 @hsbisync jail@，
+--   否则空表会让这些链接判成“消失”并向对端传播删除。
+cmdJail :: FilePath -> Maybe String -> IO ()
+cmdJail root mTag = case mTag of
+    Nothing -> replyErr "jail: helper started without a profile tag"
+    Just tag -> do
+        ok <- LinkTable.exists root tag
+        if ok
+            then replyOk [("created", Msg.JBool False)]
+            else do
+                ign <- readProfileIgnore root (Just tag)
+                old <- scanRelLinks Nothing root root ign
+                if not (null old)
+                    then replyErr ("jail: " ++ show (length old)
+                        ++ " real symlink(s) still here; run `hsbisync jail "
+                        ++ tag ++ "` on that host first")
+                    else do
+                        createDirectoryIfMissing True (root </> ".bisync" </> tag)
+                        LinkTable.save root tag LinkTable.isEmptyTable
+                        replyOk [("created", Msg.JBool True)]
 
 -- | 登录方（主控端）地址，取自 sshd 设置的环境变量。
 --   SSH_CONNECTION 是现代 sshd 的标准变量；SSH_CLIENT 是旧变量，
