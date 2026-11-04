@@ -136,6 +136,13 @@ SYNC PROCEDURE
          removed), the link is restored on that end instead of propagating a
          deletion. Only a path that is really gone propagates the deletion.
 
+         A deletion is carried one step further: a link dropped from the
+         baseline this run (link_deleted) is also deleted on the peer when the
+         peer still holds the same link (same length and mtime) - otherwise the
+         relay would see it as "new" on the next run and pull it back. Once the
+         peer drops the link, the real files it pointed to are out of scope, so
+         they are not deleted.
+
      [4/6] Reading states ...
          Both ends are scanned in parallel (each filtered by the now-identical
          ignore rules) and compared with their own baseline. The scan is

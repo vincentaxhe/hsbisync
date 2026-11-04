@@ -24,7 +24,7 @@ import qualified Data.ByteString.Lazy as BL
 import State
     ( FileState(..), StateKind(..)
     , appendAddedKind, appendDeletedKind
-    , currentStateWith, currentLinkState, lastStateKind
+    , currentStateWith, currentLinkState, lastStateKindT
     , linkTableOf, readProfileIgnore, scanRelLinks
     , stateBuilder, discardStateUnder
     )
@@ -180,8 +180,16 @@ cmdState root mTag kind = do
               | not (null rmdirs) ]
 
 -- | @{"cmd":"last","kind":…}@ → @{"entries":[…]}@（读基线：不扫描、不清理）
+--
+--   链接（'LinkKind'）还可能多带一个 @tombstones@：本轮读状态时被 @deleted@ 抹掉的
+--   条目（同 @entries@ 的数组形状）。主控端用它把「删掉的链接」再传播一步给仍持有
+--   同一条链接的对端；文件侧忽略这个字段。一次都没有就整个字段不出现。
 cmdLast :: FilePath -> Maybe String -> StateKind -> IO ()
-cmdLast root mTag kind = replyOk . entries =<< lastStateKind kind root mTag
+cmdLast root mTag kind = do
+    (sts, tombs) <- lastStateKindT kind root mTag
+    replyOk $ entries sts
+           ++ [ ("tombstones", Msg.raw (stateBuilder tombs))
+              | kind == LinkKind, not (null tombs) ]
 
 entries :: [FileState] -> [(String, Msg.Value)]
 entries st = [("entries", Msg.raw (stateBuilder st))]

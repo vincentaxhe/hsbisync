@@ -30,9 +30,9 @@ import State
     ( FileState(..), FileChange(..), SideState(..), StateKind(..)
     , parseStateValue, statRel, statLinkRel
     , currentStateWith, currentLinkState
-    , lastStateKind, appendAddedKind, appendDeletedKind, discardStateUnder, posixSecs
+    , lastStateKind, lastStateKindT, appendAddedKind, appendDeletedKind, discardStateUnder, posixSecs
     , linkTableOf, readProfileIgnore, scanRelLinks
-    , indexStates, dedup
+    , indexStates, dedup, sameFile
     )
 import Sync (sync, SyncAction(..), resolveConflicts, SideStats(..), sideStateLabel)
 import Write
@@ -353,7 +353,7 @@ syncFilePhases profile mTag mHost1 path1 mHost2 path2 = do
     --   输出（用户 2026-09-22）：不统计条数 —— 想看变化看第 5 步的初步统计，
     --   这一步只留阶段标题。
     putStrLn "\n[4/6] Reading states ..."
-    ((_label1, (last1, cur1), rmdir1), (_label2, (last2, cur2), rmdir2)) <-
+    ((_label1, (last1, cur1), rmdir1, _), (_label2, (last2, cur2), rmdir2, _)) <-
         concurrently (readSideK SKFile mTag mHost1 path1) (readSideK SKFile mTag mHost2 path2)
 
     -- 第 4 步的收尾：扫描本来就要进入/查看/离开每一个目录，空判定是顺带得出的，
@@ -689,17 +689,33 @@ syncLinkPhase
     -> Maybe String -> FilePath -> Maybe String -> FilePath -> IO Bool
 syncLinkPhase profile mTag mHost1 path1 mHost2 path2 = do
     putStrLn "\n[3/6] Syncing symlinks ..."
-    ((_label1, (last1, cur1), _), (_label2, (last2, cur2), _)) <-
+    ((_label1, (last1, cur1), _, tombs1), (_label2, (last2, cur2), _, tombs2)) <-
         concurrently (readSideK SKLink mTag mHost1 path1) (readSideK SKLink mTag mHost2 path2)
 
-    let (_, pairs1, _, pairs2) = sync (last1, last2) (cur1, cur2)
+    -- 链接的删除要能再传播一步：本轮读状态时被 link_deleted 抹掉的墓碑，若对端
+    -- **仍持有同一条链接**（size/mtime 相同）且本端现在没有它，就把墓碑放回基线，
+    -- 让 diff 得出「对端删除」。否则那端只是显得“新增”，删除永远传不过去
+    -- （中转仓库 B 删掉后，C 还留着链接，下一轮 B 反而把链接重新收回来）。
+    let carry tombs ownMap peerMap =
+            [ fs | fs <- tombs
+                 , not (Map.member (filename fs) ownMap)
+                 , Just peerFs <- [Map.lookup (filename fs) peerMap]
+                 , sameFile fs peerFs ]
+        idx2 = indexStates cur2
+        idx1 = indexStates cur1
+        last1' = last1 ++ carry tombs1 (indexStates cur1) idx2
+        last2' = last2 ++ carry tombs2 (indexStates cur2) idx1
+
+    let (_, pairs1, _, pairs2) = sync (last1', last2') (cur1, cur2)
         (_, pairs1', pairs2') = resolveConflicts pairs1 pairs2
 
     -- 「链接被真实内容替换」≠「链接被删除」：前者要把链接还原回去，不能把删除传给对端。
     -- 实测踩过：jail 端删掉 link_table.json 变回普通仓库后，磁盘上是链接目标的内容，
     -- 而 link_state 里还记着链接 → 这一端报 deleted，另一端的真链接就被删掉了
     -- （接着文件阶段还把内容也删干净）。
-    (pairs1'', pairs2'') <- restoreReplacedLinks mHost1 path1 mHost2 path2 profile pairs1' pairs2'
+    (pairs1'', pairs2'') <- restoreReplacedLinks mHost1 path1 mHost2 path2 profile
+                                (Set.fromList (map filename (tombs1 ++ tombs2)))
+                                pairs1' pairs2'
 
     let hasWork = any (isJust . snd) pairs1'' || any (isJust . snd) pairs2''
 
@@ -758,15 +774,19 @@ data Replaced = Replaced
 --   处理：报删除的那一端改为**接收**（把链接还原），持有端不动。还原后
 --   'discardLocal' / helper 的 @recvLink@ 会作废该子树下的文件基线，内容由文件阶段
 --   重新同步；若那一端是 jail，则按链接表写条目（内容继续留在同步目录里）。
+--
+--   第一个集合是**本轮刚删掉的链接**（墓碑）：它们要克制地删掉，不能被“还原”回来。
 restoreReplacedLinks
     :: Maybe String -> FilePath -> Maybe String -> FilePath -> String
+    -> Set.Set FilePath
     -> [(FileChange, Maybe SyncAction)]
     -> [(FileChange, Maybe SyncAction)]
     -> IO ([(FileChange, Maybe SyncAction)], [(FileChange, Maybe SyncAction)])
-restoreReplacedLinks mHost1 path1 mHost2 path2 profile pairs1 pairs2 = do
+restoreReplacedLinks mHost1 path1 mHost2 path2 profile tombNames pairs1 pairs2 = do
     let holders = Map.fromList
             [ (filename (rhFs h), h)
-            | h <- mapMaybe (holderOf 1) pairs1 ++ mapMaybe (holderOf 2) pairs2 ]
+            | h <- mapMaybe (holderOf 1) pairs1 ++ mapMaybe (holderOf 2) pairs2
+            , not (Set.member (filename (rhFs h)) tombNames) ]
     if Map.null holders
         then return (pairs1, pairs2)
         else do
@@ -984,40 +1004,48 @@ kindName :: StateKind -> Msg.Value
 kindName FileKind = Msg.str "file"
 kindName LinkKind = Msg.str "link"
 
--- | 读取一端的状态：(label, (上次状态, 当前状态), 本次扫描发起过的每一次 rmdir)
+-- | 读取一端的状态：(label, (上次状态, 当前状态), 本次扫描发起过的每一次 rmdir, 墓碑)
 --
 --   悬空链接没有特殊处理：扫描只是扫不到那里的东西。
 --   第三项只对**文件**扫描有意义：链接扫描不清理（见 'State.currentStateWith'）。
+--   第四项（墓碑）只对链接有意义：本轮被 @link_deleted@ 抹掉的条目，见 'lastStateKindT'。
 readSideK
     :: SyncKind -> Maybe String -> Maybe String -> FilePath
-    -> IO (String, ([FileState], [FileState]), [(FilePath, Bool)])
+    -> IO (String, ([FileState], [FileState]), [(FilePath, Bool)], [FileState])
 readSideK kind mTag mHost path =
     case mHost of
         Nothing -> do
-            l <- lastStateKind (kindState kind) path mTag
+            (l, tombs) <- case kind of
+                SKFile -> (\s -> (s, [])) <$> lastStateKind FileKind path mTag
+                SKLink -> lastStateKindT LinkKind path mTag
             (c, rmdirs) <- case kind of
                 SKFile -> currentStateWith True path mTag
                 SKLink -> (\s -> (s, [])) <$> currentLinkState path mTag
-            return ("local", (l, c), rmdirs)
+            return ("local", (l, c), rmdirs, tombs)
         Just host -> do
             hh <- spawnHelper host path (fromMaybe "" mTag)
-            (l, _)       <- getHelperStates hh "last"  (kindState kind)
-            (c, rmdirs)  <- getHelperStates hh "state" (kindState kind)
+            (l, _, tombs)   <- getHelperStates hh "last"  (kindState kind)
+            (c, rmdirs, _)  <- getHelperStates hh "state" (kindState kind)
             destroyHelper hh
-            return ("ssh " ++ host, (l, c), rmdirs)
+            return ("ssh " ++ host, (l, c), rmdirs, tombs)
 
 -- | 读对端状态：which = "state"（本次扫描）或 "last"（上次基线）
 --
 --   "state" 的响应里还可能带 @rmdir@：本次**发起过的每一次 rmdir**，形如
 --   @[{"相对路径": 是否成功}, …]@（**数组**保序，深 → 浅）；
---   "last" 只读基线，不带这个字段 → 空列表。
-getHelperStates :: HelperHandle -> String -> StateKind -> IO ([FileState], [(FilePath, Bool)])
+--   "last" 只读基线，不带这个字段 → 空列表；链接的 "last" 还可能带 @tombstones@
+--   （本轮被 deleted 抹掉的条目，形状同 @entries@）。
+getHelperStates
+    :: HelperHandle -> String -> StateKind
+    -> IO ([FileState], [(FilePath, Bool)], [FileState])
 getHelperStates hh which kind = do
     r <- call hh (Msg.cmd which [("kind", kindName kind)])
     case r of
         Left err -> error $ which ++ " failed: " ++ err
         Right v  -> case Msg.field "entries" v of
-            Just e  -> return (parseStateValue e, Msg.fieldBools "rmdir" v)
+            Just e  -> return ( parseStateValue e
+                              , Msg.fieldBools "rmdir" v
+                              , maybe [] parseStateValue (Msg.field "tombstones" v) )
             Nothing -> error $ which ++ ": response has no \"entries\""
 
 -- ============================================================================

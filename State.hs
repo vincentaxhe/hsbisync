@@ -3,7 +3,7 @@ module State where
 import Control.Exception (catch, IOException, try)
 import Control.Monad (when)
 import Data.Bits ((.&.))
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, isJust)
 import Data.Time (UTCTime)
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime, utcTimeToPOSIXSeconds)
 
@@ -490,6 +490,19 @@ statKindRelT mtbl LinkKind = statLinkRelT mtbl
 --   与 'lastStateKind' 不同，此函数不修改任何文件。
 readLastStateKind :: StateKind -> FilePath -> Maybe String -> IO [FileState]
 readLastStateKind kind root mTag = do
+    (st, mdels) <- readStateParts kind root mTag
+    return $ case mdels of
+        Nothing   -> st
+        Just dels -> filter (\fs -> not (Set.member (filename fs) dels)) st
+
+-- | 读三件套的“合并后、尚未应用 deleted”的结果
+--
+--   返回 @(条目, Just 被删除的名字集合)@；没有 deleted 文件时第二项是 'Nothing'
+--   （与“文件存在但为空”区分：后者仍然要触发写回/清理，与旧行为一致）。
+readStateParts
+    :: StateKind -> FilePath -> Maybe String
+    -> IO ([FileState], Maybe (Set.Set FilePath))
+readStateParts kind root mTag = do
     let stateDir = root </> ".bisync" </> fromMaybe "" mTag
         (stateName, addedName, deletedName) = kindFileNames kind
         stateFile   = stateDir </> stateName
@@ -508,30 +521,42 @@ readLastStateKind kind root mTag = do
         then do
             raw <- BS.readFile deletedFile
             let dels = Set.fromList (map (T.unpack . T.decodeUtf8) (bsLines raw))
-            return $ filter (\fs -> not (Set.member (filename fs) dels)) st'
-        else return st'
+            return (st', Just dels)
+        else return (st', Nothing)
 
 -- | 从状态目录读取上次同步状态，合并后写回并清理
 --
---   内部调用 'readLastStateKind'，然后写回 state 并删除 added / deleted。
+--   内部调用 'lastStateKindT'，后者已写回 state 并删除 added / deleted。
 lastStateKind :: StateKind -> FilePath -> Maybe String -> IO [FileState]
-lastStateKind kind root mTag = do
+lastStateKind kind root mTag = fst <$> lastStateKindT kind root mTag
+
+-- | 同 'lastStateKind'，但额外返回**本次被 deleted 抹掉的条目**（“墓碑”）。
+--
+--   用途：链接的删除要能再传播一步 —— 本轮删掉的链接，若对端仍持有**同一条**，
+--   就顺手把对端也删掉；否则那端只显得“新增”，删除永远传不过去
+--   （中转仓库 B 删掉后，C 还留着链接，下一轮 B 反而把链接重新收回来）。
+--   墓碑本身照旧在本轮读状态时清掉，不会长期堆积。
+lastStateKindT :: StateKind -> FilePath -> Maybe String -> IO ([FileState], [FileState])
+lastStateKindT kind root mTag = do
     let stateDir = root </> ".bisync" </> fromMaybe "" mTag
         (stateName, addedName, deletedName) = kindFileNames kind
         stateFile   = stateDir </> stateName
         addedFile   = stateDir </> addedName
         deletedFile = stateDir </> deletedName
 
-    st <- readLastStateKind kind root mTag
+    (st, mdels) <- readStateParts kind root mTag
+    let (kept, tombs) = case mdels of
+            Nothing   -> (st, [])
+            Just dels -> ( filter (\fs -> not (Set.member (filename fs) dels)) st
+                         , [ fs | fs <- st, Set.member (filename fs) dels ] )
 
     hasAdded <- doesFileExist addedFile
-    hasDeleted <- doesFileExist deletedFile
-    when (hasAdded || hasDeleted) $ do
-        writeEntries stateFile st
-        when hasAdded   $ removeFileSilent addedFile
-        when hasDeleted $ removeFileSilent deletedFile
+    when (hasAdded || isJust mdels) $ do
+        writeEntries stateFile kept
+        when hasAdded       $ removeFileSilent addedFile
+        when (isJust mdels) $ removeFileSilent deletedFile
 
-    return st
+    return (kept, tombs)
 
 -- | 兼容旧签名（文件条目）
 readLastState :: FilePath -> Maybe String -> IO [FileState]
