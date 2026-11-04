@@ -1,7 +1,7 @@
 module Main where
 
 import Control.Exception (IOException, try)
-import Control.Monad (forM_, unless, when)
+import Control.Monad (filterM, forM_, unless, when)
 import System.Directory
     ( doesDirectoryExist, doesFileExist
     , getCurrentDirectory, listDirectory
@@ -224,12 +224,19 @@ requireProfileDir cwd profile = do
     return profDir
 
 -- | @.bisync/@ 下现有的 profile 名（按名字排序；目录不存在就是空）
+--
+--   只认**子目录**：@.bisync@ 下面还有仓库级的配置文件（@ignore@、
+--   @link_table.json@），它们不是 profile。
 existingProfiles :: FilePath -> IO [String]
 existingProfiles bisyncDir = do
     hasDir <- doesDirectoryExist bisyncDir
     if not hasDir
         then return []
-        else sort . filter (not . isHidden) <$> listDirectory bisyncDir
+        else do
+            entries <- listDirectory bisyncDir
+            dirs <- filterM (doesDirectoryExist . (bisyncDir </>))
+                            [ e | e <- entries, not (isHidden e) ]
+            return (sort dirs)
 
 -- ============================================================================
 -- diff 子命令（只读预览）
@@ -280,8 +287,8 @@ diffOneTree :: TimeZone -> FilePath -> String -> StateKind -> IO ()
 diffOneTree tz cwd tag kind = do
     prev <- readLastStateKind kind cwd (Just tag)
     cur  <- case kind of
-        FileKind -> currentState     cwd (Just tag)
-        LinkKind -> currentLinkState cwd (Just tag)
+        FileKind -> currentState     cwd
+        LinkKind -> currentLinkState cwd
 
     let prevM = indexStates prev
         -- (DiffState, 条目, 基线)：
@@ -395,10 +402,10 @@ updatedBreakdown kind changed =
                     ++ show both      ++ " " ++ w ++ "+mtime"
 
 -- ============================================================================
--- profile 子命令（只读：列出 / 显示某个 profile 的 repo 与 ignore）
+-- profile 子命令（只读：列出 / 显示各 profile 的 repo 与仓库级 ignore）
 -- ============================================================================
 
--- | hsbisync profile — 列出所有 profile（每个都带 repo 与 ignore 详情）。
+-- | hsbisync profile — 列出所有 profile（每个带 repo 详情，另外单独列一次 ignore）。
 --
 --   没有"只显示某一个"的模式：列表输出本身就包含全部信息，没必要多一个入口。
 --   注：repo/ignore 不再由 profile 命令直接写入 ——
@@ -418,39 +425,38 @@ cmdProfileList = do
         then putStrLn "No .bisync directory found."
         else do
             names <- existingProfiles bisyncDir
-            if null names
-                then putStrLn "No profiles found."
-                else do
-                    putStrLn "Profiles:"
-                    forM_ names $ \name ->
-                        showProfile bisyncDir name
+            unless (null names) $ do
+                putStrLn "Profiles:"
+                forM_ names $ \name ->
+                    showProfile bisyncDir name
+            -- ignore 是仓库级的（.bisync/ignore），所有 profile 共用 → 只列一次
+            showRepoIgnore bisyncDir
 
--- | 显示单个 profile 的 repo 和 ignore 内容
+-- | 仓库级 ignore（@.bisync/ignore@）
+showRepoIgnore :: FilePath -> IO ()
+showRepoIgnore bisyncDir = do
+    let ignoreFile = bisyncDir </> "ignore"
+    hasIgnore <- doesFileExist ignoreFile
+    ignoreLines <- if hasIgnore
+        then lines <$> readFile ignoreFile
+        else return []
+    putStrLn "Ignore (repo-wide):"
+    if null ignoreLines
+        then putStrLn "    -"
+        else forM_ ignoreLines $ \l -> putStrLn $ "    " ++ l
+
+-- | 显示单个 profile 的 repo
 showProfile :: FilePath -> String -> IO ()
 showProfile bisyncDir name = do
-    let repoFile   = bisyncDir </> name </> "repo"
-        ignoreFile = bisyncDir </> name </> "ignore"
-    hasRepo   <- doesFileExist repoFile
-    hasIgnore <- doesFileExist ignoreFile
-
+    let repoFile = bisyncDir </> name </> "repo"
+    hasRepo <- doesFileExist repoFile
     peerText <- if hasRepo
         then do
             peer <- filter (not . (`elem` "\n\r")) <$> readFile repoFile
             return $ "repo: " ++ peer
         else return "repo: -"
-
-    ignoreLines <- if hasIgnore
-        then lines <$> readFile ignoreFile
-        else return []
-
     putStrLn $ "  " ++ name
     putStrLn $ "    " ++ peerText
-    if null ignoreLines
-        then putStrLn "    ignore: -"
-        else do
-            putStrLn "    ignore:"
-            forM_ ignoreLines $ \l ->
-                putStrLn $ "      " ++ l
 
 -- | 文件名是否以 '.' 开头
 isHidden :: FilePath -> Bool

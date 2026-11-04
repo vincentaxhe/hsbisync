@@ -25,7 +25,7 @@ import State
     ( FileState(..), StateKind(..)
     , appendAddedKind, appendDeletedKind
     , currentStateWith, currentLinkState, lastStateKindT
-    , linkTableOf, scanRelLinks, readAllProfilesIgnore
+    , linkTableOf, scanRelLinks, readIgnore
     , stateBuilder, discardStateUnder
     )
 import Write
@@ -122,9 +122,9 @@ commandLoop root mTag = go
     -- 需要 "path" 的命令走 withPath；其余（state/last/getignore/putrepo…）不需要
     dispatch' cmd kind req = case cmd of
         "quit"      -> replyOk []
-        "state"     -> cmdState     root mTag kind
+        "state"     -> cmdState     root kind
         "last"      -> cmdLast      root mTag kind
-        "getignore" -> cmdGetIgnore root mTag
+        "getignore" -> cmdGetIgnore root
         "putrepo"   -> cmdPutRepo   root mTag req
         "jail"      -> cmdJail      root
         "setstat"   -> cmdSetStat   root req
@@ -172,9 +172,9 @@ isEOF = catch (hLookAhead stdin >> return False) handler
 --   **一次都没发起就整个字段都不出现**：老主控端会忽略这个未知键，
 --   新主控端把字段缺失当空列表，两个方向都兼容。
 --   远端 helper 的 stdout 就是协议，不能自己打印，只能回报给主控端统一展示。
-cmdState :: FilePath -> Maybe String -> StateKind -> IO ()
-cmdState root mTag kind = do
-    (sts, rmdirs) <- currentKind kind root mTag
+cmdState :: FilePath -> StateKind -> IO ()
+cmdState root kind = do
+    (sts, rmdirs) <- currentKind kind root
     replyOk $ [ ("entries", Msg.raw (stateBuilder sts)) ]
            ++ [ ("rmdir", Msg.arr [ Msg.obj [(p, Msg.JBool ok)] | (p, ok) <- rmdirs ])
               | not (null rmdirs) ]
@@ -194,9 +194,9 @@ cmdLast root mTag kind = do
 entries :: [FileState] -> [(String, Msg.Value)]
 entries st = [("entries", Msg.raw (stateBuilder st))]
 
-currentKind :: StateKind -> FilePath -> Maybe String -> IO ([FileState], [(FilePath, Bool)])
-currentKind FileKind root mTag = currentStateWith True root mTag
-currentKind LinkKind root mTag = (\s -> (s, [])) <$> currentLinkState root mTag
+currentKind :: StateKind -> FilePath -> IO ([FileState], [(FilePath, Bool)])
+currentKind FileKind root = currentStateWith True root
+currentKind LinkKind root = (\s -> (s, [])) <$> currentLinkState root
 
 -- ============================================================================
 -- ADD / DELETE / UNLINK
@@ -411,9 +411,9 @@ cmdSetTime root req =
 
 -- | @{"cmd":"getignore"}@ → @{"exists":false}@ 或
 --   @{"exists":true,"mtime":…,"mode":…,"hash":…}@
-cmdGetIgnore :: FilePath -> Maybe String -> IO ()
-cmdGetIgnore root mTag = do
-    let ignoreFile = root </> ".bisync" </> fromMaybe "" mTag </> "ignore"
+cmdGetIgnore :: FilePath -> IO ()
+cmdGetIgnore root = do
+    let ignoreFile = root </> ".bisync" </> "ignore"
     exists <- doesFileExist ignoreFile
     if not exists
         then replyOk [("exists", Msg.JBool False)]
@@ -488,7 +488,7 @@ cmdJail root = do
     if ok
         then replyOk [("created", Msg.JBool False)]
         else do
-            ign <- readAllProfilesIgnore root
+            ign <- readIgnore root
             old <- scanRelLinks Nothing root root ign
             if not (null old)
                 then replyErr ("jail: " ++ show (length old)

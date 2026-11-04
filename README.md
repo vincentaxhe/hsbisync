@@ -75,8 +75,8 @@ SUBCOMMANDS
          mtime; times shown in the local timezone). No state is written.
 
      profile
-         List every profile under .bisync/ together with its repo and ignore
-         contents. Read-only, takes no arguments.
+         List the repo of every profile under .bisync/ plus the repo-wide
+         ignore rules. Read-only, takes no arguments.
 
      --helper --passcode=dontrunyourself --root=<path> [--tag=<profile>]
          Internal: the remote half of the process, started locally over ssh.
@@ -123,7 +123,7 @@ SYNC PROCEDURE
          explicit-address mode.
 
      [2/6] Syncing ignore rules ...
-         Unconditionally align .bisync/<profile>/ignore on both ends: the newer
+         Unconditionally align .bisync/ignore on both ends: the newer
          side overwrites the older one. This must come first, so that the file
          sets scanned on both ends are comparable. After this step the ignore
          file no longer takes part in file syncing.
@@ -193,8 +193,9 @@ FILES
          One line with the peer address. Written automatically by
          sync <profile> <root1> <root2>.
 
-     .bisync/<profile>/ignore
-         The ignore rules, gitignore syntax. Aligned on both ends by step 2.
+     .bisync/ignore
+         The ignore rules, gitignore syntax. Repo-wide (every profile shares
+         it); aligned on both ends by step 2.
 
      .bisync/link_table.json
          The link table of a jail repository; never synced. Its presence makes
@@ -218,14 +219,14 @@ FILES
      direction.
 
      Each profile describes one sync relationship (one peer plus one set of
-     ignore rules), and each end keeps its own copy. The .bisync directory
-     itself never takes part in syncing; the ignore file is aligned by step 2.
+     baselines), and each end keeps its own copy. The .bisync directory itself
+     never takes part in syncing; the ignore file is aligned by step 2.
 
 IGNORE RULES
-     .bisync/<profile>/ignore filters the file tree at scan time using
-     gitignore syntax (implemented by gitignore-ospath): ignored entries are
+     .bisync/ignore filters the file tree at scan time using gitignore syntax
+     (implemented by gitignore-ospath): ignored entries are
      invisible to sync - not deleted, not transferred. The ignore file itself is
-     aligned on both ends by step 2.
+     aligned on both ends by step 2. It is repo-wide, not per profile.
 
      Hidden files get no special treatment; .git/ and friends are synced as
      well. The .bisync directory itself is always skipped. The tool's temporary

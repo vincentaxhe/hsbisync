@@ -32,7 +32,7 @@ import State
     , currentStateWith, currentLinkState
     , lastStateKind, lastStateKindT, appendAddedKind, appendDeletedKind, discardStateUnder, posixSecs
     , linkTableOf, scanRelLinks
-    , profilesUnder, readAllProfilesIgnore
+    , profilesUnder, readIgnore
     , indexStates, dedup, sameFile
     )
 import Sync (sync, SyncAction(..), resolveConflicts, SideStats(..), sideStateLabel)
@@ -108,7 +108,7 @@ applyRepoModes profile r1 r2 = do
             unless ok $ do
                 -- 空表 + 磁盘上还有真链接 = 这些链接在链接阶段"消失"，会向
                 -- 对端传播删除。先让用户在该端跑 jail 子命令，把链接搬进表。
-                ign <- readAllProfilesIgnore root
+                ign <- readIgnore root
                 old <- scanRelLinks Nothing root root ign
                 if not (null old)
                     then die $ unlines
@@ -148,7 +148,7 @@ convertToJail root = do
     if already
         then putStrLn ("  already jail: " ++ LinkTable.tablePath root)
         else do
-            ign  <- readAllProfilesIgnore root
+            ign  <- readIgnore root
             rels <- scanRelLinks Nothing root root ign
             entries <- mapM (mkEntry root) rels
             createDirectoryIfMissing True (root </> ".bisync")
@@ -311,7 +311,7 @@ runSync srcKind profile root1 root2 = do
     -- 此阶段之后 ignore 文件不再参与文件同步。
     -- 输出：只在**真的复制了**才多一行；两端都没有 / 两边本来就一样 → 除了标题不说别的。
     putStrLn "\n[2/6] Syncing ignore rules ..."
-    syncIgnoreFiles profile mHost1 path1 mHost2 path2
+    syncIgnoreFiles mHost1 path1 mHost2 path2
 
     -- 阶段 3：同步软链接（先让两端的链接结构完全一致）。
     -- 输出：只有真有动作（要用户确认）时才列清单 + 提问；结构调整一致时静默。
@@ -869,7 +869,7 @@ withHelpers mHost1 path1 mHost2 path2 profile k =
                   k side1 side2
 
 -- ============================================================================
--- Ignore 规则预同步（同步开始前对齐两端 .bisync/<profile>/ignore）
+-- Ignore 规则预同步（同步开始前对齐两端 .bisync/ignore）
 -- ============================================================================
 
 -- | 若该端为远程，则为其派生一个 helper 执行动作；本地端直接执行。
@@ -878,14 +878,14 @@ withSide Nothing path _ k = k (Lcl path)
 withSide (Just host) path profile k =
     bracket (spawnHelper host path profile) destroyHelper (k . Rmt)
 
--- | profile 的 ignore 文件相对路径（相对同步根目录）
-ignoreRel :: String -> FilePath
-ignoreRel profile = ".bisync" </> profile </> "ignore"
+-- | ignore 文件相对路径（相对同步根目录）：**仓库级**，不按 profile 分
+ignoreRel :: FilePath
+ignoreRel = ".bisync" </> "ignore"
 
 -- | 读取本地 ignore 文件元信息 @(mtime, mode, sha512)@，不存在返回 Nothing
-localIgnoreMeta :: FilePath -> String -> IO (Maybe (Integer, Int, String))
-localIgnoreMeta root profile = do
-    let rel  = ignoreRel profile
+localIgnoreMeta :: FilePath -> IO (Maybe (Integer, Int, String))
+localIgnoreMeta root = do
+    let rel  = ignoreRel
         full = root </> rel
     e <- doesFileExist full
     if not e
@@ -896,22 +896,21 @@ localIgnoreMeta root profile = do
             return $ Just (posixSecs (mtime fs), mode fs, hashBytes content)
 
 -- | 读取任一端 ignore 文件元信息
-sideIgnoreMeta :: Side -> String -> IO (Maybe (Integer, Int, String))
-sideIgnoreMeta (Lcl root) profile = localIgnoreMeta root profile
-sideIgnoreMeta (Rmt hh)   _        = getIgnoreRemote hh
+sideIgnoreMeta :: Side -> IO (Maybe (Integer, Int, String))
+sideIgnoreMeta (Lcl root) = localIgnoreMeta root
+sideIgnoreMeta (Rmt hh)   = getIgnoreRemote hh
 
 -- | 对齐两端 ignore 文件（在扫描状态之前调用）
 syncIgnoreFiles
-    :: String            -- ^ profile
-    -> Maybe String      -- ^ root1 host（Nothing=本地）
+    :: Maybe String      -- ^ root1 host（Nothing=本地）
     -> FilePath         -- ^ root1 路径
     -> Maybe String      -- ^ root2 host
     -> FilePath         -- ^ root2 路径
     -> IO ()
-syncIgnoreFiles profile mHost1 path1 mHost2 path2 =
-    withSide mHost1 path1 profile $ \side1 ->
-      withSide mHost2 path2 profile $ \side2 ->
-        syncIgnore profile side1 side2
+syncIgnoreFiles mHost1 path1 mHost2 path2 =
+    withSide mHost1 path1 "" $ \side1 ->
+      withSide mHost2 path2 "" $ \side2 ->
+        syncIgnore side1 side2
 
 -- | 两端 ignore 的合并决策：
 --   * 都无 → 无事（**静默**）
@@ -922,27 +921,27 @@ syncIgnoreFiles profile mHost1 path1 mHost2 path2 =
 --
 --   输出约定（用户 2026-09-22）：**只有真的做了动作才打印**（即复制那一行）。
 --   "两边都没有"和"两边一样"都不是动作，一个字都不说。
-syncIgnore :: String -> Side -> Side -> IO ()
-syncIgnore profile sideA sideB = do
-    mA <- sideIgnoreMeta sideA profile
-    mB <- sideIgnoreMeta sideB profile
+syncIgnore :: Side -> Side -> IO ()
+syncIgnore sideA sideB = do
+    mA <- sideIgnoreMeta sideA
+    mB <- sideIgnoreMeta sideB
     case (mA, mB) of
         (Nothing, Nothing) ->
             return ()
         (Just a, Nothing) ->
-            copyIgnore profile sideA sideB "root2" a
+            copyIgnore sideA sideB "root2" a
         (Nothing, Just b) ->
-            copyIgnore profile sideB sideA "root1" b
+            copyIgnore sideB sideA "root1" b
         (Just a, Just b)
             | hashOf a == hashOf b ->
                 return ()
             | otherwise ->
                 case compare (mtOf a) (mtOf b) of
-                    GT -> copyIgnore profile sideA sideB "root2" a
-                    LT -> copyIgnore profile sideB sideA "root1" b
+                    GT -> copyIgnore sideA sideB "root2" a
+                    LT -> copyIgnore sideB sideA "root1" b
                     EQ -> do
                         putStrLn "  WARNING: ignore files differ but mtime is equal; using root1"
-                        copyIgnore profile sideA sideB "root2" a
+                        copyIgnore sideA sideB "root2" a
   where
     mtOf   (m, _, _) = m
     hashOf (_, _, h) = h
@@ -950,11 +949,11 @@ syncIgnore profile sideA sideB = do
 -- | 把 src 端的 ignore 文件同步到 dst 端（经 transferContent 保留 mtime/mode）。
 --   只提示哪个 root 被更新了，不区分"较旧/缺失"、不指明来源。
 copyIgnore
-    :: String -> Side -> Side -> String
+    :: Side -> Side -> String
     -> (Integer, Int, String)  -- ^ 源端 (mtime, mode, hash)
     -> IO ()
-copyIgnore profile src dst dstName (mt, srcMode, _) = do
-    result <- transferContent SKFile src dst (ignoreRel profile) srcMode mt
+copyIgnore src dst dstName (mt, srcMode, _) = do
+    result <- transferContent SKFile src dst ignoreRel srcMode mt
     case result of
         Left err -> putStrLn $ "  ERROR: failed to sync ignore file: " ++ err
         Right () -> putStrLn $ "  " ++ dstName ++ " ignore updated"
@@ -1009,8 +1008,8 @@ readSideK kind mTag mHost path =
                 SKFile -> (\s -> (s, [])) <$> lastStateKind FileKind path mTag
                 SKLink -> lastStateKindT LinkKind path mTag
             (c, rmdirs) <- case kind of
-                SKFile -> currentStateWith True path mTag
-                SKLink -> (\s -> (s, [])) <$> currentLinkState path mTag
+                SKFile -> currentStateWith True path
+                SKLink -> (\s -> (s, [])) <$> currentLinkState path
             return ("local", (l, c), rmdirs, tombs)
         Just host -> do
             hh <- spawnHelper host path (fromMaybe "" mTag)

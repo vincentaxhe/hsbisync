@@ -1,7 +1,7 @@
 module State where
 
 import Control.Exception (catch, IOException, try)
-import Control.Monad (filterM, forM, when)
+import Control.Monad (filterM, when)
 import Data.Bits ((.&.))
 import Data.List (isPrefixOf)
 import Data.Maybe (fromMaybe, isJust)
@@ -31,7 +31,7 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Builder as B
 import qualified Data.Text.Encoding as T
 import qualified Data.Text.IO as TIO
-import qualified Data.Text as T (pack, unpack, empty, concat)
+import qualified Data.Text as T (pack, unpack)
 
 -- | 空的 gitignore 规则集
 emptyIgnore :: Ignore
@@ -96,12 +96,12 @@ data FileChange
 -- 获取当前文件状态（扫描 root 目录）
 -- ============================================================================
 
--- | 从 @.bisync/<profile>/ignore@ 读取忽略规则
+-- | 从 @.bisync/ignore@ 读取忽略规则（**仓库级**，所有 profile 共用）
 --
 --   文件名与文件内容一律按 UTF-8 处理（进程入口已固定编码，见 Main.main）。
-readProfileIgnore :: FilePath -> Maybe String -> IO Ignore
-readProfileIgnore root mTag = do
-    let ignoreFile = root </> ".bisync" </> fromMaybe "" mTag </> "ignore"
+readIgnore :: FilePath -> IO Ignore
+readIgnore root = do
+    let ignoreFile = root </> ".bisync" </> "ignore"
     exists <- doesFileExist ignoreFile
     if exists
         then parse <$> TIO.readFile ignoreFile
@@ -110,11 +110,11 @@ readProfileIgnore root mTag = do
 -- | 扫描目录，返回所有文件的相对路径（深度优先）
 --
 --   不做隐藏文件过滤：所有文件/目录（含以 @.@ 开头的）都参与同步，
---   需要排除的条目通过 ignore 规则（@.bisync/<profile>/ignore@）过滤。
+--   需要排除的条目通过 ignore 规则（@.bisync/ignore@）过滤。
 --   仅在同步根目录下额外跳过工具自身状态目录 @.bisync@。
-scanFiles :: FilePath -> Maybe String -> IO [FilePath]
-scanFiles root mTag = do
-    ign <- readProfileIgnore root mTag
+scanFiles :: FilePath -> IO [FilePath]
+scanFiles root = do
+    ign <- readIgnore root
     srFiles <$> scanRelFrom False [] root root ign
 
 -- | 扫描 root 目录，返回所有文件的 FileState 列表（相对路径）
@@ -124,8 +124,8 @@ scanFiles root mTag = do
 --   指回根目录的链接在第 1 层就会被切断。
 --
 --   **只读**：不会改动文件树（@hsbisync diff@ 用的就是它）。
-currentState :: FilePath -> Maybe String -> IO [FileState]
-currentState root mTag = fst <$> currentStateWith False root mTag
+currentState :: FilePath -> IO [FileState]
+currentState root = fst <$> currentStateWith False root
 
 -- | 扫描 root 目录：返回（文件的 FileState 列表, 本次**每一次 rmdir 尝试**）。
 --
@@ -142,9 +142,9 @@ currentState root mTag = fst <$> currentStateWith False root mTag
 --   （竞态 / 挂载点 EBUSY / 权限 / 只读文件系统），由主控端上报，不在这里吞掉。
 --
 --   同步流程用 @cleanup = True@；只读预览（diff）用 'currentState'。
-currentStateWith :: Bool -> FilePath -> Maybe String -> IO ([FileState], [(FilePath, Bool)])
-currentStateWith cleanup root mTag = do
-    ign <- readProfileIgnore root mTag
+currentStateWith :: Bool -> FilePath -> IO ([FileState], [(FilePath, Bool)])
+currentStateWith cleanup root = do
+    ign <- readIgnore root
     mRootId <- dirIdent root
     let seed = maybe [] (:[]) mRootId
     res <- scanRelFrom cleanup seed root root ign
@@ -394,9 +394,9 @@ scanRelLinks Nothing root dir ignoreRules = do
     return (map (makeRelative root) links ++ subs)
 
 -- | 扫描同步目录中所有"可见"软链接（相对路径）
-scanLinks :: Maybe LinkTable.Table -> FilePath -> Maybe String -> IO [FilePath]
-scanLinks mtbl root mTag = do
-    ign <- readProfileIgnore root mTag
+scanLinks :: Maybe LinkTable.Table -> FilePath -> IO [FilePath]
+scanLinks mtbl root = do
+    ign <- readIgnore root
     scanRelLinks mtbl root root ign
 
 -- | 读本端的链接表：文件不存在 → @Nothing@（普通仓库）；内容坏 → 直接报错
@@ -426,24 +426,11 @@ profilesUnder root = do
             filterM (doesDirectoryExist . (dir </>))
                     [ e | e <- es, not (isPrefixOf "." e) ]
 
--- | 所有 profile 的 ignore 规则合并成一份（jail / unjail 转换用）
---
---   转换是**仓库级**的，而 ignore 是按 profile 的：任何 profile 忽略的条目都不该被
---   搬进表或从磁盘删掉，所以这里取并集（把各 profile 的规则拼在一起再解析）。
-readAllProfilesIgnore :: FilePath -> IO Ignore
-readAllProfilesIgnore root = do
-    ps <- profilesUnder root
-    chunks <- forM ps $ \p -> do
-        let f = root </> ".bisync" </> p </> "ignore"
-        ok <- doesFileExist f
-        if ok then TIO.readFile f else return T.empty
-    return (parse (T.concat chunks))
-
 -- | 扫描所有软链接的 FileState 列表（相对路径）
-currentLinkState :: FilePath -> Maybe String -> IO [FileState]
-currentLinkState root mTag = do
+currentLinkState :: FilePath -> IO [FileState]
+currentLinkState root = do
     mtbl <- linkTableOf root
-    links <- scanLinks mtbl root mTag
+    links <- scanLinks mtbl root
     mapM (statLinkRelT mtbl root) links
 
 -- | 链接条目的元信息：lstat（不跟随）
