@@ -1,8 +1,9 @@
 module State where
 
 import Control.Exception (catch, IOException, try)
-import Control.Monad (when)
+import Control.Monad (filterM, forM, when)
 import Data.Bits ((.&.))
+import Data.List (isPrefixOf)
 import Data.Maybe (fromMaybe, isJust)
 import Data.Time (UTCTime)
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime, utcTimeToPOSIXSeconds)
@@ -30,7 +31,7 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Builder as B
 import qualified Data.Text.Encoding as T
 import qualified Data.Text.IO as TIO
-import qualified Data.Text as T (pack, unpack)
+import qualified Data.Text as T (pack, unpack, empty, concat)
 
 -- | 空的 gitignore 规则集
 emptyIgnore :: Ignore
@@ -400,25 +401,48 @@ scanLinks mtbl root mTag = do
 
 -- | 读本端的链接表：文件不存在 → @Nothing@（普通仓库）；内容坏 → 直接报错
 --   （当空表会把所有链接判成"消失"，太危险）。
-linkTableOf :: FilePath -> Maybe String -> IO (Maybe LinkTable.Table)
-linkTableOf root mTag = case mTag of
-    Nothing -> return Nothing
-    Just tag
-        | null tag  -> return Nothing
-        | otherwise -> do
-            ok <- LinkTable.exists root tag
-            if not ok
-                then return Nothing
-                else do
-                    r <- LinkTable.load root tag
-                    case r of
-                        Left e  -> ioError (userError e)
-                        Right t -> return (Just t)
+--
+--   表是**仓库级**的（@.bisync/link_table.json@），与 profile 无关。
+linkTableOf :: FilePath -> IO (Maybe LinkTable.Table)
+linkTableOf root = do
+    ok <- LinkTable.exists root
+    if not ok
+        then return Nothing
+        else do
+            r <- LinkTable.load root
+            case r of
+                Left e  -> ioError (userError e)
+                Right t -> return (Just t)
+
+-- | @.bisync@ 下的所有 profile 名（目录名，不含点开头的）
+profilesUnder :: FilePath -> IO [FilePath]
+profilesUnder root = do
+    let dir = root </> ".bisync"
+    has <- doesDirectoryExist dir
+    if not has
+        then return []
+        else do
+            es <- listDirectory dir
+            filterM (doesDirectoryExist . (dir </>))
+                    [ e | e <- es, not (isPrefixOf "." e) ]
+
+-- | 所有 profile 的 ignore 规则合并成一份（jail / unjail 转换用）
+--
+--   转换是**仓库级**的，而 ignore 是按 profile 的：任何 profile 忽略的条目都不该被
+--   搬进表或从磁盘删掉，所以这里取并集（把各 profile 的规则拼在一起再解析）。
+readAllProfilesIgnore :: FilePath -> IO Ignore
+readAllProfilesIgnore root = do
+    ps <- profilesUnder root
+    chunks <- forM ps $ \p -> do
+        let f = root </> ".bisync" </> p </> "ignore"
+        ok <- doesFileExist f
+        if ok then TIO.readFile f else return T.empty
+    return (parse (T.concat chunks))
 
 -- | 扫描所有软链接的 FileState 列表（相对路径）
 currentLinkState :: FilePath -> Maybe String -> IO [FileState]
 currentLinkState root mTag = do
-    mtbl <- linkTableOf root mTag
+    mtbl <- linkTableOf root
     links <- scanLinks mtbl root mTag
     mapM (statLinkRelT mtbl root) links
 
@@ -708,7 +732,7 @@ appendAddedKind kind root mTag relPath = do
         (_, addedName, _) = kindFileNames kind
         addedFp = stateDir </> addedName
     createDirectoryIfMissing True stateDir
-    mtbl <- linkTableOf root mTag
+    mtbl <- linkTableOf root
     fs <- statKindRelT mtbl kind root relPath
     let line = T.encodeUtf8 (T.pack (show (size fs) ++ "," ++ show (posixSecs (mtime fs)) ++ ","))
             <> T.encodeUtf8 (T.pack relPath)

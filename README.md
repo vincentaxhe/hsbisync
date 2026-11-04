@@ -16,8 +16,8 @@ SYNOPSIS
      hsbisync sync <profile> [--jail <root>]... [--no-confirm]
      hsbisync sync <profile> <root1> <root2> [--jail <root>]...
                  [--no-confirm]
-     hsbisync jail <profile>
-     hsbisync unjail <profile>
+     hsbisync jail
+     hsbisync unjail
      hsbisync diff <profile>
      hsbisync profile
      hsbisync help | --help
@@ -45,22 +45,26 @@ SUBCOMMANDS
          form can be used afterwards.
 
          Option --jail <root> (repeatable) only makes sure that end has an
-         empty link_table.json (nothing happens if it already exists) so the
-         link phase compares against the table. It does not move any links;
-         use the jail / unjail subcommands for that. An end not named by
-         --jail is left untouched. It is a switch, so the path stays a
-         positional argument:
+         empty .bisync/link_table.json (nothing happens if it already exists)
+         so the link phase compares against the table. It does not move any
+         links; use the jail / unjail subcommands for that. An end not named by
+         --jail is left untouched. The table is repo-wide (not per profile): a
+         repository is never half jail, so every profile shares one table. It is
+         a switch, so the path stays a positional argument:
              sync p --jail A B
              sync p A --jail B
 
          Option --no-confirm: answer y at every confirmation (scripts, no tty).
 
-     jail <profile>
+     jail
          Turn the current directory into a jail repository: existing symlinks
-         move into link_table.json and are unlinked; the link target's content
-         is then synced as real directories at the same relative path.
+         move into .bisync/link_table.json and are unlinked; the link target's
+         content is then synced as real directories at the same relative path.
+         The table belongs to the repository, not to a profile: the file
+         baselines of every profile are invalidated, and the conversion applies
+         to all of them.
 
-     unjail <profile>
+     unjail
          The reverse: the table's entries are recreated as real symlinks
          (whatever occupies that path is removed first; the content is
          re-synced), then the table is deleted.
@@ -84,8 +88,8 @@ ROOTS
          [user@]host:/remote/path
 
 JAIL REPOSITORIES
-     A jail end keeps symlinks only in .bisync/<profile>/link_table.json and
-     creates none on disk; the link target's content is synced as ordinary
+     A jail end keeps symlinks only in .bisync/link_table.json and creates none
+     on disk; the link target's content is synced as ordinary
      files/directories at the same relative path - which is what a host that
      should just receive config content needs.
 
@@ -96,6 +100,10 @@ JAIL REPOSITORIES
      size is the link's st_size and mtime the link's own mtime - the link
      phase's comparison key, which a jail end has no lstat to obtain. A
      malformed table is an error, never treated as empty.
+
+     The table is repo-wide, not per profile: an end is either jail or not, so
+     every profile shares one table (a profile that syncs later must not see
+     link targets as plain directories).
 
      --jail works on a remote root too: the helper creates the empty table
      there (and refuses if that end still has real links). The jail / unjail
@@ -188,9 +196,10 @@ FILES
      .bisync/<profile>/ignore
          The ignore rules, gitignore syntax. Aligned on both ends by step 2.
 
-     .bisync/<profile>/link_table.json
+     .bisync/link_table.json
          The link table of a jail repository; never synced. Its presence makes
-         the end jail; the jail / unjail subcommands switch between forms.
+         the end jail; the jail / unjail subcommands switch between forms. It
+         is repo-wide: every profile shares it.
 
      The three baseline files (one set for the file tree and one for the
      symlink tree, with the same shape):

@@ -130,20 +130,25 @@ dropPrefix prefix s
 -- jail / unjail 子命令：在当前目录做仓库形态转换
 -- ============================================================================
 
--- | @hsbisync jail <profile>@ / @hsbisync unjail <profile>@
+-- | @hsbisync jail@ / @hsbisync unjail@
 --
 --   只作用于**当前目录**（就是同步根本端）。已经是目标形态则什么都不做。
 --   转换只做一次；之后同步流程根据 link_table.json 在不在自动选口径。
+--
+--   链接表是**仓库级**的（@.bisync/link_table.json@），与 profile 无关；
+--   旧命令行的 @<profile>@ 仍然接受（兼容），但直接忽略并提示一句。
 cmdConvert :: Bool -> [String] -> IO ()
 cmdConvert toJail args = case args of
-    [profile] -> do
-        cwd <- getCurrentDirectory
-        _ <- requireProfileDir cwd profile
-        if toJail
-            then convertToJail profile cwd
-            else convertFromJail profile cwd
-    _ -> die ("Usage: hsbisync " ++ verb ++ " <profile>")
+    []  -> go
+    [p] -> do
+        putStrLn $ "  note: the link table is repo-wide (.bisync/link_table.json);"
+                ++ " profile " ++ p ++ " is ignored"
+        go
+    _   -> die ("Usage: hsbisync " ++ verb)
   where
+    go = do
+        cwd <- getCurrentDirectory
+        if toJail then convertToJail cwd else convertFromJail cwd
     verb = if toJail then "jail" else "unjail"
 
 -- ============================================================================

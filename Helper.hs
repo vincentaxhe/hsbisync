@@ -25,7 +25,7 @@ import State
     ( FileState(..), StateKind(..)
     , appendAddedKind, appendDeletedKind
     , currentStateWith, currentLinkState, lastStateKindT
-    , linkTableOf, readProfileIgnore, scanRelLinks
+    , linkTableOf, scanRelLinks, readAllProfilesIgnore
     , stateBuilder, discardStateUnder
     )
 import Write
@@ -126,7 +126,7 @@ commandLoop root mTag = go
         "last"      -> cmdLast      root mTag kind
         "getignore" -> cmdGetIgnore root mTag
         "putrepo"   -> cmdPutRepo   root mTag req
-        "jail"      -> cmdJail      root mTag
+        "jail"      -> cmdJail      root
         "setstat"   -> cmdSetStat   root req
         "settime"   -> cmdSetTime   root req
         "add"       -> withPath $ cmdAdd    root mTag kind
@@ -213,9 +213,9 @@ cmdDelete root mTag kind path = do
     replyOk []
 
 -- | 链接的"内容"：普通仓库读真实链接；链接表模式查表
-linkContent :: FilePath -> Maybe String -> FilePath -> IO BS.ByteString
-linkContent root mTag relPath = do
-    mtbl <- linkTableOf root mTag
+linkContent :: FilePath -> FilePath -> IO BS.ByteString
+linkContent root relPath = do
+    mtbl <- linkTableOf root
     case mtbl of
         Nothing -> readLinkContent (root </> relPath)
         Just tbl -> case Map.lookup relPath tbl of
@@ -229,17 +229,17 @@ targetText = T.unpack . T.decodeUtf8With TEE.lenientDecode
 -- | 文件：删的是**目标**（'removeFileSafe' 先解析末端链接，保留链接本身）；
 --   链接：只 unlink 链接自己。占位不是链接时回 @notLink@，主控端只告警不删。
 cmdUnlink :: FilePath -> Maybe String -> StateKind -> FilePath -> IO ()
-cmdUnlink root mTag kind path = case kind of
+cmdUnlink root _mTag kind path = case kind of
     FileKind -> removeFileSafe (root </> path) >> replyOk []
     LinkKind -> do
-        mtbl <- linkTableOf root mTag
+        mtbl <- linkTableOf root
         case mtbl of
             Nothing -> do
                 ok <- removeLinkSafe (root </> path)
                 replyOk (if ok then [] else [("notLink", Msg.JBool True)])
             Just tbl -> do
                 let (tbl', had) = LinkTable.delEntry path tbl
-                when had $ LinkTable.save root (fromMaybe "" mTag) tbl'
+                when had $ LinkTable.save root tbl'
                 replyOk (if had then [] else [("notLink", Msg.JBool True)])
 
 -- ============================================================================
@@ -250,9 +250,9 @@ cmdUnlink root mTag kind path = case kind of
 --
 --   文件走**流式**哈希（内存 O(1)）；链接的内容就是指向字符串，很短。
 cmdHash :: FilePath -> Maybe String -> StateKind -> FilePath -> IO ()
-cmdHash root mTag kind path = case kind of
+cmdHash root _mTag kind path = case kind of
     LinkKind -> do
-        content <- linkContent root mTag path
+        content <- linkContent root path
         replyOk [("hash", Msg.str (hashBytes content))]
     FileKind -> do
         r <- try (hashFile (root </> path))
@@ -269,9 +269,9 @@ cmdHash root mTag kind path = case kind of
 --   读源出错 / 提前 EOF 时用 'padZeros' 把帧补齐 —— 接收端长度仍对齐，而哈希
 --   必然对不上，于是它自己删临时文件、回错误（比截短载荷安全得多）。
 cmdSend :: FilePath -> Maybe String -> StateKind -> FilePath -> IO ()
-cmdSend root mTag kind path = case kind of
+cmdSend root _mTag kind path = case kind of
     LinkKind -> do
-        content <- linkContent root mTag path
+        content <- linkContent root path
         replyOk [("size", Msg.int (fromIntegral (BS.length content)))]
         BS.hPut stdout content
         hFlush stdout
@@ -347,13 +347,13 @@ cmdRecv root mTag kind req path =
         case mh of
             Nothing -> replyErr "recv: missing hash trailer"
             Just expected -> do
-                mtbl <- linkTableOf root mTag
+                mtbl <- linkTableOf root
                 case mtbl of
                     Just tbl
                         | hashBytes content /= expected ->
                             replyErr "verification failed before commit; target untouched"
                         | otherwise -> do
-                            LinkTable.save root (fromMaybe "" mTag)
+                            LinkTable.save root
                                 (LinkTable.putEntry path
                                     (LinkTable.Entry (targetText content)
                                                      (fromIntegral (BS.length content)) mt) tbl)
@@ -481,24 +481,22 @@ repoAlready fp addr = do
 --   表已存在 → created=false（主控端不重复提示）。
 --   该端还有真实链接 → 报错，让用户先在那台机器上跑 @hsbisync jail@，
 --   否则空表会让这些链接判成“消失”并向对端传播删除。
-cmdJail :: FilePath -> Maybe String -> IO ()
-cmdJail root mTag = case mTag of
-    Nothing -> replyErr "jail: helper started without a profile tag"
-    Just tag -> do
-        ok <- LinkTable.exists root tag
-        if ok
-            then replyOk [("created", Msg.JBool False)]
-            else do
-                ign <- readProfileIgnore root (Just tag)
-                old <- scanRelLinks Nothing root root ign
-                if not (null old)
-                    then replyErr ("jail: " ++ show (length old)
-                        ++ " real symlink(s) still here; run `hsbisync jail "
-                        ++ tag ++ "` on that host first")
-                    else do
-                        createDirectoryIfMissing True (root </> ".bisync" </> tag)
-                        LinkTable.save root tag LinkTable.isEmptyTable
-                        replyOk [("created", Msg.JBool True)]
+--   链接表是**仓库级**的（@.bisync/link_table.json@），与 profile 无关。
+cmdJail :: FilePath -> IO ()
+cmdJail root = do
+    ok <- LinkTable.exists root
+    if ok
+        then replyOk [("created", Msg.JBool False)]
+        else do
+            ign <- readAllProfilesIgnore root
+            old <- scanRelLinks Nothing root root ign
+            if not (null old)
+                then replyErr ("jail: " ++ show (length old)
+                    ++ " real symlink(s) still here; run `hsbisync jail` on that host first")
+                else do
+                    createDirectoryIfMissing True (root </> ".bisync")
+                    LinkTable.save root LinkTable.isEmptyTable
+                    replyOk [("created", Msg.JBool True)]
 
 -- | 登录方（主控端）地址，取自 sshd 设置的环境变量。
 --   SSH_CONNECTION 是现代 sshd 的标准变量；SSH_CLIENT 是旧变量，

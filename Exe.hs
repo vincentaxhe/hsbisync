@@ -31,7 +31,8 @@ import State
     , parseStateValue, statRel, statLinkRel
     , currentStateWith, currentLinkState
     , lastStateKind, lastStateKindT, appendAddedKind, appendDeletedKind, discardStateUnder, posixSecs
-    , linkTableOf, readProfileIgnore, scanRelLinks
+    , linkTableOf, scanRelLinks
+    , profilesUnder, readAllProfilesIgnore
     , indexStates, dedup, sameFile
     )
 import Sync (sync, SyncAction(..), resolveConflicts, SideStats(..), sideStateLabel)
@@ -88,14 +89,6 @@ autoConfirm = unsafePerformIO (newIORef False)
 setAutoConfirm :: Bool -> IO ()
 setAutoConfirm = writeIORef autoConfirm
 
--- | 本轮同步的 profile（链接表路径 @<root>/.bisync/<profile>/link_table.json@ 要用它）
-{-# NOINLINE currentProfile #-}
-currentProfile :: IORef (Maybe String)
-currentProfile = unsafePerformIO (newIORef Nothing)
-
-setCurrentProfile :: String -> IO ()
-setCurrentProfile = writeIORef currentProfile . Just
-
 -- | 按 @--jail@ 在指定端**只保证 link_table.json 存在**（空表；已存在则不动）。
 --
 --   它不搬链接、不做任何转换 —— 转换只能用子命令 @jail@ / @unjail@。
@@ -111,22 +104,22 @@ applyRepoModes profile r1 r2 = do
   where
     applyOne specs (Local root)
         | root `elem` specs = do
-            ok <- LinkTable.exists root profile
+            ok <- LinkTable.exists root
             unless ok $ do
                 -- 空表 + 磁盘上还有真链接 = 这些链接在链接阶段"消失"，会向
                 -- 对端传播删除。先让用户在该端跑 jail 子命令，把链接搬进表。
-                ign <- readProfileIgnore root (Just profile)
+                ign <- readAllProfilesIgnore root
                 old <- scanRelLinks Nothing root root ign
                 if not (null old)
                     then die $ unlines
                         [ "--jail: " ++ root ++ " still has " ++ show (length old)
                             ++ " real symlink(s); an empty table would delete them on the peer"
-                        , "  convert it first:  cd " ++ root ++ " && hsbisync jail " ++ profile
+                        , "  convert it first:  cd " ++ root ++ " && hsbisync jail"
                         ]
                     else do
-                        createDirectoryIfMissing True (root </> ".bisync" </> profile)
-                        LinkTable.save root profile LinkTable.isEmptyTable
-                        putStrLn ("  jail: created " ++ LinkTable.tablePath root profile)
+                        createDirectoryIfMissing True (root </> ".bisync")
+                        LinkTable.save root LinkTable.isEmptyTable
+                        putStrLn ("  jail: created " ++ LinkTable.tablePath root)
         | otherwise = return ()
     applyOne specs (Remote host p)
         | (host ++ ":" ++ p) `elem` specs =
@@ -138,32 +131,33 @@ applyRepoModes profile r1 r2 = do
                     Right resp
                         | (Msg.field "created" resp >>= Msg.asBool) == Just True ->
                             putStrLn $ "  jail: created " ++ host ++ ":" ++ p
-                                       ++ "/.bisync/" ++ profile ++ "/link_table.json"
+                                       ++ "/.bisync/link_table.json"
                         | otherwise -> return ()
         | otherwise = return ()
     rootText (Local p)    = p
     rootText (Remote h p) = h ++ ":" ++ p
 
--- | @hsbisync jail <profile>@：把当前目录转成 jail 型仓库。
+-- | @hsbisync jail@：把当前目录转成 jail 型仓库。
 --
 --   现有真实链接收进表并从磁盘上删掉（只 unlink），链接子树下的文件基线
---   作废 —— 之后链接目标的内容会作为真实目录落到同一相对路径。
---   已经是 jail 则什么都不做。
-convertToJail :: String -> FilePath -> IO ()
-convertToJail profile root = do
-    already <- LinkTable.exists root profile
+--   作废（**所有 profile** 都要作废 —— 链接表是仓库级的）—— 之后链接目标的内容
+--   会作为真实目录落到同一相对路径。已经是 jail 则什么都不做。
+convertToJail :: FilePath -> IO ()
+convertToJail root = do
+    already <- LinkTable.exists root
     if already
-        then putStrLn ("  already jail: " ++ LinkTable.tablePath root profile)
+        then putStrLn ("  already jail: " ++ LinkTable.tablePath root)
         else do
-            ign  <- readProfileIgnore root (Just profile)
+            ign  <- readAllProfilesIgnore root
             rels <- scanRelLinks Nothing root root ign
             entries <- mapM (mkEntry root) rels
-            createDirectoryIfMissing True (root </> ".bisync" </> profile)
-            LinkTable.save root profile (Map.fromList entries)
+            createDirectoryIfMissing True (root </> ".bisync")
+            LinkTable.save root (Map.fromList entries)
             mapM_ (\r -> removeLinkSafe (root </> r)) rels
-            mapM_ (discardStateUnder root (Just profile)) rels
+            ps <- profilesUnder root
+            mapM_ (\p -> mapM_ (discardStateUnder root (Just p)) rels) ps
             putStrLn $ "  jail: " ++ show (length rels) ++ " link(s) -> "
-                       ++ LinkTable.tablePath root profile
+                       ++ LinkTable.tablePath root
 
 -- | 普通仓库 -> jail：把现有真实链接收进表，并从磁盘上删掉（只 unlink）。
 --
@@ -176,25 +170,26 @@ mkEntry root rel = do
     target <- readLinkContent (root </> rel)
     return (rel, LinkTable.Entry (targetText target) sz (posixSecs mt))
 
--- | @hsbisync unjail <profile>@：把当前目录转回普通仓库。
+-- | @hsbisync unjail@：把当前目录转回普通仓库。
 --
 --   表里的条目在磁盘上重建成真实链接；链接位置可能已被真实文件/目录占用
 --   （jail 期间链接目标的内容就落在那里），'writeLinkVerified' 会先把占位
 --   整体删掉再建链接 —— 内容不会丢：它本来就还会从对端重新同步。
 --
---   同样要作废文件基线，否则“路径要么悬空、要么指向根外”会被算成本端删除。
-convertFromJail :: String -> FilePath -> IO ()
-convertFromJail profile root = do
-    ok <- LinkTable.exists root profile
-    unless ok (putStrLn ("  not a jail: " ++ LinkTable.tablePath root profile))
+--   同样要作废文件基线（所有 profile），否则“路径要么悬空、要么指向根外”会被算成本端删除。
+convertFromJail :: FilePath -> IO ()
+convertFromJail root = do
+    ok <- LinkTable.exists root
+    unless ok (putStrLn ("  not a jail: " ++ LinkTable.tablePath root))
     when ok $ do
-        r <- LinkTable.load root profile
+        r <- LinkTable.load root
         case r of
             Left e   -> ioError (userError e)
             Right tbl -> do
                 mapM_ (restore tbl) (Map.toAscList tbl)
-                mapM_ (discardStateUnder root (Just profile)) (Map.keys tbl)
-                removeFile (LinkTable.tablePath root profile)
+                ps <- profilesUnder root
+                mapM_ (\p -> mapM_ (discardStateUnder root (Just p)) (Map.keys tbl)) ps
+                removeFile (LinkTable.tablePath root)
                 putStrLn $ "  unjail: " ++ show (Map.size tbl) ++ " link(s) restored"
   where
     restore _ (rel, e) = do
@@ -212,8 +207,7 @@ convertFromJail profile root = do
 -- | 读链接的“内容”：普通仓库读真实链接；链接表模式查表
 lclLinkContent :: FilePath -> FilePath -> IO BS.ByteString
 lclLinkContent root relPath = do
-    tag  <- readIORef currentProfile
-    mtbl <- linkTableOf root tag
+    mtbl <- linkTableOf root
     case mtbl of
         Nothing -> readLinkContent (root </> relPath)
         Just tbl -> case Map.lookup relPath tbl of
@@ -224,15 +218,14 @@ lclLinkContent root relPath = do
 lclLinkWrite :: FilePath -> FilePath -> BS.ByteString -> Int -> Integer -> String
              -> IO (Either String ())
 lclLinkWrite root relPath content md mt expected = do
-    tag  <- readIORef currentProfile
-    mtbl <- linkTableOf root tag
+    mtbl <- linkTableOf root
     case mtbl of
         Nothing -> writeLinkVerified root (root </> relPath) content md mt expected
         Just tbl
             | hashBytes content /= expected ->
                 return (Left "verification failed before commit; target untouched")
             | otherwise -> do
-                LinkTable.save root (fromMaybe "" tag)
+                LinkTable.save root
                     (LinkTable.putEntry relPath
                         (LinkTable.Entry (targetText content)
                                          (fromIntegral (BS.length content)) mt) tbl)
@@ -241,13 +234,12 @@ lclLinkWrite root relPath content md mt expected = do
 -- | 删除链接：普通仓库 unlink；链接表模式删条目（目录/文件不动）
 lclLinkRemove :: FilePath -> FilePath -> IO Bool
 lclLinkRemove root relPath = do
-    tag  <- readIORef currentProfile
-    mtbl <- linkTableOf root tag
+    mtbl <- linkTableOf root
     case mtbl of
         Nothing -> removeLinkSafe (root </> relPath)
         Just tbl -> do
             let (tbl', had) = LinkTable.delEntry relPath tbl
-            when had $ LinkTable.save root (fromMaybe "" tag) tbl'
+            when had $ LinkTable.save root tbl'
             return had
 
 -- | 指向字符串的字节 → String
@@ -276,8 +268,6 @@ runSync srcKind profile root1 root2 = do
     let (mHost1, path1) = case root1 of Local p -> (Nothing, p); Remote h p -> (Just h, p)
         (mHost2, path2) = case root2 of Local p -> (Nothing, p); Remote h p -> (Just h, p)
         mTag = Just profile
-
-    setCurrentProfile profile
 
     -- 阶段 0：先明确两端地址（本地端就是一个路径，没有 local: 这种写法）
     putStrLn $ "\n  root1 = " ++ rootLabel root1

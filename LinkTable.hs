@@ -1,9 +1,12 @@
 -- | 「链接表」：jail 型仓库里，软链接不落成真实链接，只在这张表里记一行。
 --
---   * 表文件：@<同步根>/.bisync/<profile>/link_table.json@
+--   * 表文件：@<同步根>/.bisync/link_table.json@（**仓库级，不按 profile 分**）
 --     （@.bisync@ 在根那一层就被跳过、不参与同步 → 天然是本端本地配置）。
 --   * **存在性就是模式**：文件在 = 这个仓库是 jail 型（链接只认表）；
 --     删掉文件 = 回到普通仓库（按 lstat 扫描真实链接）。
+--   * 链接是**仓库的属性**，不是 profile 的属性：一个仓库不可能同时是 jail 和非 jail，
+--     否则“某个 profile 先同步过、另一个 profile 不知道哪些路径其实是链接”就会出问题
+--     —— 所以表放在 @.bisync/@ 下，所有 profile 共用一张。
 --   * 表里每条记 @target@ / @size@ / @mtime@：
 --     @size@ 就是链接的 @st_size@（= 指向字符串的字节长度），@mtime@ 是链接自身
 --     的 mtime。两个都必须存 —— 它们是链接比较键 @(size, mtime)@ 的两半，
@@ -48,15 +51,14 @@ data Entry = Entry
 
 type Table = Map String Entry
 
--- | 表文件路径
-tablePath :: FilePath -> String -> FilePath
-tablePath root profile = root </> ".bisync" </> profile </> "link_table.json"
+-- | 表文件路径：**仓库级**（@.bisync/link_table.json@），所有 profile 共用
+--
+tablePath :: FilePath -> FilePath
+tablePath root = root </> ".bisync" </> "link_table.json"
 
 -- | 该端是不是 jail 型仓库（只看文件在不在）
-exists :: FilePath -> String -> IO Bool
-exists root profile
-    | null profile = return False
-    | otherwise    = doesFileExist (tablePath root profile)
+exists :: FilePath -> IO Bool
+exists root = doesFileExist (tablePath root)
 
 -- | 空表（新建时用）
 isEmptyTable :: Table
@@ -98,9 +100,9 @@ decode raw = case Msg.decodeStrict raw of
 -- ============================================================================
 
 -- | 读表。文件不存在 → 'isEmptyTable'；内容坏 → Left。
-load :: FilePath -> String -> IO (Either String Table)
-load root profile = do
-    let p = tablePath root profile
+load :: FilePath -> IO (Either String Table)
+load root = do
+    let p = tablePath root
     ok <- doesFileExist p
     if not ok
         then return (Right isEmptyTable)
@@ -111,9 +113,9 @@ load root profile = do
                 Right b -> decode b
 
 -- | 原子写表（temp + rename，同目录保证 rename 是原子的）
-save :: FilePath -> String -> Table -> IO ()
-save root profile tbl = do
-    let p   = tablePath root profile
+save :: FilePath -> Table -> IO ()
+save root tbl = do
+    let p   = tablePath root
         dir = takeDirectory p
         tmp = p ++ ".tmp"
     createDirectoryIfMissing True dir
