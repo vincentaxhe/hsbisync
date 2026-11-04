@@ -5,7 +5,7 @@ import Control.Exception (ErrorCall, IOException, bracket, catch, displayExcepti
 import Control.Monad (filterM, forM, forM_, unless, when)
 import Data.Char (toLower)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
-import Data.Maybe (fromMaybe, isJust)
+import Data.Maybe (fromMaybe, isJust, mapMaybe)
 import qualified Data.Map as Map
 import qualified Data.Set as Set
 import System.Directory (canonicalizePath, createDirectoryIfMissing, doesFileExist, removeFile)
@@ -27,7 +27,7 @@ import qualified Data.ByteString.Char8 as B8
 import Connect (destroyHelper, handshakeInfo, prepareRemotes, spawnHelper)
 import qualified LinkTable
 import State
-    ( FileState(..), FileChange(..), StateKind(..)
+    ( FileState(..), FileChange(..), SideState(..), StateKind(..)
     , parseStateValue, statRel, statLinkRel
     , currentStateWith, currentLinkState
     , lastStateKind, appendAddedKind, appendDeletedKind, discardStateUnder, posixSecs
@@ -39,6 +39,7 @@ import Write
     ( HelperHandle(..), call, readMsg, sendMsg, hGetExactly
     , writeLinkVerified, readLinkContent
     , hashBytes, hashFile, removeFileSafe, removeLinkSafe, getIgnoreRemote, setMtimeOnly
+    , entryExists
     , writeRepoFile
     , copyFileStream, copyExactly, copyExactlyHash, discardExactly, padZeros
     , openTargetTemp, commitReceived, removeQuietly
@@ -471,6 +472,14 @@ changeName fc = case fc of
     Del fs _ _      -> filename fs
     Conflict fs _ _ -> filename fs
 
+-- | FileChange 携带的 FileState（不管哪个构造子）
+changeFS :: FileChange -> FileState
+changeFS fc = case fc of
+    Noop fs _ _     -> fs
+    Added fs _ _    -> fs
+    Del fs _ _      -> fs
+    Conflict fs _ _ -> fs
+
 -- | 文件比较阶段的钩子：把"有冲突的"和"要传输的"文件里**两端 size 相同**的拿出来，
 --   安静地逐个校对两端内容（SHA512），然后把**确实一致**的按来时路分类列出：
 --
@@ -685,7 +694,14 @@ syncLinkPhase profile mTag mHost1 path1 mHost2 path2 = do
 
     let (_, pairs1, _, pairs2) = sync (last1, last2) (cur1, cur2)
         (_, pairs1', pairs2') = resolveConflicts pairs1 pairs2
-        hasWork = any (isJust . snd) pairs1' || any (isJust . snd) pairs2'
+
+    -- 「链接被真实内容替换」≠「链接被删除」：前者要把链接还原回去，不能把删除传给对端。
+    -- 实测踩过：jail 端删掉 link_table.json 变回普通仓库后，磁盘上是链接目标的内容，
+    -- 而 link_state 里还记着链接 → 这一端报 deleted，另一端的真链接就被删掉了
+    -- （接着文件阶段还把内容也删干净）。
+    (pairs1'', pairs2'') <- restoreReplacedLinks mHost1 path1 mHost2 path2 profile pairs1' pairs2'
+
+    let hasWork = any (isJust . snd) pairs1'' || any (isJust . snd) pairs2''
 
     -- 输出约定（用户 2026-09-22）：**只有真的有动作（要确认）时才列出来并提问**。
     -- 不统计两端软链接的前后条数（那是文件阶段的口径，链接阶段不需要），
@@ -693,11 +709,11 @@ syncLinkPhase profile mTag mHost1 path1 mHost2 path2 = do
     if not hasWork
         then return True
         else do
-            showSummary pairs1' pairs2'
+            showSummary pairs1'' pairs2''
             -- 只剩冲突（要跳过的那些）时没有要执行的动作：不必确认，也不用起 helper，
             -- 列完清单直接结束（用户 2026-09-23 定，与文件阶段口径一致）——但结构没谈成，
             -- 返回 False，文件阶段不做。
-            if not (hasApplicableAction pairs1' pairs2')
+            if not (hasApplicableAction pairs1'' pairs2'')
                 then return False
                 else do
                     yes <- askYesNo "\nApply symlink changes? [y/N] "
@@ -707,15 +723,111 @@ syncLinkPhase profile mTag mHost1 path1 mHost2 path2 = do
                             return False
                         else do
                             applied <- withHelpers mHost1 path1 mHost2 path2 profile $ \side1 side2 -> do
-                                ok1 <- execute SKLink mTag side1 side2 pairs1'
-                                discardLocal side1 mTag pairs1'
-                                ok2 <- execute SKLink mTag side2 side1 pairs2'
-                                discardLocal side2 mTag pairs2'
+                                ok1 <- execute SKLink mTag side1 side2 pairs1''
+                                discardLocal side1 mTag pairs1''
+                                ok2 <- execute SKLink mTag side2 side1 pairs2''
+                                discardLocal side2 mTag pairs2''
                                 return (ok1 && ok2)
                             unless applied $
                                 putStrLn "  WARNING: symlink changes not fully applied."
                             -- 真正一致 = 该做的都落地了 **且** 没留下未消解冲突
-                            return (applied && not (hasUnresolved pairs1' pairs2'))
+                            return (applied && not (hasUnresolved pairs1'' pairs2''))
+
+-- ============================================================================
+-- 链接阶段修正：链接被真实内容替换 → 还原链接（而不是传播删除）
+-- ============================================================================
+
+-- | 一次「链接被真实内容替换」的候选：一端仍持有链接、另一端报「删除」
+data Replaced = Replaced
+    { rhFs :: FileState    -- ^ 仍持有链接那一端的元信息（size = 指向长度、mtime = 链接自身）
+    , rhD1 :: SideState    -- ^ root1 侧状态（两端共用）
+    , rhD2 :: SideState    -- ^ root2 侧状态
+    , rhOn :: Int          -- ^ 1 = root1 仍持有；2 = root2 仍持有
+    }
+
+-- | 链接阶段的第一道修正：**「链接被真实内容替换」不是「链接被删除」**。
+--
+--   场景（实测踩过，后果很重）：jail 端删掉 @link_table.json@ 变回普通仓库（README 里
+--   写的就是这种切换方式），磁盘上留着的是链接目标的内容（真实目录/文件），而
+--   @link_state@ 里仍记着那是一条链接 → 该端把链接报成 @deleted@，另一端（真正持有
+--   链接的那端）于是把链接**删掉**；删除还会传染到文件阶段，把内容也删干净。
+--
+--   判据：一端报「删除」、另一端**仍然持有**该链接，且报删除那一端的**路径上还占着东西**
+--   （真实文件/目录）→ 链接是被内容替换了，不是被删除。真删除时那个路径是空的。
+--
+--   处理：报删除的那一端改为**接收**（把链接还原），持有端不动。还原后
+--   'discardLocal' / helper 的 @recvLink@ 会作废该子树下的文件基线，内容由文件阶段
+--   重新同步；若那一端是 jail，则按链接表写条目（内容继续留在同步目录里）。
+restoreReplacedLinks
+    :: Maybe String -> FilePath -> Maybe String -> FilePath -> String
+    -> [(FileChange, Maybe SyncAction)]
+    -> [(FileChange, Maybe SyncAction)]
+    -> IO ([(FileChange, Maybe SyncAction)], [(FileChange, Maybe SyncAction)])
+restoreReplacedLinks mHost1 path1 mHost2 path2 profile pairs1 pairs2 = do
+    let holders = Map.fromList
+            [ (filename (rhFs h), h)
+            | h <- mapMaybe (holderOf 1) pairs1 ++ mapMaybe (holderOf 2) pairs2 ]
+    if Map.null holders
+        then return (pairs1, pairs2)
+        else do
+            -- 只有「丢失侧路径上还有东西」的才还原；真删除（路径已空）必须继续传播
+            found <- withHelpers mHost1 path1 mHost2 path2 profile $ \side1 side2 ->
+                filterM (\h -> sideEntryExists
+                                  (if rhOn h == 1 then side2 else side1)
+                                  (filename (rhFs h)))
+                        (Map.elems holders)
+            if null found
+                then return (pairs1, pairs2)
+                else do
+                    let m = Map.fromList [ (filename (rhFs h), h) | h <- found ]
+                    putStrLn $ "  restoring link (real content at that path): "
+                        ++ unwords (Map.keys m)
+                    return (map (conv m 1) pairs1, map (conv m 2) pairs2)
+  where
+    -- 本端（which）还有这个链接、对端报删除 → 还原候选
+    holderOf :: Int -> (FileChange, Maybe SyncAction) -> Maybe Replaced
+    holderOf which (fc, _) = case fc of
+        Del fs d1 d2      -> mk fs d1 d2
+        Conflict fs d1 d2 -> mk fs d1 d2
+        _                 -> Nothing
+      where
+        mk fs d1 d2
+            | which == 1, isHeldSS d1, isGoneSS d2 = Just (Replaced fs d1 d2 1)
+            | which == 2, isHeldSS d2, isGoneSS d1 = Just (Replaced fs d1 d2 2)
+            | otherwise                             = Nothing
+
+    -- 持有端：不再删除；丢失端：改成接收（用持有端的 size/mtime）。
+    -- 丢失侧的状态标成 absent：它现在确实没有链接（只是路径上还有内容），
+    -- 否则摘要会出现「root2 will receive … [r2:deleted]」这种自相矛盾的行。
+    conv :: Map.Map FilePath Replaced -> Int
+         -> (FileChange, Maybe SyncAction) -> (FileChange, Maybe SyncAction)
+    conv m which (fc, act) = case Map.lookup (filename (changeFS fc)) m of
+        Nothing -> (fc, act)
+        Just (Replaced fs d1 d2 on)
+            | on == which -> (Noop fs d1 d2, Nothing)
+            | otherwise   ->
+                let lostFs = changeFS fc
+                    d1' = if which == 1 then Absent lostFs else d1
+                    d2' = if which == 2 then Absent lostFs else d2
+                in (Added fs d1' d2', Just Receive)
+
+    isGoneSS :: SideState -> Bool
+    isGoneSS (SDeleted _) = True
+    isGoneSS _            = False
+
+    -- 本端"还持有这个链接"（存在且未变/新增/修改）
+    isHeldSS :: SideState -> Bool
+    isHeldSS (SNew _)       = True
+    isHeldSS (SUpdated _)   = True
+    isHeldSS (SUnchanged _) = True
+    isHeldSS _              = False
+
+-- | 该端相对路径上是否还有节点（本地 lstat；远端用 getstat 探"在不在"）
+sideEntryExists :: Side -> FilePath -> IO Bool
+sideEntryExists (Lcl root) rel = entryExists (root </> rel)
+sideEntryExists (Rmt hh) rel = do
+    r <- call hh (Msg.cmd "getstat" [("path", Msg.str rel)])
+    return (case r of Right _ -> True; Left _ -> False)
 
 -- | 链接阶段刚在某端建/改了一个链接：把该端这个链接**子树**下的文件基线条目作废。
 --

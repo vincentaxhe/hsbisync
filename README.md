@@ -131,6 +131,11 @@ SYNC PROCEDURE
          that the same path refers to the same object on both ends; when links
          are not aligned that assumption fails.
 
+         When one end still holds a link but the other end's path is occupied
+         by a real file/directory (the link was replaced by content, not
+         removed), the link is restored on that end instead of propagating a
+         deletion. Only a path that is really gone propagates the deletion.
+
      [4/6] Reading states ...
          Both ends are scanned in parallel (each filtered by the now-identical
          ignore rules) and compared with their own baseline. The scan is

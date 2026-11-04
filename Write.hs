@@ -490,6 +490,17 @@ isSymLink path = do
         Right st -> isSymbolicLink st
         Left _   -> False
 
+-- | 路径上是否仍"占着东西"（lstat 成功即可，不跟随链接：链接、文件、目录都算）。
+--
+--   用途：区分"链接被人删掉了"（路径不存在 → 删除该传播）与
+--   "链接被真实文件/目录替换了"（路径存在 → 应该把链接还原回来）。
+entryExists :: FilePath -> IO Bool
+entryExists path = do
+    r <- (try (getSymbolicLinkStatus path) :: IO (Either IOException FileStatus))
+    return $ case r of
+        Right _ -> True
+        Left _  -> False
+
 -- | 读取符号链接的"内容"：它的指向字符串（UTF-8 字节，可直接参与哈希/SEND/RECV）
 readLinkContent :: FilePath -> IO BS.ByteString
 readLinkContent path = T.encodeUtf8 . T.pack <$> readSymbolicLink path
