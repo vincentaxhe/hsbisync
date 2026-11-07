@@ -13,9 +13,10 @@ NAME
      hsbisync - bidirectional file synchronizer between two directories
 
 SYNOPSIS
-     hsbisync sync <profile> [--jail <root>]... [--no-confirm]
-     hsbisync sync <profile> <root1> <root2> [--jail <root>]...
+     hsbisync sync <profile> [--jail <root>]... [--unjail <root>]...
                  [--no-confirm]
+     hsbisync sync <profile> <root1> <root2> [--jail <root>]...
+                 [--unjail <root>]... [--no-confirm]
      hsbisync jail
      hsbisync unjail
      hsbisync diff <profile>
@@ -53,6 +54,13 @@ SUBCOMMANDS
          a switch, so the path stays a positional argument:
              sync p --jail A B
              sync p A --jail B
+
+         Option --unjail <root> (repeatable) only deletes
+         .bisync/link_table.json on that end (nothing happens if it is not
+         there), explicitly turning that end back into an ordinary repository.
+         It only removes the file; links are not restored (use the unjail
+         subcommand for that). Also a switch, so the path stays positional; the
+         same end cannot be named by both --jail and --unjail.
 
          Option --no-confirm: answer y at every confirmation (scripts, no tty).
 
@@ -106,7 +114,8 @@ JAIL REPOSITORIES
      link targets as plain directories).
 
      --jail works on a remote root too: the helper creates the empty table
-     there (and refuses if that end still has real links). The jail / unjail
+     there (and refuses if that end still has real links); --unjail works on a
+     remote root too (the helper deletes the table). The jail / unjail
      conversion subcommands act on the local current directory only.
 
 SYNC PROCEDURE
@@ -199,8 +208,8 @@ FILES
 
      .bisync/link_table.json
          The link table of a jail repository; never synced. Its presence makes
-         the end jail; the jail / unjail subcommands switch between forms. It
-         is repo-wide: every profile shares it.
+         the end jail; the jail / unjail subcommands or the --jail / --unjail
+         switches move between forms. It is repo-wide: every profile shares it.
 
      The three baseline files (one set for the file tree and one for the
      symlink tree, with the same shape):

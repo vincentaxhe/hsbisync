@@ -81,6 +81,15 @@ jailTargets = unsafePerformIO (newIORef [])
 setJailTargets :: [String] -> IO ()
 setJailTargets = writeIORef jailTargets
 
+-- | @--unjail <root>@（可重复）指定的目标端（入口读完参数后设置）
+{-# NOINLINE unjailTargets #-}
+unjailTargets :: IORef [String]
+unjailTargets = unsafePerformIO (newIORef [])
+
+-- | 由入口设置：本轮哪几端要显式删掉链接表（转回普通仓库）
+setUnjailTargets :: [String] -> IO ()
+setUnjailTargets = writeIORef unjailTargets
+
 -- | @--no-confirm@：所有确认处自动答 y（脚本 / 无终端时用）
 {-# NOINLINE autoConfirm #-}
 autoConfirm :: IORef Bool
@@ -89,21 +98,27 @@ autoConfirm = unsafePerformIO (newIORef False)
 setAutoConfirm :: Bool -> IO ()
 setAutoConfirm = writeIORef autoConfirm
 
--- | 按 @--jail@ 在指定端**只保证 link_table.json 存在**（空表；已存在则不动）。
+-- | 按 @--jail@ / @--unjail@ 对指定端**只动 link_table.json**：
+--   @--jail@ 确保它存在（空表；已存在则不动），@--unjail@ 确保它不存在（没有则不动）。
 --
---   它不搬链接、不做任何转换 —— 转换只能用子命令 @jail@ / @unjail@。
---   不在 @--jail@ 列表里的端完全不动（不保证表不存在）。
+--   两者都不搬链接、不做任何转换 —— 转换用子命令 @jail@ / @unjail@；
+--   也不在当前列表里的端完全不动（不保证表存在与否）。
 --   之后链接阶段会自动按“表在不在”选择口径。
 applyRepoModes :: String -> Root -> Root -> IO ()
 applyRepoModes profile r1 r2 = do
-    specs <- readIORef jailTargets
-    case [ s | s <- specs, s `notElem` map rootText [r1, r2] ] of
-        (bad:_) -> die ("--jail must name one of the two roots; got: " ++ bad)
+    jspecs <- readIORef jailTargets
+    uspecs <- readIORef unjailTargets
+    let names = map rootText [r1, r2]
+    case [ s | s <- jspecs ++ uspecs, s `notElem` names ] of
+        (bad:_) -> die ("--jail/--unjail must name one of the two roots; got: " ++ bad)
         []      -> return ()
-    mapM_ (applyOne specs) [r1, r2]
+    case [ s | s <- jspecs, s `elem` uspecs ] of
+        (bad:_) -> die ("--jail and --unjail name the same root: " ++ bad)
+        []      -> return ()
+    mapM_ (applyOne jspecs uspecs) [r1, r2]
   where
-    applyOne specs (Local root)
-        | root `elem` specs = do
+    applyOne jspecs uspecs (Local root)
+        | root `elem` jspecs = do
             ok <- LinkTable.exists root
             unless ok $ do
                 -- 空表 + 磁盘上还有真链接 = 这些链接在链接阶段"消失"，会向
@@ -120,9 +135,13 @@ applyRepoModes profile r1 r2 = do
                         createDirectoryIfMissing True (root </> ".bisync")
                         LinkTable.save root LinkTable.isEmptyTable
                         putStrLn ("  jail: created " ++ LinkTable.tablePath root)
+        -- 只删文件（不还原链接）：本来就没有就什么都不做
+        | root `elem` uspecs = do
+            removed <- LinkTable.remove root
+            when removed $ putStrLn ("  unjail: removed " ++ LinkTable.tablePath root)
         | otherwise = return ()
-    applyOne specs (Remote host p)
-        | (host ++ ":" ++ p) `elem` specs =
+    applyOne jspecs uspecs (Remote host p)
+        | (host ++ ":" ++ p) `elem` jspecs =
             -- 远端也自动建空表（走 helper 的 jail 命令，同样有“还有真链接就拒绝”的护栏）
             bracket (spawnHelper host p profile) destroyHelper $ \hh -> do
                 r <- call hh (Msg.obj [("cmd", Msg.str "jail")])
@@ -131,6 +150,16 @@ applyRepoModes profile r1 r2 = do
                     Right resp
                         | (Msg.field "created" resp >>= Msg.asBool) == Just True ->
                             putStrLn $ "  jail: created " ++ host ++ ":" ++ p
+                                       ++ "/.bisync/link_table.json"
+                        | otherwise -> return ()
+        | (host ++ ":" ++ p) `elem` uspecs =
+            bracket (spawnHelper host p profile) destroyHelper $ \hh -> do
+                r <- call hh (Msg.obj [("cmd", Msg.str "unjail")])
+                case r of
+                    Left e -> die ("--unjail: " ++ host ++ ":" ++ p ++ ": " ++ e)
+                    Right resp
+                        | (Msg.field "removed" resp >>= Msg.asBool) == Just True ->
+                            putStrLn $ "  unjail: removed " ++ host ++ ":" ++ p
                                        ++ "/.bisync/link_table.json"
                         | otherwise -> return ()
         | otherwise = return ()

@@ -25,11 +25,13 @@ module LinkTable
     , isEmptyTable
     , load
     , save
+    , remove
     , putEntry
     , delEntry
     ) where
 
 import Control.Exception (IOException, try)
+import Control.Monad (when)
 import Data.Map (Map)
 import System.Directory (createDirectoryIfMissing, doesFileExist, removeFile, renameFile)
 import System.FilePath (takeDirectory, (</>))
@@ -129,6 +131,16 @@ save root tbl = do
                 Left e   -> do
                     _ <- try (removeFile tmp) :: IO (Either IOException ())
                     ioError e
+
+-- | 删表文件 = 该端转回普通仓库。返回**是否真的删掉了**（本来就没有 = False）。
+--
+--   只删文件：不搬链接、不动基线（要还原成真实链接请用 @hsbisync unjail@）。
+remove :: FilePath -> IO Bool
+remove root = do
+    let p = tablePath root
+    ok <- doesFileExist p
+    when ok (removeFile p)
+    return ok
 
 -- | 增/改一条
 putEntry :: String -> Entry -> Table -> Table

@@ -24,7 +24,7 @@ import GHC.IO.Encoding (setFileSystemEncoding, setLocaleEncoding, utf8)
 import Arg (Root(..), parseRoot, parseSyncThree)
 import Exe
     ( RootSource(..), convertFromJail, convertToJail
-    , printBanner, runSync, setAutoConfirm, setJailTargets
+    , printBanner, runSync, setAutoConfirm, setJailTargets, setUnjailTargets
     )
 import Help (showHelp)
 import Helper (runHelper)
@@ -49,12 +49,14 @@ main = do
     setFileSystemEncoding utf8
     setLocaleEncoding utf8
     args0 <- getArgs
-    -- --jail <root>（可重复）：本次同步把该端当 jail 型仓库。
+    -- --jail <root> / --unjail <root>（都可重复）：本次同步显式地在该端
+    -- 建立 / 删除 .bisync/link_table.json（存在性就是 jail 开关）。
     -- 用空格分隔而不是 --jail=<root>：路径里带引号/空格时省得和 shell 转义拧。
-    (args, jailSpecs) <- case splitJail args0 of
+    (args, jailSpecs, unjailSpecs) <- case splitRepoModes args0 of
         Left e  -> die e
         Right r -> return r
     setJailTargets jailSpecs
+    setUnjailTargets unjailSpecs
     -- --no-confirm：所有确认自动答 y（脚本 / 无终端时用）
     let (syncArgs, noConfirm) = splitNoConfirm args
     setAutoConfirm noConfirm
@@ -77,22 +79,27 @@ main = do
 
 -- | 完整说明文在 Help.hs（单一维护点）；此处只负责分发。
 
--- | 从参数里抽出 @--jail@ 标记（可重复）：它后面紧跟的那个路径就是 jail 端。
+-- | 从参数里抽出 @--jail@ / @--unjail@ 标记（都可重复）：它后面紧跟的那个
+--   路径就是 Jail 端 / 要被显式删掉链接表的那一端。
 --
 --   只移除开关本身，**路径仍留在位置参数里** —— 所以：
 --
---   > sync p --jail A B        -- ✓ A 是 jail，两端是 A 和 B
---   > sync p --jail A --jail B -- ✓ 两端都是 jail
---   > sync p A B --jail A    -- ✗ 去掉开关后有三个路径 → 参数个数校验报错
+--   > sync p --jail A B          -- ✓ A 建表，两端是 A 和 B
+--   > sync p --jail A --unjail B -- ✓ A 建表、B 删表
+--   > sync p --jail A --jail B   -- ✓ 两端都建表
+--   > sync p A B --jail A        -- ✗ 去掉开关后有三个路径 → 参数个数校验报错
 --
 --   路径里的空格/引号完全由 shell 负责，程序不做任何拼接。
-splitJail :: [String] -> Either String ([String], [String])
-splitJail = go [] []
+--   同一个根同时出现在两个列表里由 Exe.applyRepoModes 报错。
+splitRepoModes :: [String] -> Either String ([String], [String], [String])
+splitRepoModes = go [] [] []
   where
-    go pos specs [] = Right (reverse pos, reverse specs)
-    go _ _ ["--jail"] = Left "--jail requires a path: --jail <root>"
-    go pos specs ("--jail" : x : rest) = go (x : pos) (x : specs) rest
-    go pos specs (a : rest) = go (a : pos) specs rest
+    go pos js us [] = Right (reverse pos, reverse js, reverse us)
+    go _ _ _ ["--jail"] = Left "--jail requires a path: --jail <root>"
+    go _ _ _ ["--unjail"] = Left "--unjail requires a path: --unjail <root>"
+    go pos js us ("--jail" : x : rest) = go (x : pos) (x : js) us rest
+    go pos js us ("--unjail" : x : rest) = go (x : pos) js (x : us) rest
+    go pos js us (a : rest) = go (a : pos) js us rest
 
 -- | 抽掉无值的 @--no-confirm@（可以出现在任意位置）
 splitNoConfirm :: [String] -> ([String], Bool)

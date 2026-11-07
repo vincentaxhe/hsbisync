@@ -127,6 +127,7 @@ commandLoop root mTag = go
         "getignore" -> cmdGetIgnore root
         "putrepo"   -> cmdPutRepo   root mTag req
         "jail"      -> cmdJail      root
+        "unjail"    -> cmdUnjail    root
         "setstat"   -> cmdSetStat   root req
         "settime"   -> cmdSetTime   root req
         "add"       -> withPath $ cmdAdd    root mTag kind
@@ -497,6 +498,15 @@ cmdJail root = do
                     createDirectoryIfMissing True (root </> ".bisync")
                     LinkTable.save root LinkTable.isEmptyTable
                     replyOk [("created", Msg.JBool True)]
+
+-- | @{"cmd":"unjail"}@ → @{"removed":true|false}@
+--
+--   @--unjail@ 指向远端时的对称操作：**只删** @.bisync/link_table.json@，
+--   不搬链接、不动基线。表本来就不在 → removed=false（主控端不打印）。
+cmdUnjail :: FilePath -> IO ()
+cmdUnjail root = do
+    removed <- LinkTable.remove root
+    replyOk [("removed", Msg.JBool removed)]
 
 -- | 登录方（主控端）地址，取自 sshd 设置的环境变量。
 --   SSH_CONNECTION 是现代 sshd 的标准变量；SSH_CLIENT 是旧变量，
